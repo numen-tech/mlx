@@ -3545,8 +3545,9 @@ std::vector<array> QuantizedMatmul::vjp(
           cotangents[0],
           primals[1],
           primals[2],
-          mode_ == QuantizationMode::Affine ? std::optional<array>(primals[3])
-                                            : std::nullopt,
+          (mode_ == QuantizationMode::Affine && primals.size() > 3)
+              ? std::optional<array>(primals[3])
+              : std::nullopt,
           !transpose_,
           group_size_,
           bits_,
@@ -3609,8 +3610,9 @@ std::vector<array> QuantizedMatmul::jvp(
       tangents[0],
       primals[1],
       primals[2],
-      mode_ == QuantizationMode::Affine ? std::optional<array>(primals[3])
-                                        : std::nullopt,
+      (mode_ == QuantizationMode::Affine && primals.size() > 3)
+          ? std::optional<array>(primals[3])
+          : std::nullopt,
       transpose_,
       group_size_,
       bits_,
