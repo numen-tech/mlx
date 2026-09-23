@@ -51,6 +51,14 @@ void set_compile_options(
       default:
         throw std::invalid_argument("[metal::Device] Invalid math mode.");
     }
+    // MTLCompileOptions.mathFloatingPointFunctions is independent of mathMode
+    // and defaults to Fast, so a Safe/Relaxed request would still compile the
+    // fast (approximate) transcendental variants. Keep them Precise unless
+    // fast math was explicitly asked for.
+    mtl_options->setMathFloatingPointFunctions(
+        compile_options.math_mode == MathMode::Fast
+            ? MTL::MathFloatingPointFunctionsFast
+            : MTL::MathFloatingPointFunctionsPrecise);
   } else {
     if (compile_options.math_mode == MathMode::Relaxed) {
       throw std::runtime_error(
