@@ -133,6 +133,26 @@
   instantiate_quantized_types(64, bits)    \
   instantiate_quantized_types(32, bits)
 
+// Bias-free (symmetric) decode kernels, 1- and 2-bit only: sym_derived_bias
+// static_asserts the other widths away, and the host (quantized.cpp,
+// mode = "affine_sym") only requests them for bits <= 2. Same name format as
+// the affine set, so the non-JIT metallib serves the same names the JIT path
+// builds: affine_sym_qmv[_fast]_<type>_gs_<gs>_b_<bits>_batch_<0|1>.
+// (numen-tech/gemma4-qat#179, Codex P1)
+#define instantiate_quantized_sym_batched(type, group_size, bits) \
+  instantiate_quantized_batched_wrap(affine_sym_qmv_fast, type, group_size, bits) \
+  instantiate_quantized_batched_wrap(affine_sym_qmv, type, group_size, bits)
+
+#define instantiate_quantized_sym_types(group_size, bits)       \
+  instantiate_quantized_sym_batched(float, group_size, bits)      \
+  instantiate_quantized_sym_batched(float16_t, group_size, bits)  \
+  instantiate_quantized_sym_batched(bfloat16_t, group_size, bits)
+
+#define instantiate_quantized_sym_groups(bits) \
+  instantiate_quantized_sym_types(128, bits)   \
+  instantiate_quantized_sym_types(64, bits)    \
+  instantiate_quantized_sym_types(32, bits)
+
 #define instantiate_quantized_all() \
   instantiate_quantized_groups(1) \
   instantiate_quantized_groups(2) \
@@ -140,6 +160,8 @@
   instantiate_quantized_groups(4) \
   instantiate_quantized_groups(5) \
   instantiate_quantized_groups(6) \
-  instantiate_quantized_groups(8)
+  instantiate_quantized_groups(8) \
+  instantiate_quantized_sym_groups(1) \
+  instantiate_quantized_sym_groups(2)
 
 instantiate_quantized_all() // clang-format on
