@@ -883,6 +883,15 @@ class TestQuantized(mlx_tests.MLXTestCase):
                     self.assertLess((y_q - y_hat).abs().max(), 1e-3)
 
     def test_qmv_affine_sym(self):
+        def assert_sym_matches_biased(y_sym, y_biased):
+            # Both paths accumulate the same fp32 products, but the biased
+            # reference may run a different kernel (qmv_quad for K in {64, 128},
+            # qmv_wide for 2-bit M >= 3 on gen-15+ GPUs), so the sums can differ
+            # by a few ulps of the output dtype at the largest output magnitude.
+            tol = 4 * mx.finfo(y_biased.dtype).eps * y_biased.abs().max()
+            diff = (y_sym.astype(mx.float32) - y_biased.astype(mx.float32)).abs()
+            self.assertLessEqual(diff.max().item(), tol.item())
+
         # Fork-only path: an affine quantized_matmul called with biases=None
         # (bits <= 2, transpose=True, mat-vec regime) dispatches to the
         # bias-free affine_sym_qmv / affine_sym_qmv_fast kernels, which derive
@@ -897,9 +906,9 @@ class TestQuantized(mlx_tests.MLXTestCase):
         k1, k2 = mx.random.split(key)
         Ms = [1, 2, 3, 8]
         Ns = [256, 67]  # 67 is a non-multiple of the 8-row output tile
-        for bits, group_size, K in product(
-            [1, 2], [32, 64, 128], [64, 128, 512, 2048]
-        ):
+        for bits, group_size, K in product([1, 2], [32, 64, 128], [64, 128, 512, 2048]):
+            if K < group_size:
+                continue
             for M, N in product(Ms, Ns):
                 with self.subTest(M=M, N=N, K=K, group_size=group_size, bits=bits):
                     x = mx.random.normal(shape=(M, K), key=k1)
@@ -925,7 +934,7 @@ class TestQuantized(mlx_tests.MLXTestCase):
                         continue
                     self.assertEqual(y_sym.shape, y_hat.shape)
                     self.assertEqual(y_sym.dtype, x.dtype)
-                    self.assertLess((y_sym - y_biased).abs().max(), 1e-5)
+                    assert_sym_matches_biased(y_sym, y_biased)
                     self.assertLess((y_sym - y_hat).abs().max(), 1e-3)
 
         # Half-precision activations: the kernels are templated on the
@@ -942,7 +951,7 @@ class TestQuantized(mlx_tests.MLXTestCase):
                     )
                     y_sym = mx.quantized_matmul(x, w_q, scales, None, True, 64, bits)
                     self.assertEqual(y_sym.dtype, dtype)
-                    self.assertLess((y_sym - y_biased).abs().max(), 1e-2)
+                    assert_sym_matches_biased(y_sym, y_biased)
 
     def test_qmv_affine_sym_throws(self):
         x = mx.random.normal(shape=(1, 512))
@@ -955,26 +964,24 @@ class TestQuantized(mlx_tests.MLXTestCase):
                 mx.quantized_matmul(x, w_q, scales, None, True, 64, bits)
 
         w_q, scales, _ = mx.quantize(w, 64, 2)
+        x_qvm = mx.random.normal(shape=(1, 64))
+        x_qmm = mx.random.normal(shape=(512, 512))
+        # The remaining checks throw from eval_gpu / eval_cpu, so evaluate every
+        # input up front: an array computed inside an eval that throws never has
+        # its completion event signaled, and a consumer on another stream (the
+        # CPU case below) would then wait on that event forever.
+        mx.eval(x, w_q, scales, x_qvm, x_qmm)
+
         # Non-transposed (qvm) path has no bias-free kernel.
         with self.assertRaises(RuntimeError):
-            mx.eval(
-                mx.quantized_matmul(
-                    mx.random.normal(shape=(1, 64)), w_q, scales, None, False, 64, 2
-                )
-            )
+            mx.eval(mx.quantized_matmul(x_qvm, w_q, scales, None, False, 64, 2))
         # Matrix regime (M >= the device's qmv batch limit) is qmm-only.
         with self.assertRaises(RuntimeError):
-            mx.eval(
-                mx.quantized_matmul(
-                    mx.random.normal(shape=(512, 512)), w_q, scales, None, True, 64, 2
-                )
-            )
+            mx.eval(mx.quantized_matmul(x_qmm, w_q, scales, None, True, 64, 2))
         # CPU has no bias-free kernel either.
         with self.assertRaises(RuntimeError):
             mx.eval(
-                mx.quantized_matmul(
-                    x, w_q, scales, None, True, 64, 2, stream=mx.cpu
-                )
+                mx.quantized_matmul(x, w_q, scales, None, True, 64, 2, stream=mx.cpu)
             )
         # Sanity: the very same call on the GPU mat-vec path works.
         mx.eval(mx.quantized_matmul(x, w_q, scales, None, True, 64, 2))
