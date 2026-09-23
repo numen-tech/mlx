@@ -257,4 +257,8 @@ NS::SharedPtr<NS::AutoreleasePool> new_scoped_memory_pool();
 
 bool is_nax_available();
 
+// Bumps the `waits` counter of counters() (metal.h). Called immediately
+// before every host-side blocking wait on GPU completion.
+void count_host_wait();
+
 } // namespace mlx::core::metal

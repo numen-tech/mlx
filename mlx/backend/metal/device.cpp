@@ -34,10 +34,11 @@ namespace mlx::core::metal {
 namespace {
 
 // Work counters behind counters()/reset() (metal.h). Relaxed: they are
-// statistics read after an eval completes, never used for synchronization.
+// statistics read while no eval is in flight, never used for synchronization.
 std::atomic<uint64_t> dispatch_count{0};
 std::atomic<uint64_t> commit_count{0};
 std::atomic<uint64_t> sync_count{0};
+std::atomic<uint64_t> wait_count{0};
 
 constexpr const char* default_mtllib_path = METAL_PATH;
 
@@ -585,6 +586,7 @@ void CommandEncoder::synchronize() {
   end_encoding();
   commit();
   sync_count.fetch_add(1, std::memory_order_relaxed);
+  count_host_wait();
   cbuf->waitUntilCompleted();
 
   if (!exiting_) {
@@ -991,17 +993,23 @@ bool is_nax_available() {
 #endif
 }
 
+void count_host_wait() {
+  wait_count.fetch_add(1, std::memory_order_relaxed);
+}
+
 Counters counters() {
   return {
       dispatch_count.load(std::memory_order_relaxed),
       commit_count.load(std::memory_order_relaxed),
-      sync_count.load(std::memory_order_relaxed)};
+      sync_count.load(std::memory_order_relaxed),
+      wait_count.load(std::memory_order_relaxed)};
 }
 
 void reset() {
   dispatch_count.store(0, std::memory_order_relaxed);
   commit_count.store(0, std::memory_order_relaxed);
   sync_count.store(0, std::memory_order_relaxed);
+  wait_count.store(0, std::memory_order_relaxed);
 }
 
 } // namespace mlx::core::metal

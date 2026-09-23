@@ -29,7 +29,7 @@ const std::string& get_metallib_path() {
 }
 
 Counters counters() {
-  return {0, 0, 0};
+  return {0, 0, 0, 0};
 }
 void reset() {}
 

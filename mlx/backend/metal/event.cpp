@@ -26,6 +26,7 @@ EventImpl::~EventImpl() {
 }
 
 void EventImpl::wait(uint64_t value) {
+  count_host_wait();
   mtl_event_->waitUntilSignaledValue(value, -1); // never times out
 }
 

@@ -7,7 +7,7 @@
 
 using namespace mlx::core;
 
-TEST_CASE("test metal counters count dispatches, commits and syncs") {
+TEST_CASE("test metal counters count dispatches, commits, syncs and waits") {
   auto a = random::normal({64, 64});
   auto b = random::normal({64, 64});
   eval(a, b);
@@ -17,6 +17,7 @@ TEST_CASE("test metal counters count dispatches, commits and syncs") {
   CHECK_EQ(z.dispatches, 0);
   CHECK_EQ(z.commits, 0);
   CHECK_EQ(z.syncs, 0);
+  CHECK_EQ(z.waits, 0);
 
   auto c = matmul(a, b);
   eval(c);
@@ -24,10 +25,18 @@ TEST_CASE("test metal counters count dispatches, commits and syncs") {
   CHECK_GE(after_eval.dispatches, 1);
   CHECK_GE(after_eval.commits, 1);
   CHECK_EQ(after_eval.syncs, 0);
+  // eval() blocks on c's completion event unless the GPU already signaled it
+  // before the host checked, so at most one wait.
+  CHECK_LE(after_eval.waits, 1);
+
+  // Re-evaluating (or reading) an evaluated array does not wait again.
+  eval(c);
+  CHECK_EQ(metal::counters().waits, after_eval.waits);
 
   synchronize();
   auto after_sync = metal::counters();
   CHECK_EQ(after_sync.syncs, 1);
+  CHECK_EQ(after_sync.waits, after_eval.waits + 1);
   CHECK_GE(after_sync.commits, after_eval.commits + 1);
   CHECK_EQ(after_sync.dispatches, after_eval.dispatches);
 
@@ -36,4 +45,5 @@ TEST_CASE("test metal counters count dispatches, commits and syncs") {
   CHECK_EQ(r.dispatches, 0);
   CHECK_EQ(r.commits, 0);
   CHECK_EQ(r.syncs, 0);
+  CHECK_EQ(r.waits, 0);
 }

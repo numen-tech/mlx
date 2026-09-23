@@ -55,6 +55,7 @@ void Fence::wait(Stream stream, const array& x) {
   if (stream.device == Device::cpu) {
     scheduler::enqueue(stream, [fence_ = fence_, count = f.count]() mutable {
       auto& f = *static_cast<FenceImpl*>(fence_.get());
+      metal::count_host_wait();
       while (f.cpu_value()[0] < count) {
       }
     });
