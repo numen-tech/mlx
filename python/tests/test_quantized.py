@@ -965,6 +965,10 @@ class TestQuantized(mlx_tests.MLXTestCase):
             w_q, scales, _ = mx.quantize(w, 64, bits)
             with self.assertRaises(ValueError):
                 mx.quantized_matmul(x, w_q, scales, None, True, 64, bits)
+        w_q, scales, _ = mx.quantize(w, 64, 2)
+        for bits in [0, -1]:
+            with self.assertRaises(ValueError):
+                mx.quantized_matmul(x, w_q, scales, None, True, 64, bits)
 
         w_q, scales, _ = mx.quantize(w, 64, 2)
         x_qvm = mx.random.normal(shape=(1, 64))
@@ -988,6 +992,35 @@ class TestQuantized(mlx_tests.MLXTestCase):
             )
         # Sanity: the very same call on the GPU mat-vec path works.
         mx.eval(mx.quantized_matmul(x, w_q, scales, None, True, 64, 2))
+
+    def test_qmv_affine_sym_grad(self):
+        # The reverse products use the biased kernels with the derived bias, so
+        # the gradients match the explicitly biased call.
+        key = mx.random.key(1)
+        k1, k2, k3 = mx.random.split(key, 3)
+        for bits, K in product([1, 2], [512, 1024]):
+            with self.subTest(bits=bits, K=K):
+                x = mx.random.normal(shape=(2, K), key=k1)
+                w = mx.random.normal(shape=(64, K), key=k2)
+                w_q, scales, _ = mx.quantize(w, 64, bits)
+                cotan = mx.random.normal(shape=(2, 64), key=k3)
+
+                def f_sym(x, scales):
+                    return mx.quantized_matmul(x, w_q, scales, None, True, 64, bits)
+
+                def f_biased(x, scales):
+                    biases = -0.5 * scales if bits == 1 else -scales
+                    return mx.quantized_matmul(x, w_q, scales, biases, True, 64, bits)
+
+                _, vjp_sym = mx.vjp(f_sym, [x, scales], [cotan])
+                _, vjp_biased = mx.vjp(f_biased, [x, scales], [cotan])
+                for a, b in zip(vjp_sym, vjp_biased):
+                    self.assertEqual(a.shape, b.shape)
+                    self.assertLess((a - b).abs().max().item(), 1e-3)
+
+                _, jvp_sym = mx.jvp(lambda x: f_sym(x, scales), [x], [x])
+                _, jvp_biased = mx.jvp(lambda x: f_biased(x, scales), [x], [x])
+                self.assertLess((jvp_sym[0] - jvp_biased[0]).abs().max().item(), 1e-3)
 
     def test_qvm(self):
         key = mx.random.key(0)

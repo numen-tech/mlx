@@ -4809,7 +4809,7 @@ array quantized_matmul(
 
   auto [group_size, bits] =
       quantization_params_from_mode(qmode, group_size_, bits_);
-  if (qmode == QuantizationMode::Affine && !biases && bits > 2) {
+  if (qmode == QuantizationMode::Affine && !biases && bits != 1 && bits != 2) {
     throw std::invalid_argument(
         "[quantized_matmul] Bias-free affine supports bits in {1, 2} only.");
   }
@@ -5054,8 +5054,7 @@ array pack_and_quantize(
 std::vector<array>
 affine_quantize(const array& w, int group_size, int bits, StreamOrDevice s_) {
   auto s = to_stream(s_);
-  if (group_size != 32 && group_size != 64 && group_size != 128 &&
-      group_size != 256 && group_size != 512) {
+  if (group_size != 32 && group_size != 64 && group_size != 128) {
     std::ostringstream msg;
     msg << "[quantize] The requested group size " << group_size
         << " is not supported. The supported group sizes are 32, 64, and 128.";

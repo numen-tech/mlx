@@ -3536,6 +3536,17 @@ std::vector<array> QuantizedMatmul::vjp(
     const std::vector<array>&) {
   std::vector<array> vjps;
 
+  // Bias-free affine derives the bias from the scale: -scale/2 for 1-bit,
+  // -scale for 2-bit. The reverse products run on the biased kernels.
+  bool sym = mode_ == QuantizationMode::Affine && primals.size() == 3;
+  float sym_c = (bits_ == 1) ? -0.5f : -1.0f;
+  std::optional<array> biases = std::nullopt;
+  if (mode_ == QuantizationMode::Affine) {
+    biases = sym
+        ? multiply(primals[2], array(sym_c, primals[2].dtype()), stream())
+        : primals[3];
+  }
+
   // We rely on the fact that w is always 2D so transpose is simple
   std::optional<array> dsb = std::nullopt;
   for (auto arg : argnums) {
@@ -3545,9 +3556,7 @@ std::vector<array> QuantizedMatmul::vjp(
           cotangents[0],
           primals[1],
           primals[2],
-          (mode_ == QuantizationMode::Affine && primals.size() > 3)
-              ? std::optional<array>(primals[3])
-              : std::nullopt,
+          biases,
           !transpose_,
           group_size_,
           bits_,
@@ -3579,11 +3588,15 @@ std::vector<array> QuantizedMatmul::vjp(
         // biases
         vjps.push_back(sum(*dsb, -1, false, stream()));
       } else {
-        // scales
+        // scales: d(w_hat)/d(scale) is q, or q + c for the derived bias
         auto wq = dequantize(
             primals[1],
             ones_like(primals[2], stream()),
-            zeros_like(primals[3], stream()),
+            full(
+                primals[2].shape(),
+                sym ? sym_c : 0.0f,
+                primals[2].dtype(),
+                stream()),
             group_size_,
             bits_,
             quantization_mode_to_string(mode_),

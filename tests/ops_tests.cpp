@@ -3394,23 +3394,8 @@ TEST_CASE("test quantize dequantize") {
   }
 }
 
-// Bias-free (symmetric) affine quantized_matmul: the 1/2-bit decode path where
-// no biases buffer is bound and the kernel derives the bias from the scale
-// (-scale/2 for 1-bit, -scale for 2-bit; sym_derived_bias in
-// backend/metal/kernels/quantized.h). Metal only: the CPU backend has no
-// bias-free path. Pins two things (numen-tech/gemma4-qat#179, Codex P1):
-//   - the affine_sym_qmv[_fast] kernels resolve in BOTH Metal builds: the
-//     non-JIT metallib (instantiated in kernels/quantized.metal) and the JIT
-//     path (emitted from the header at runtime); a missing instantiation
-//     throws "Unable to load kernel" here.
-//   - the routing across the host's exact fast gate (qmv_fast_k_alignment:
-//     K % 1024 == 0 for 1-bit, K % 512 == 0 for 2-bit): 1-bit K = 512 mod
-//     1024 takes the generic affine_sym_qmv here (on the 0.31.1 line, whose
-//     gate is K % 512, the same shapes run the partial tail block of
-//     qmv_fast_impl, kept in the kernel for that reason); K = 1024 and the
-//     2-bit cases take affine_sym_qmv_fast. N = 8 (one row group) puts the
-//     last rows at the very end of the weight buffer; N = 64 covers the
-//     multi-row-group grid. The cases are numen-tech/mlx#1's, unchanged.
+// Bias-free affine decode on Metal: the affine_sym_qmv[_fast] kernels load in
+// both the metallib and JIT builds and match the derived-bias reference.
 TEST_CASE("test bias-free affine quantized_matmul decode") {
   if (!is_available(Device::gpu)) {
     return;

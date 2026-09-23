@@ -24,6 +24,10 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   if (inputs.size() > 3) {
     biases = inputs[3];
   }
+  if (mode_ == QuantizationMode::Affine && !biases) {
+    throw std::runtime_error(
+        "[QuantizedMatmul::eval_gpu] Bias-free affine is Metal-only for now.");
+  }
 
   auto supports = [&](auto&& f) {
     return f(
