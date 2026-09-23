@@ -882,6 +882,7 @@ class TestQuantized(mlx_tests.MLXTestCase):
                     self.assertEqual(y_q.shape, y_hat.shape)
                     self.assertLess((y_q - y_hat).abs().max(), 1e-3)
 
+    @unittest.skipUnless(mx.metal.is_available(), "Bias-free affine is Metal-only")
     def test_qmv_affine_sym(self):
         def assert_sym_matches_biased(y_sym, y_biased):
             # Both paths accumulate the same fp32 products, but the biased
@@ -952,6 +953,7 @@ class TestQuantized(mlx_tests.MLXTestCase):
                     self.assertEqual(y_sym.dtype, dtype)
                     assert_sym_matches_biased(y_sym, y_biased)
 
+    @unittest.skipUnless(mx.metal.is_available(), "Bias-free affine is Metal-only")
     def test_qmv_affine_sym_throws(self):
         x = mx.random.normal(shape=(1, 512))
         w = mx.random.normal(shape=(64, 512))
@@ -988,9 +990,7 @@ class TestQuantized(mlx_tests.MLXTestCase):
         for x_big in [x_qmm_edge, x_qmm]:
             with self.subTest(M=x_big.shape[0]):
                 with self.assertRaisesRegex(RuntimeError, "Bias-free affine"):
-                    mx.eval(
-                        mx.quantized_matmul(x_big, w_q, scales, None, True, 64, 2)
-                    )
+                    mx.eval(mx.quantized_matmul(x_big, w_q, scales, None, True, 64, 2))
         # CPU has no bias-free kernel either.
         with self.assertRaises(RuntimeError):
             mx.eval(
@@ -999,6 +999,7 @@ class TestQuantized(mlx_tests.MLXTestCase):
         # Sanity: the very same call on the GPU mat-vec path works.
         mx.eval(mx.quantized_matmul(x, w_q, scales, None, True, 64, 2))
 
+    @unittest.skipUnless(mx.metal.is_available(), "Bias-free affine is Metal-only")
     def test_qmv_affine_sym_grad(self):
         # The reverse products use the biased kernels with the derived bias, so
         # the gradients match the explicitly biased call.

@@ -927,15 +927,8 @@ METAL_FUNC void qmv_fast_impl(
   }
 
   if (aligned_end < in_vec_size) {
-    // Partial last block (in_vec_size % block_size != 0). Reachable only from
-    // a host fast gate coarser than block_size (the 0.31.1 line's K % 512 gate
-    // with 1-bit K = 512 mod 1024); qmv_fast_k_alignment (quantized.cpp) keeps
-    // the gate exact here. Lanes past the end of the row contribute +0 (their
-    // x_thread, sum and scale would all be zero), so they skip the row loop
-    // instead of masking it: masking still ran qdot, whose weight reads for
-    // those lanes land past the end of the row and, for the last output rows,
-    // past the end of the weight buffer. Every lane still joins the simd_sum
-    // below. (numen-tech/gemma4-qat#179, Codex P1)
+    // Partial last block: lanes past the end of the row skip the loads (they
+    // would read past the weight buffer) and still join the simd_sum below.
     bool in_bounds =
         (aligned_end + simd_lid * values_per_thread) < in_vec_size;
     if (in_bounds) {

@@ -3397,7 +3397,7 @@ TEST_CASE("test quantize dequantize") {
 // Bias-free affine decode on Metal: the affine_sym_qmv[_fast] kernels load in
 // both the metallib and JIT builds and match the derived-bias reference.
 TEST_CASE("test bias-free affine quantized_matmul decode") {
-  if (!is_available(Device::gpu)) {
+  if (!metal::is_available()) {
     return;
   }
   const auto gpu = Device::gpu;
