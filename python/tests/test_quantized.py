@@ -902,7 +902,11 @@ class TestQuantized(mlx_tests.MLXTestCase):
         # variant (qmv_fast_k_alignment), the other shapes the generic one;
         # K in {64, 128} takes qmv_quad on the biased path and must not here
         # (there is no bias-free qmv_quad), and M in [2, 8] must stay off
-        # qmv_wide (no bias-free qmv_wide either).
+        # qmv_wide (no bias-free qmv_wide either). Every shape here is in the
+        # mat-vec regime on every GPU generation: get_qmv_batch_limit
+        # (backend/metal/quantized.cpp) returns at least 13 for K <= 2048 and
+        # N <= 256, and the largest M is 8, so the eval must not throw;
+        # test_qmv_affine_sym_throws pins the rejection above the limit.
         key = mx.random.key(0)
         k1, k2 = mx.random.split(key)
         Ms = [1, 2, 3, 8]
@@ -926,15 +930,7 @@ class TestQuantized(mlx_tests.MLXTestCase):
                     y_sym = mx.quantized_matmul(
                         x, w_q, scales, None, True, group_size, bits
                     )
-                    try:
-                        mx.eval(y_sym)
-                    except RuntimeError as e:
-                        # M reached this device's qmv batch limit: the
-                        # bias-free path covers the mat-vec regime only and
-                        # says so instead of silently taking the qmm route.
-                        self.assertGreater(M, 1)
-                        self.assertIn("Bias-free affine", str(e))
-                        continue
+                    mx.eval(y_sym)
                     self.assertEqual(y_sym.shape, y_hat.shape)
                     self.assertEqual(y_sym.dtype, x.dtype)
                     assert_sym_matches_biased(y_sym, y_biased)
@@ -972,19 +968,29 @@ class TestQuantized(mlx_tests.MLXTestCase):
 
         w_q, scales, _ = mx.quantize(w, 64, 2)
         x_qvm = mx.random.normal(shape=(1, 64))
+        # M at and far above the qmv batch limit. get_qmv_batch_limit
+        # (backend/metal/quantized.cpp) returns at most 33 (gen-17+, K and N
+        # <= 2048) and the dispatch rejects M >= limit, so M = 33 is the
+        # smallest M rejected on every GPU generation for this K = 512, N = 64.
+        x_qmm_edge = mx.random.normal(shape=(33, 512))
         x_qmm = mx.random.normal(shape=(512, 512))
         # The remaining checks throw from eval_gpu / eval_cpu, so evaluate every
         # input up front: an array computed inside an eval that throws never has
         # its completion event signaled, and a consumer on another stream (the
         # CPU case below) would then wait on that event forever.
-        mx.eval(x, w_q, scales, x_qvm, x_qmm)
+        mx.eval(x, w_q, scales, x_qvm, x_qmm_edge, x_qmm)
 
         # Non-transposed (qvm) path has no bias-free kernel.
         with self.assertRaises(RuntimeError):
             mx.eval(mx.quantized_matmul(x_qvm, w_q, scales, None, False, 64, 2))
-        # Matrix regime (M >= the device's qmv batch limit) is qmm-only.
-        with self.assertRaises(RuntimeError):
-            mx.eval(mx.quantized_matmul(x_qmm, w_q, scales, None, True, 64, 2))
+        # Matrix regime (M >= the device's qmv batch limit) is qmm-only: the
+        # bias-free path says so instead of silently taking the qmm route.
+        for x_big in [x_qmm_edge, x_qmm]:
+            with self.subTest(M=x_big.shape[0]):
+                with self.assertRaisesRegex(RuntimeError, "Bias-free affine"):
+                    mx.eval(
+                        mx.quantized_matmul(x_big, w_q, scales, None, True, 64, 2)
+                    )
         # CPU has no bias-free kernel either.
         with self.assertRaises(RuntimeError):
             mx.eval(
