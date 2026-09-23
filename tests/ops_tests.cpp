@@ -3403,11 +3403,14 @@ TEST_CASE("test quantize dequantize") {
 //     non-JIT metallib (instantiated in kernels/quantized.metal) and the JIT
 //     path (emitted from the header at runtime); a missing instantiation
 //     throws "Unable to load kernel" here.
-//   - the qmv_fast tail block: 1-bit reads 32 values per lane (block 1024)
-//     while the host's fast gate is only K % 512 == 0, so K = 512 mod 1024
-//     leaves a partial last block, and N = 8 (one row group) puts the last
-//     rows at the very end of the weight buffer. K % 1024 == 0 and 2-bit
-//     (block 512) cover the no-tail path; N = 64 the multi-row-group grid.
+//   - the routing across the host's exact fast gate (qmv_fast_k_alignment:
+//     K % 1024 == 0 for 1-bit, K % 512 == 0 for 2-bit): 1-bit K = 512 mod
+//     1024 takes the generic affine_sym_qmv here (on the 0.31.1 line, whose
+//     gate is K % 512, the same shapes run the partial tail block of
+//     qmv_fast_impl, kept in the kernel for that reason); K = 1024 and the
+//     2-bit cases take affine_sym_qmv_fast. N = 8 (one row group) puts the
+//     last rows at the very end of the weight buffer; N = 64 covers the
+//     multi-row-group grid. The cases are numen-tech/mlx#1's, unchanged.
 TEST_CASE("test bias-free affine quantized_matmul decode") {
   if (!is_available(Device::gpu)) {
     return;
@@ -3422,14 +3425,14 @@ TEST_CASE("test bias-free affine quantized_matmul decode") {
     int group_size;
   };
   const Case cases[] = {
-      {1, 512, 8, 128}, // fast path, partial tail block only
-      {1, 1536, 8, 128}, // fast path, one full block + partial tail
-      {1, 1024, 8, 128}, // fast path, no tail
-      {2, 512, 8, 128}, // fast path, no tail (2-bit block is 512)
-      {1, 1536, 64, 128}, // fast path, several row groups
-      {1, 512, 8, 64}, // fast path, group 64
-      {2, 1536, 64, 64}, // fast path, group 64
-      {1, 544, 8, 32}, // K % 512 != 0: the non-fast affine_sym_qmv kernel
+      {1, 512, 8, 128}, // 1-bit, K % 1024 != 0: generic affine_sym_qmv
+      {1, 1536, 8, 128}, // ditto (one full 1024 block + 512)
+      {1, 1024, 8, 128}, // 1-bit fast path (K % 1024 == 0), no tail
+      {2, 512, 8, 128}, // 2-bit fast path (K % 512 == 0)
+      {1, 1536, 64, 128}, // generic, several row groups
+      {1, 512, 8, 64}, // generic, group 64
+      {2, 1536, 64, 64}, // 2-bit fast path, group 64, several row groups
+      {1, 544, 8, 32}, // K % 512 != 0 on either line: generic affine_sym_qmv
       {2, 544, 8, 32}, // ditto, 2-bit
   };
 

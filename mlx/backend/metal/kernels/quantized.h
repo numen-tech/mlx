@@ -927,9 +927,10 @@ METAL_FUNC void qmv_fast_impl(
   }
 
   if (aligned_end < in_vec_size) {
-    // Partial last block (in_vec_size % block_size != 0; e.g. 1-bit with
-    // K = 512 mod 1024, where the host's K % 512 fast gate is coarser than
-    // block_size). Lanes past the end of the row contribute exactly +0 (their
+    // Partial last block (in_vec_size % block_size != 0). Reachable only from
+    // a host fast gate coarser than block_size (the 0.31.1 line's K % 512 gate
+    // with 1-bit K = 512 mod 1024); qmv_fast_k_alignment (quantized.cpp) keeps
+    // the gate exact here. Lanes past the end of the row contribute +0 (their
     // x_thread, sum and scale would all be zero), so they skip the row loop
     // instead of masking it: masking still ran qdot, whose weight reads for
     // those lanes land past the end of the row and, for the last output rows,

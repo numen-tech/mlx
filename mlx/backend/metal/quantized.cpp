@@ -146,9 +146,14 @@ inline int get_qmv_batch_limit(int D, int O, metal::Device& d) {
 }
 
 // Must match the K step in qmv_fast_impl (kernels/quantized.h):
-//   pack_factor<bits, 32>() * (bits == 2 ? 1 : 2) * SIMD_SIZE
+//   pack_factor<bits, 32>() * packs_per_thread * SIMD_SIZE
+// with packs_per_thread = bits <= 2 ? 1 : 2: upstream reads one pack per lane
+// only for 2-bit, the fork's 1-bit kernel does too (mlx#3), so its block is
+// 1024 values, not upstream's 2048. An exact gate keeps the partial-block tail
+// of qmv_fast_impl unreachable; a stricter one (2048 for 1-bit) silently
+// routed every K = 1024 mod 2048 1-bit matmul to the generic qmv.
 inline int qmv_fast_k_alignment(int bits) {
-  return get_pack_factor(bits, 32) * (bits == 2 ? 1 : 2) * 32;
+  return get_pack_factor(bits, 32) * (bits <= 2 ? 1 : 2) * 32;
 }
 
 inline int add_strides_and_shapes(

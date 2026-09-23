@@ -897,16 +897,19 @@ class TestQuantized(mlx_tests.MLXTestCase):
         # bias-free affine_sym_qmv / affine_sym_qmv_fast kernels, which derive
         # the bias from the scale in-kernel (-scale/2 for 1-bit, -scale for
         # 2-bit). Compare against the biased kernels fed exactly those derived
-        # biases and against a dequantize-then-matmul reference. K = 2048
-        # (1-bit) / 512 (2-bit) with N % 8 == 0 selects the _fast variant, the
-        # other shapes the generic one; K in {64, 128} takes qmv_quad on the
-        # biased path and must not here (there is no bias-free qmv_quad), and
-        # M in [2, 8] must stay off qmv_wide (no bias-free qmv_wide either).
+        # biases and against a dequantize-then-matmul reference. K % 1024 == 0
+        # (1-bit) / K % 512 == 0 (2-bit) with N % 8 == 0 selects the _fast
+        # variant (qmv_fast_k_alignment), the other shapes the generic one;
+        # K in {64, 128} takes qmv_quad on the biased path and must not here
+        # (there is no bias-free qmv_quad), and M in [2, 8] must stay off
+        # qmv_wide (no bias-free qmv_wide either).
         key = mx.random.key(0)
         k1, k2 = mx.random.split(key)
         Ms = [1, 2, 3, 8]
         Ns = [256, 67]  # 67 is a non-multiple of the 8-row output tile
-        for bits, group_size, K in product([1, 2], [32, 64, 128], [64, 128, 512, 2048]):
+        for bits, group_size, K in product(
+            [1, 2], [32, 64, 128], [64, 128, 512, 1024, 2048]
+        ):
             if K < group_size:
                 continue
             for M, N in product(Ms, Ns):
