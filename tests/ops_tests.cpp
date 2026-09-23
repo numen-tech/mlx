@@ -3394,6 +3394,117 @@ TEST_CASE("test quantize dequantize") {
   }
 }
 
+// Bias-free (symmetric) affine quantized_matmul: the 1/2-bit decode path where
+// no biases buffer is bound and the kernel derives the bias from the scale
+// (-scale/2 for 1-bit, -scale for 2-bit; sym_derived_bias in
+// backend/metal/kernels/quantized.h). Metal only: the CPU backend has no
+// bias-free path. Pins two things (numen-tech/gemma4-qat#179, Codex P1):
+//   - the affine_sym_qmv[_fast] kernels resolve in BOTH Metal builds: the
+//     non-JIT metallib (instantiated in kernels/quantized.metal) and the JIT
+//     path (emitted from the header at runtime); a missing instantiation
+//     throws "Unable to load kernel" here.
+//   - the qmv_fast tail block: 1-bit reads 32 values per lane (block 1024)
+//     while the host's fast gate is only K % 512 == 0, so K = 512 mod 1024
+//     leaves a partial last block, and N = 8 (one row group) puts the last
+//     rows at the very end of the weight buffer. K % 1024 == 0 and 2-bit
+//     (block 512) cover the no-tail path; N = 64 the multi-row-group grid.
+TEST_CASE("test bias-free affine quantized_matmul decode") {
+  if (!is_available(Device::gpu)) {
+    return;
+  }
+  const auto gpu = Device::gpu;
+  const auto cpu = Device::cpu;
+
+  struct Case {
+    int bits;
+    int K;
+    int N;
+    int group_size;
+  };
+  const Case cases[] = {
+      {1, 512, 8, 128}, // fast path, partial tail block only
+      {1, 1536, 8, 128}, // fast path, one full block + partial tail
+      {1, 1024, 8, 128}, // fast path, no tail
+      {2, 512, 8, 128}, // fast path, no tail (2-bit block is 512)
+      {1, 1536, 64, 128}, // fast path, several row groups
+      {1, 512, 8, 64}, // fast path, group 64
+      {2, 1536, 64, 64}, // fast path, group 64
+      {1, 544, 8, 32}, // K % 512 != 0: the non-fast affine_sym_qmv kernel
+      {2, 544, 8, 32}, // ditto, 2-bit
+  };
+
+  int seed = 0;
+  for (auto dtype : {float16, float32}) {
+    for (const auto& c : cases) {
+      auto w =
+          random::bits({c.N, c.K * c.bits / 32}, 4, random::key(seed++), cpu);
+      auto scales = astype(
+          random::uniform(
+              0.5f,
+              1.5f,
+              {c.N, c.K / c.group_size},
+              float32,
+              random::key(seed++),
+              cpu),
+          dtype,
+          cpu);
+      auto x = astype(
+          random::normal({1, c.K}, float32, random::key(seed++), cpu),
+          dtype,
+          cpu);
+
+      // Reference in fp32 on the CPU, from the same fp16/fp32 scale values and
+      // the derived bias the kernel uses.
+      auto scales_f = astype(scales, float32, cpu);
+      auto biases_f =
+          multiply(scales_f, array(c.bits == 1 ? -0.5f : -1.0f), cpu);
+      auto w_hat = dequantize(
+          w,
+          scales_f,
+          biases_f,
+          c.group_size,
+          c.bits,
+          "affine",
+          std::nullopt,
+          std::nullopt,
+          cpu);
+      auto expected =
+          matmul(astype(x, float32, cpu), transpose(w_hat, cpu), cpu);
+
+      auto out = quantized_matmul(
+          x,
+          w,
+          scales,
+          std::nullopt,
+          /* transpose = */ true,
+          c.group_size,
+          c.bits,
+          "affine",
+          gpu);
+      CHECK_EQ(out.dtype(), dtype);
+      CHECK_EQ(out.shape(), Shape{1, c.N});
+
+      // fp32: both sides accumulate K products in fp32, only the summation
+      // order differs (per-lane partials + simd tree vs. the CPU matmul), so
+      // a few fp32 ulps of the result; 1e-4 relative is ~100x that. fp16: the
+      // kernel accumulates in fp32 and rounds the result once to fp16 (2^-11
+      // relative), and x/scales are exact in both; 4e-3 relative is ~8x that.
+      // A wrong bias, a missed tail or a misread weight word moves outputs by
+      // O(scale * K^0.5) ~ 1 or more, far outside either bound.
+      float rtol = dtype == float32 ? 1e-4f : 4e-3f;
+      float scale = max(abs(expected, cpu), cpu).item<float>();
+      float max_diff =
+          max(abs(subtract(astype(out, float32, cpu), expected, cpu), cpu), cpu)
+              .item<float>();
+      INFO(
+          "bits=" << c.bits << " K=" << c.K << " N=" << c.N
+                  << " group_size=" << c.group_size << " dtype=" << dtype
+                  << " max_diff=" << max_diff << " max|expected|=" << scale);
+      CHECK(max_diff <= 1e-3f + rtol * scale);
+    }
+  }
+}
+
 TEST_CASE("test repeat") {
   auto data = array({13, 3, 16, 6, 14, 4, 15, 5, 11, 1, 12, 2}, {3, 2, 2});
   auto repeat_axis_0 = repeat(data, 2, 0);
