@@ -1,5 +1,6 @@
 // Copyright © 2023-2024 Apple Inc.
 
+#include <atomic>
 #include <cstdlib>
 #include <sstream>
 
@@ -31,6 +32,12 @@ struct hash<NS::SharedPtr<T>> {
 namespace mlx::core::metal {
 
 namespace {
+
+// Work counters behind counters()/reset() (metal.h). Relaxed: they are
+// statistics read after an eval completes, never used for synchronization.
+std::atomic<uint64_t> dispatch_count{0};
+std::atomic<uint64_t> commit_count{0};
+std::atomic<uint64_t> sync_count{0};
 
 constexpr const char* default_mtllib_path = METAL_PATH;
 
@@ -418,6 +425,7 @@ void CommandEncoder::dispatch_threadgroups(
     MTL::Size group_dims) {
   maybeInsertBarrier();
   buffer_ops_++;
+  dispatch_count.fetch_add(1, std::memory_order_relaxed);
   get_command_encoder()->dispatchThreadgroups(grid_dims, group_dims);
 }
 
@@ -426,6 +434,7 @@ void CommandEncoder::dispatch_threads(
     MTL::Size group_dims) {
   maybeInsertBarrier();
   buffer_ops_++;
+  dispatch_count.fetch_add(1, std::memory_order_relaxed);
   get_command_encoder()->dispatchThreads(grid_dims, group_dims);
 }
 
@@ -564,6 +573,7 @@ void CommandEncoder::commit(std::function<void()> completion) {
         }
       });
   buffer_->commit();
+  commit_count.fetch_add(1, std::memory_order_relaxed);
   buffer_ = NS::RetainPtr(queue_->commandBufferWithUnretainedReferences());
   buffer_ops_ = 0;
   buffer_sizes_ = 0;
@@ -574,6 +584,7 @@ void CommandEncoder::synchronize() {
   auto cbuf = buffer_; // retained
   end_encoding();
   commit();
+  sync_count.fetch_add(1, std::memory_order_relaxed);
   cbuf->waitUntilCompleted();
 
   if (!exiting_) {
@@ -978,6 +989,19 @@ bool is_nax_available() {
   static bool is_nax_available_ = _check_nax();
   return is_nax_available_;
 #endif
+}
+
+Counters counters() {
+  return {
+      dispatch_count.load(std::memory_order_relaxed),
+      commit_count.load(std::memory_order_relaxed),
+      sync_count.load(std::memory_order_relaxed)};
+}
+
+void reset() {
+  dispatch_count.store(0, std::memory_order_relaxed);
+  commit_count.store(0, std::memory_order_relaxed);
+  sync_count.store(0, std::memory_order_relaxed);
 }
 
 } // namespace mlx::core::metal

@@ -28,6 +28,11 @@ const std::string& get_metallib_path() {
       "[metal::get_metallib_path] Cannot get metallib path without metal backend");
 }
 
+Counters counters() {
+  return {0, 0, 0};
+}
+void reset() {}
+
 } // namespace metal
 
 } // namespace mlx::core
