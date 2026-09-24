@@ -45,15 +45,24 @@ Event::Event(Stream stream) : stream_(stream) {
 
 void Event::wait() {
   check_error();
+  if (stream_.device == Device::gpu) {
+    metal::count_host_wait();
+  }
   cast<metal::EventImpl>().wait(value());
   check_error();
 }
 
 void Event::wait(Stream stream) {
   if (stream.device == Device::cpu) {
-    scheduler::wait_event(stream, *this, [value = value()](Event& self) {
-      self.cast<metal::EventImpl>().wait(value);
-    });
+    scheduler::wait_event(
+        stream,
+        *this,
+        [value = value(), gpu = stream_.device == Device::gpu](Event& self) {
+          if (gpu) {
+            metal::count_host_wait();
+          }
+          self.cast<metal::EventImpl>().wait(value);
+        });
   } else {
     auto& encoder = metal::get_command_encoder(stream);
     encoder.wait_event(*this, value());

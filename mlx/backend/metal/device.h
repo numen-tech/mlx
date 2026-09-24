@@ -94,7 +94,7 @@ class MLX_API CommandEncoder {
   void signal_event(Event event, uint64_t value);
   bool needs_commit() const;
   void commit(std::function<void()> completion = nullptr);
-  void synchronize();
+  void synchronize(bool explicit_sync = false);
 
   MTL::CommandBuffer* get_command_buffer() const {
     return buffer_.get();
@@ -256,5 +256,8 @@ std::unordered_map<int, CommandEncoder>& get_global_command_encoders();
 NS::SharedPtr<NS::AutoreleasePool> new_scoped_memory_pool();
 
 bool is_nax_available();
+
+// Call before each host wait on GPU work.
+void count_host_wait();
 
 } // namespace mlx::core::metal

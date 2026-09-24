@@ -81,7 +81,7 @@ void finalize(Stream s) {
   cu::get_command_encoder(s).commit();
 }
 
-void synchronize(Stream s) {
+void synchronize(Stream s, bool) {
   nvtx3::scoped_range r("gpu::synchronize");
   cu::get_command_encoder(s).synchronize();
 }

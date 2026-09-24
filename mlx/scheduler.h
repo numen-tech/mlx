@@ -37,6 +37,9 @@ class MLX_API Scheduler {
     {
       std::lock_guard<std::mutex> lk(mtx);
       n_active_tasks_++;
+      if (stream.device == Device::gpu) {
+        n_active_gpu_tasks_++;
+      }
     }
     completion_cv.notify_all();
   }
@@ -45,6 +48,9 @@ class MLX_API Scheduler {
     {
       std::lock_guard<std::mutex> lk(mtx);
       n_active_tasks_--;
+      if (stream.device == Device::gpu) {
+        n_active_gpu_tasks_--;
+      }
     }
     completion_cv.notify_all();
   }
@@ -57,10 +63,24 @@ class MLX_API Scheduler {
     std::unique_lock<std::mutex> lk(mtx);
     int n_tasks_old = n_active_tasks();
     if (n_tasks_old > 1) {
+      int n_gpu_tasks_old = n_active_gpu_tasks_;
       completion_cv.wait(lk, [this, n_tasks_old] {
         return this->n_active_tasks() < n_tasks_old;
       });
+      // Count only when a GPU task completed during the wait.
+      if (n_active_gpu_tasks_ < n_gpu_tasks_old) {
+        gpu_waits_.fetch_add(1, std::memory_order_relaxed);
+      }
     }
+  }
+
+  // Blocking wait_for_one() calls that ended on a GPU task completion.
+  uint64_t gpu_waits() const {
+    return gpu_waits_.load(std::memory_order_relaxed);
+  }
+
+  void reset_gpu_waits() {
+    gpu_waits_.store(0, std::memory_order_relaxed);
   }
 
  private:
@@ -69,6 +89,8 @@ class MLX_API Scheduler {
   StreamThread& get_thread(Stream s);
 
   int n_active_tasks_{0};
+  int n_active_gpu_tasks_{0};
+  std::atomic<uint64_t> gpu_waits_{0};
   std::unordered_map<int, std::unique_ptr<StreamThread>> threads_;
   std::shared_mutex threads_mtx_;
   std::condition_variable completion_cv;
