@@ -542,9 +542,7 @@ void qmv(
 // The 1-bit path has so little weight traffic that unpacking into registers
 // dominates even when several input rows reuse the result. The 2-bit path
 // breaks even after two rows and wins once three or more rows share a block.
-// affine_sym (bias-free 1/2-bit) has no qmv_wide kernel at all: its only
-// entry points are affine_sym_qmv / affine_sym_qmv_fast, so it must never
-// take the wide route regardless of M.
+// affine_sym has no qmv_wide kernel.
 inline bool
 use_qmv_wide(const std::string& mode, int bits, int M, metal::Device& d) {
   if (mode == "affine_sym") {

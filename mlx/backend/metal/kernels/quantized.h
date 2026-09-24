@@ -1839,13 +1839,8 @@ template <
       simd_lid);
 }
 
-// Bias-free (symmetric) decode kernels: no biases buffer; the affine bias is
-// derived from the scale in-kernel (see sym_derived_bias). Buffer indices
-// follow the affine_qmv* layout with the biases slot (buffer 2) left unbound:
-// since 0.32.2 the host qmv() binds x at buffer 3 whether or not a biases /
-// global_scale buffer is present. has_global_scale and results_per_simdgroup
-// mirror affine_qmv's template signature (the host instantiates every qmv
-// kernel with them) and are unused here, exactly as in affine_qmv.
+// Bias-free decode kernels: same buffer layout as affine_qmv* with the biases
+// slot (buffer 2) unbound; the bias comes from sym_derived_bias.
 template <
     typename T,
     int group_size,

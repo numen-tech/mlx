@@ -885,29 +885,14 @@ class TestQuantized(mlx_tests.MLXTestCase):
     @unittest.skipUnless(mx.metal.is_available(), "Bias-free affine is Metal-only")
     def test_qmv_affine_sym(self):
         def assert_sym_matches_biased(y_sym, y_biased):
-            # Both paths accumulate the same fp32 products, but the biased
-            # reference may run a different kernel (qmv_quad for K in {64, 128},
-            # qmv_wide for 2-bit M >= 3 on gen-15+ GPUs), so the sums can differ
-            # by a few ulps of the output dtype at the largest output magnitude.
+            # The biased reference may run a different kernel, so allow a few
+            # ulps of the output dtype.
             tol = 4 * mx.finfo(y_biased.dtype).eps * y_biased.abs().max()
             diff = (y_sym.astype(mx.float32) - y_biased.astype(mx.float32)).abs()
             self.assertLessEqual(diff.max().item(), tol.item())
 
-        # Fork-only path: an affine quantized_matmul called with biases=None
-        # (bits <= 2, transpose=True, mat-vec regime) dispatches to the
-        # bias-free affine_sym_qmv / affine_sym_qmv_fast kernels, which derive
-        # the bias from the scale in-kernel (-scale/2 for 1-bit, -scale for
-        # 2-bit). Compare against the biased kernels fed exactly those derived
-        # biases and against a dequantize-then-matmul reference. K % 1024 == 0
-        # (1-bit) / K % 512 == 0 (2-bit) with N % 8 == 0 selects the _fast
-        # variant (qmv_fast_k_alignment), the other shapes the generic one;
-        # K in {64, 128} takes qmv_quad on the biased path and must not here
-        # (there is no bias-free qmv_quad), and M in [2, 8] must stay off
-        # qmv_wide (no bias-free qmv_wide either). Every shape here is in the
-        # mat-vec regime on every GPU generation: get_qmv_batch_limit
-        # (backend/metal/quantized.cpp) returns at least 13 for K <= 2048 and
-        # N <= 256, and the largest M is 8, so the eval must not throw;
-        # test_qmv_affine_sym_throws pins the rejection above the limit.
+        # Bias-free affine (biases=None) must match the biased kernels fed the
+        # derived biases and a dequantized reference, on both qmv variants.
         key = mx.random.key(0)
         k1, k2 = mx.random.split(key)
         Ms = [1, 2, 3, 8]
@@ -970,16 +955,11 @@ class TestQuantized(mlx_tests.MLXTestCase):
 
         w_q, scales, _ = mx.quantize(w, 64, 2)
         x_qvm = mx.random.normal(shape=(1, 64))
-        # M at and far above the qmv batch limit. get_qmv_batch_limit
-        # (backend/metal/quantized.cpp) returns at most 33 (gen-17+, K and N
-        # <= 2048) and the dispatch rejects M >= limit, so M = 33 is the
-        # smallest M rejected on every GPU generation for this K = 512, N = 64.
+        # M = 33 is the smallest M above the qmv batch limit on every GPU.
         x_qmm_edge = mx.random.normal(shape=(33, 512))
         x_qmm = mx.random.normal(shape=(512, 512))
-        # The remaining checks throw from eval_gpu / eval_cpu, so evaluate every
-        # input up front: an array computed inside an eval that throws never has
-        # its completion event signaled, and a consumer on another stream (the
-        # CPU case below) would then wait on that event forever.
+        # Evaluate the inputs up front: the checks below throw inside eval, and
+        # an input left inside a failed eval would block the CPU stream.
         mx.eval(x, w_q, scales, x_qvm, x_qmm_edge, x_qmm)
 
         # Non-transposed (qvm) path has no bias-free kernel.
