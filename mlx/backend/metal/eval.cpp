@@ -76,8 +76,8 @@ void finalize(Stream s) {
   encoder.commit();
 }
 
-void synchronize(Stream s) {
-  metal::get_command_encoder(s).synchronize();
+void synchronize(Stream s, bool explicit_sync) {
+  metal::get_command_encoder(s).synchronize(explicit_sync);
 }
 
 void clear_streams() {

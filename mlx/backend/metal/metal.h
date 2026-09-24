@@ -37,7 +37,8 @@ MLX_API const std::string& get_metallib_path();
  *   A commit is not a host wait.
  * - `syncs`: explicit stream synchronizations (CommandEncoder::synchronize(),
  *   i.e. mx::synchronize()). Encoder teardown (clear_streams(), thread exit)
- *   is not counted.
+ *   and the internal flush after a primitive throws in eval() are not
+ *   counted.
  * - `waits`: host blocking waits on GPU completion. Counted once per wait
  *   *call*, whether or not the GPU had already finished, never as blocking
  *   time: Metal shared-event waits on a GPU-signaled event
@@ -45,7 +46,7 @@ MLX_API const std::string& get_metallib_path();
  *   stream waiting on a GPU event), the waitUntilCompleted inside
  *   synchronize() (so every sync is also a wait), the CPU-stream spin on a
  *   GPU-updated fast fence, and eval() throttling (scheduler::wait_for_one())
- *   that blocks while GPU command buffers are in flight. Waits on CPU-signaled
+ *   that ends when a GPU command buffer completes. Waits on CPU-signaled
  *   events and fences are not counted. Note array::wait() skips the event
  *   wait when the event is already signaled, so an eval() whose GPU work
  *   finished before the host checked records no wait.

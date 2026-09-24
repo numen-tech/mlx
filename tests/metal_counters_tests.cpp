@@ -85,3 +85,30 @@ TEST_CASE("test metal counters skip encoder teardown") {
   CHECK_EQ(r.syncs, 0);
   CHECK_EQ(r.waits, 0);
 }
+
+TEST_CASE("test metal counters skip eval error recovery") {
+  Device gpu = Device::gpu;
+  auto a = full({1024}, 3.0f, gpu);
+  auto b = multiply(a, array(2.0f), gpu);
+  // A Metal compile error makes the kernel throw at eval time.
+  auto kernel = fast::metal_kernel(
+      "test_metal_counters_bad_kernel",
+      {"inp"},
+      {"out"},
+      "this is not metal code {");
+  auto outs = kernel(
+      {b},
+      {b.shape()},
+      {b.dtype()},
+      {1, 1, 1},
+      {1, 1, 1},
+      {},
+      std::nullopt,
+      false,
+      gpu);
+
+  metal::reset();
+  CHECK_THROWS(eval(outs[0]));
+  CHECK_EQ(metal::counters().syncs, 0);
+  CHECK(all(equal(b, array(6.0f), gpu), gpu).item<bool>());
+}

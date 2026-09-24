@@ -581,14 +581,16 @@ void CommandEncoder::commit(std::function<void()> completion) {
   buffer_sizes_ = 0;
 }
 
-void CommandEncoder::synchronize() {
+void CommandEncoder::synchronize(bool explicit_sync) {
   auto pool = new_scoped_memory_pool();
   auto cbuf = buffer_; // retained
   end_encoding();
   commit();
-  // Encoder teardown (clear_streams(), thread exit) is not an explicit sync.
-  if (!exiting_) {
+  if (explicit_sync) {
     sync_count.fetch_add(1, std::memory_order_relaxed);
+  }
+  // Encoder teardown (clear_streams(), thread exit) is not a host wait.
+  if (!exiting_) {
     count_host_wait();
   }
   cbuf->waitUntilCompleted();

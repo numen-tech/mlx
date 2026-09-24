@@ -94,7 +94,7 @@ class MLX_API CommandEncoder {
   void signal_event(Event event, uint64_t value);
   bool needs_commit() const;
   void commit(std::function<void()> completion = nullptr);
-  void synchronize();
+  void synchronize(bool explicit_sync = false);
 
   MTL::CommandBuffer* get_command_buffer() const {
     return buffer_.get();
