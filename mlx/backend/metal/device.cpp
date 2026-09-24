@@ -34,8 +34,7 @@ namespace mlx::core::metal {
 
 namespace {
 
-// Work counters behind counters()/reset() (metal.h). Relaxed: they are
-// statistics read while no eval is in flight, never used for synchronization.
+// Statistics for counters() (metal.h), not used for synchronization.
 std::atomic<uint64_t> dispatch_count{0};
 std::atomic<uint64_t> commit_count{0};
 std::atomic<uint64_t> sync_count{0};

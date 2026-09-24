@@ -28,35 +28,8 @@ MLX_API const
 MLX_API void set_metallib_path(const std::string& path);
 MLX_API const std::string& get_metallib_path();
 
-/** Process-wide Metal work counters, summed over every stream.
- *
- * - `dispatches`: compute kernel dispatches (dispatchThreadgroups /
- *   dispatchThreads).
- * - `commits`: command-buffer commits, including the automatic splits made
- *   when a buffer exceeds MLX_MAX_OPS_PER_BUFFER / MLX_MAX_MB_PER_BUFFER.
- *   A commit is not a host wait.
- * - `syncs`: explicit stream synchronizations (CommandEncoder::synchronize(),
- *   i.e. mx::synchronize()). Encoder teardown (clear_streams(), thread exit)
- *   and the internal flush after a primitive throws in eval() are not
- *   counted.
- * - `waits`: host blocking waits on GPU completion. Counted once per wait
- *   *call*, whether or not the GPU had already finished, never as blocking
- *   time: Metal shared-event waits on a GPU-signaled event
- *   (EventImpl::wait: an eval()/item() on an array still in flight, or a CPU
- *   stream waiting on a GPU event), the waitUntilCompleted inside
- *   synchronize() (so every sync is also a wait), the CPU-stream spin on a
- *   GPU-updated fast fence, and eval() throttling (scheduler::wait_for_one())
- *   that ends when a GPU command buffer completes. Waits on CPU-signaled
- *   events and fences are not counted. Note array::wait() skips the event
- *   wait when the event is already signaled, so an eval() whose GPU work
- *   finished before the host checked records no wait.
- *
- * Every field is built from independent relaxed atomics with no
- * happens-before relation to the GPU or to other threads encoding work.
- * counters() is a set of independent loads and reset() a set of independent
- * stores, so both are only meaningful while no eval is in flight on any
- * thread: call them after the measured eval has completed and before the next
- * one starts. */
+// Process-wide Metal work counters. syncs counts mx::synchronize() calls,
+// waits counts host waits on GPU work. Read or reset only while no eval runs.
 struct Counters {
   uint64_t dispatches;
   uint64_t commits;
