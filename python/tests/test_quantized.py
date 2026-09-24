@@ -882,6 +882,133 @@ class TestQuantized(mlx_tests.MLXTestCase):
                     self.assertEqual(y_q.shape, y_hat.shape)
                     self.assertLess((y_q - y_hat).abs().max(), 1e-3)
 
+    @unittest.skipUnless(mx.metal.is_available(), "Bias-free affine is Metal-only")
+    def test_qmv_affine_sym(self):
+        def assert_sym_matches_biased(y_sym, y_biased):
+            # The biased reference may run a different kernel, so allow a few
+            # ulps of the output dtype.
+            tol = 4 * mx.finfo(y_biased.dtype).eps * y_biased.abs().max()
+            diff = (y_sym.astype(mx.float32) - y_biased.astype(mx.float32)).abs()
+            self.assertLessEqual(diff.max().item(), tol.item())
+
+        # Bias-free affine (biases=None) must match the biased kernels fed the
+        # derived biases and a dequantized reference, on both qmv variants.
+        key = mx.random.key(0)
+        k1, k2 = mx.random.split(key)
+        Ms = [1, 2, 3, 8]
+        Ns = [256, 67]  # 67 is a non-multiple of the 8-row output tile
+        for bits, group_size, K in product(
+            [1, 2], [32, 64, 128], [64, 128, 512, 1024, 2048]
+        ):
+            if K < group_size:
+                continue
+            for M, N in product(Ms, Ns):
+                with self.subTest(M=M, N=N, K=K, group_size=group_size, bits=bits):
+                    x = mx.random.normal(shape=(M, K), key=k1)
+                    w = mx.random.normal(shape=(N, K), key=k2)
+                    w_q, scales, _ = mx.quantize(w, group_size, bits)
+                    sym_biases = -0.5 * scales if bits == 1 else -scales
+                    w_hat = mx.dequantize(w_q, scales, sym_biases, group_size, bits)
+                    y_hat = x @ mx.swapaxes(w_hat, -1, -2)
+                    y_biased = mx.quantized_matmul(
+                        x, w_q, scales, sym_biases, True, group_size, bits
+                    )
+                    y_sym = mx.quantized_matmul(
+                        x, w_q, scales, None, True, group_size, bits
+                    )
+                    mx.eval(y_sym)
+                    self.assertEqual(y_sym.shape, y_hat.shape)
+                    self.assertEqual(y_sym.dtype, x.dtype)
+                    assert_sym_matches_biased(y_sym, y_biased)
+                    self.assertLess((y_sym - y_hat).abs().max(), 1e-3)
+
+        # Half-precision activations: the kernels are templated on the
+        # activation type and derive the bias in fp32 from the fp16/bf16 scale.
+        for dtype, bits, K in product([mx.float16, mx.bfloat16], [1, 2], [512, 2048]):
+            for M in [1, 3]:
+                with self.subTest(dtype=dtype, M=M, K=K, bits=bits):
+                    x = mx.random.normal(shape=(M, K), key=k1).astype(dtype)
+                    w = mx.random.normal(shape=(256, K), key=k2).astype(dtype)
+                    w_q, scales, _ = mx.quantize(w, 64, bits)
+                    sym_biases = -0.5 * scales if bits == 1 else -scales
+                    y_biased = mx.quantized_matmul(
+                        x, w_q, scales, sym_biases, True, 64, bits
+                    )
+                    y_sym = mx.quantized_matmul(x, w_q, scales, None, True, 64, bits)
+                    self.assertEqual(y_sym.dtype, dtype)
+                    assert_sym_matches_biased(y_sym, y_biased)
+
+    @unittest.skipUnless(mx.metal.is_available(), "Bias-free affine is Metal-only")
+    def test_qmv_affine_sym_throws(self):
+        x = mx.random.normal(shape=(1, 512))
+        w = mx.random.normal(shape=(64, 512))
+
+        # Bias-free affine is defined for 1- and 2-bit only.
+        for bits in [3, 4, 8]:
+            w_q, scales, _ = mx.quantize(w, 64, bits)
+            with self.assertRaises(ValueError):
+                mx.quantized_matmul(x, w_q, scales, None, True, 64, bits)
+        w_q, scales, _ = mx.quantize(w, 64, 2)
+        for bits in [0, -1]:
+            with self.assertRaises(ValueError):
+                mx.quantized_matmul(x, w_q, scales, None, True, 64, bits)
+
+        w_q, scales, _ = mx.quantize(w, 64, 2)
+        x_qvm = mx.random.normal(shape=(1, 64))
+        # M = 33 is the smallest M above the qmv batch limit on every GPU.
+        x_qmm_edge = mx.random.normal(shape=(33, 512))
+        x_qmm = mx.random.normal(shape=(512, 512))
+        # Evaluate the inputs up front: the checks below throw inside eval, and
+        # an input left inside a failed eval would block the CPU stream.
+        mx.eval(x, w_q, scales, x_qvm, x_qmm_edge, x_qmm)
+
+        # Non-transposed (qvm) path has no bias-free kernel.
+        with self.assertRaises(RuntimeError):
+            mx.eval(mx.quantized_matmul(x_qvm, w_q, scales, None, False, 64, 2))
+        # Matrix regime (M >= the device's qmv batch limit) is qmm-only: the
+        # bias-free path says so instead of silently taking the qmm route.
+        for x_big in [x_qmm_edge, x_qmm]:
+            with self.subTest(M=x_big.shape[0]):
+                with self.assertRaisesRegex(RuntimeError, "Bias-free affine"):
+                    mx.eval(mx.quantized_matmul(x_big, w_q, scales, None, True, 64, 2))
+        # CPU has no bias-free kernel either.
+        with self.assertRaises(RuntimeError):
+            mx.eval(
+                mx.quantized_matmul(x, w_q, scales, None, True, 64, 2, stream=mx.cpu)
+            )
+        # Sanity: the very same call on the GPU mat-vec path works.
+        mx.eval(mx.quantized_matmul(x, w_q, scales, None, True, 64, 2))
+
+    @unittest.skipUnless(mx.metal.is_available(), "Bias-free affine is Metal-only")
+    def test_qmv_affine_sym_grad(self):
+        # The reverse products use the biased kernels with the derived bias, so
+        # the gradients match the explicitly biased call.
+        key = mx.random.key(1)
+        k1, k2, k3 = mx.random.split(key, 3)
+        for bits, K in product([1, 2], [512, 1024]):
+            with self.subTest(bits=bits, K=K):
+                x = mx.random.normal(shape=(2, K), key=k1)
+                w = mx.random.normal(shape=(64, K), key=k2)
+                w_q, scales, _ = mx.quantize(w, 64, bits)
+                cotan = mx.random.normal(shape=(2, 64), key=k3)
+
+                def f_sym(x, scales):
+                    return mx.quantized_matmul(x, w_q, scales, None, True, 64, bits)
+
+                def f_biased(x, scales):
+                    biases = -0.5 * scales if bits == 1 else -scales
+                    return mx.quantized_matmul(x, w_q, scales, biases, True, 64, bits)
+
+                _, vjp_sym = mx.vjp(f_sym, [x, scales], [cotan])
+                _, vjp_biased = mx.vjp(f_biased, [x, scales], [cotan])
+                for a, b in zip(vjp_sym, vjp_biased):
+                    self.assertEqual(a.shape, b.shape)
+                    self.assertLess((a - b).abs().max().item(), 1e-3)
+
+                _, jvp_sym = mx.jvp(lambda x: f_sym(x, scales), [x], [x])
+                _, jvp_biased = mx.jvp(lambda x: f_biased(x, scales), [x], [x])
+                self.assertLess((jvp_sym[0] - jvp_biased[0]).abs().max().item(), 1e-3)
+
     def test_qvm(self):
         key = mx.random.key(0)
         k1, k2 = mx.random.split(key)

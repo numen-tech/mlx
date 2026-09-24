@@ -4791,11 +4791,28 @@ array quantized_matmul(
     std::optional<int> bits_ /* = std::nullopt */,
     const std::string& mode /* = "affine" */,
     StreamOrDevice s /* = {} */) {
-  auto [dtype, qmode] = validate_mode_with_type(
-      "quantized_matmul", scales, biases, std::nullopt, mode);
+  Dtype dtype = float32;
+  QuantizationMode qmode;
+  if (mode == "affine" && !biases) {
+    // Bias-free (symmetric) affine: 1/2-bit formats where the bias is a fixed
+    // function of the scale and is derived in-kernel.
+    qmode = QuantizationMode::Affine;
+    dtype = scales.dtype();
+    if (!issubdtype(dtype, floating)) {
+      throw std::invalid_argument(
+          "[quantized_matmul] Bias-free affine requires floating scales.");
+    }
+  } else {
+    std::tie(dtype, qmode) = validate_mode_with_type(
+        "quantized_matmul", scales, biases, std::nullopt, mode);
+  }
 
   auto [group_size, bits] =
       quantization_params_from_mode(qmode, group_size_, bits_);
+  if (qmode == QuantizationMode::Affine && !biases && bits != 1 && bits != 2) {
+    throw std::invalid_argument(
+        "[quantized_matmul] Bias-free affine supports bits in {1, 2} only.");
+  }
   // Check and extract the quantized matrix shape against x
   auto [w_inner_dims, w_outer_dims] = extract_quantized_matmul_dims(
       "quantized_matmul", x, w, scales, biases, transpose, group_size, bits);
@@ -4814,8 +4831,10 @@ array quantized_matmul(
   }
   std::vector<array> inputs;
   if (qmode == QuantizationMode::Affine) {
-    inputs = {
-        astype(x, dtype), w, astype(scales, dtype), astype(*biases, dtype)};
+    inputs = {astype(x, dtype), w, astype(scales, dtype)};
+    if (biases) {
+      inputs.push_back(astype(*biases, dtype));
+    }
   } else {
     inputs = {x, w, scales};
   }
