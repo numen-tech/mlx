@@ -233,10 +233,7 @@ inline U qdot(
   U accum = 0;
 
   if (bits == 1) {
-    // Wider load: read 4 packed bytes as one 32-bit word (1 load instead of 4
-    // byte loads) and extract the same 32 one-bit weights. Little-endian bit
-    // order + accumulation order are preserved, so this is bit-exact vs the
-    // per-byte path while quartering the weight-load instruction count.
+    // 1-bit: read 32 packed weights as one 32-bit word.
     const device uint32_t* w32 = (const device uint32_t*)w;
     for (int i = 0; i < (values_per_thread / 32); i++) {
       uint32_t wb = w32[i];
@@ -849,14 +846,8 @@ METAL_FUNC void qmv_quad_impl(
   }
 }
 
-// Symmetric (bias-free) formats: the affine bias is a fixed function of the
-// scale, so kernels derive it instead of reading a biases buffer.
-// 1-bit (scale=2d, values ±d): bias = -scale/2. 2-bit ternary (scale=d,
-// values {-d,0,+d}): bias = -scale. Removes the bias stream (~10% of the
-// weight-stream bytes at 1-bit/g128); same ALU (sum_x is computed anyway).
-// bias_free is threaded through so the assert fires only when the symmetric
-// path is actually selected — the ternary at the call sites instantiates this
-// template for every bits value, including the affine-only widths.
+// Bias-free formats derive the bias from the scale: -scale/2 for 1-bit,
+// -scale for 2-bit.
 template <typename U, int bits, bool bias_free>
 METAL_FUNC U sym_derived_bias(U scale) {
   static_assert(

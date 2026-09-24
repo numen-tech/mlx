@@ -3472,13 +3472,7 @@ TEST_CASE("test bias-free affine quantized_matmul decode") {
       CHECK_EQ(out.dtype(), dtype);
       CHECK_EQ(out.shape(), Shape{1, c.N});
 
-      // fp32: both sides accumulate K products in fp32, only the summation
-      // order differs (per-lane partials + simd tree vs. the CPU matmul), so
-      // a few fp32 ulps of the result; 1e-4 relative is ~100x that. fp16: the
-      // kernel accumulates in fp32 and rounds the result once to fp16 (2^-11
-      // relative), and x/scales are exact in both; 4e-3 relative is ~8x that.
-      // A wrong bias, a missed tail or a misread weight word moves outputs by
-      // O(scale * K^0.5) ~ 1 or more, far outside either bound.
+      // The tolerance covers accumulation order and the fp16 output rounding.
       float rtol = dtype == float32 ? 1e-4f : 4e-3f;
       float scale = max(abs(expected, cpu), cpu).item<float>();
       float max_diff =
