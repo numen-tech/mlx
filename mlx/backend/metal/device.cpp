@@ -15,6 +15,7 @@
 #include "mlx/backend/metal/event.h"
 #include "mlx/backend/metal/metal.h"
 #include "mlx/backend/metal/utils.h"
+#include "mlx/scheduler.h"
 #include "mlx/utils.h"
 
 namespace std {
@@ -585,8 +586,11 @@ void CommandEncoder::synchronize() {
   auto cbuf = buffer_; // retained
   end_encoding();
   commit();
-  sync_count.fetch_add(1, std::memory_order_relaxed);
-  count_host_wait();
+  // Encoder teardown (clear_streams(), thread exit) is not an explicit sync.
+  if (!exiting_) {
+    sync_count.fetch_add(1, std::memory_order_relaxed);
+    count_host_wait();
+  }
   cbuf->waitUntilCompleted();
 
   if (!exiting_) {
@@ -1002,7 +1006,8 @@ Counters counters() {
       dispatch_count.load(std::memory_order_relaxed),
       commit_count.load(std::memory_order_relaxed),
       sync_count.load(std::memory_order_relaxed),
-      wait_count.load(std::memory_order_relaxed)};
+      wait_count.load(std::memory_order_relaxed) +
+          scheduler::scheduler().gpu_waits()};
 }
 
 void reset() {
@@ -1010,6 +1015,7 @@ void reset() {
   commit_count.store(0, std::memory_order_relaxed);
   sync_count.store(0, std::memory_order_relaxed);
   wait_count.store(0, std::memory_order_relaxed);
+  scheduler::scheduler().reset_gpu_waits();
 }
 
 } // namespace mlx::core::metal

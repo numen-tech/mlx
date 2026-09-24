@@ -7,7 +7,7 @@
 namespace mlx::core {
 
 struct FenceImpl {
-  FenceImpl(Stream stream) {
+  FenceImpl(Stream stream) : device(stream.device) {
     auto d = metal::device(stream.device).mtl_device();
     if (!d->supportsFamily(MTL::GPUFamilyMetal3)) {
       use_fast = false;
@@ -29,6 +29,8 @@ struct FenceImpl {
       allocator::free(allocator::Buffer{static_cast<MTL::Buffer*>(fence)});
     }
   }
+  // Device of the stream that updates (signals) the fence.
+  Device device;
   bool use_fast{false};
   uint32_t count{0};
   void* fence;
@@ -55,7 +57,9 @@ void Fence::wait(Stream stream, const array& x) {
   if (stream.device == Device::cpu) {
     scheduler::enqueue(stream, [fence_ = fence_, count = f.count]() mutable {
       auto& f = *static_cast<FenceImpl*>(fence_.get());
-      metal::count_host_wait();
+      if (f.device == Device::gpu) {
+        metal::count_host_wait();
+      }
       while (f.cpu_value()[0] < count) {
       }
     });

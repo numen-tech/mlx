@@ -36,21 +36,26 @@ MLX_API const std::string& get_metallib_path();
  *   when a buffer exceeds MLX_MAX_OPS_PER_BUFFER / MLX_MAX_MB_PER_BUFFER.
  *   A commit is not a host wait.
  * - `syncs`: explicit stream synchronizations (CommandEncoder::synchronize(),
- *   i.e. mx::synchronize()).
+ *   i.e. mx::synchronize()). Encoder teardown (clear_streams(), thread exit)
+ *   is not counted.
  * - `waits`: host blocking waits on GPU completion. Counted once per wait
  *   *call*, whether or not the GPU had already finished, never as blocking
- *   time: Metal shared-event waits (EventImpl::wait: an eval()/item() on an
- *   array still in flight, or a CPU stream waiting on a GPU event), the
- *   waitUntilCompleted inside synchronize() (so every sync is also a wait),
- *   and the CPU-stream spin on a fast fence. Note array::wait() skips the
- *   event wait when the event is already signaled, so an eval() whose GPU
- *   work finished before the host checked records no wait.
+ *   time: Metal shared-event waits on a GPU-signaled event
+ *   (EventImpl::wait: an eval()/item() on an array still in flight, or a CPU
+ *   stream waiting on a GPU event), the waitUntilCompleted inside
+ *   synchronize() (so every sync is also a wait), the CPU-stream spin on a
+ *   GPU-updated fast fence, and eval() throttling (scheduler::wait_for_one())
+ *   that blocks while GPU command buffers are in flight. Waits on CPU-signaled
+ *   events and fences are not counted. Note array::wait() skips the event
+ *   wait when the event is already signaled, so an eval() whose GPU work
+ *   finished before the host checked records no wait.
  *
- * Every field is an independent relaxed atomic with no happens-before
- * relation to the GPU or to other threads encoding work. counters() is four
- * independent loads and reset() four independent stores, so both are only
- * meaningful while no eval is in flight on any thread: call them after the
- * measured eval has completed and before the next one starts. */
+ * Every field is built from independent relaxed atomics with no
+ * happens-before relation to the GPU or to other threads encoding work.
+ * counters() is a set of independent loads and reset() a set of independent
+ * stores, so both are only meaningful while no eval is in flight on any
+ * thread: call them after the measured eval has completed and before the next
+ * one starts. */
 struct Counters {
   uint64_t dispatches;
   uint64_t commits;
