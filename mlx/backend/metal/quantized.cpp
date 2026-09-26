@@ -1523,11 +1523,14 @@ void qmm_splitk(
   MTL::Size grid_dims(n_tiles, m_tiles, split_k);
 
   bool aligned = N % 32 == 0;
-  // The 2-bit gs128 split-K kernel carries a tensor-unit (NAX) body for
-  // few-row tiles. It is only correct on generation-18+ GPUs, so the host
-  // selects it; every other GPU takes the SIMD body.
-  bool use_nax = metal::is_nax_available() && bits == 2 && group_size == 128 &&
-      (x.dtype() == float32 || x.dtype() == float16);
+  // The affine 2-bit gs128 split-K kernel carries a tensor-unit (NAX) body
+  // for few-row tiles, selected when metal::is_nax_available() reports a
+  // tensor unit. FP32 input honors the MLX_ENABLE_TF32 opt-out like the other
+  // NAX dispatches. The fp modes have no NAX variant.
+  bool affine = mode == "affine";
+  bool use_nax = affine && metal::is_nax_available() && bits == 2 &&
+      group_size == 128 &&
+      (x.dtype() == float16 || (x.dtype() == float32 && env::enable_tf32()));
   std::string type_string = get_type_string(x.dtype());
   std::string kname;
   kname.reserve(64);
@@ -1540,10 +1543,11 @@ void qmm_splitk(
       "_b_",
       bits,
       aligned ? "_alN_true" : "_alN_false",
-      use_nax ? "_nax_true" : "_nax_false",
+      affine ? (use_nax ? "_nax_true" : "_nax_false") : "",
       is_implied_bias(biases) ? "_ib" : "");
-  // use_nax sits before BM in the template, so it is passed explicitly; BM/BK/BN
-  // = 32 are the kernel defaults, spelled out for the trailing implied-bias arg.
+  // use_nax sits before BM in the template, so an affine kernel gets it
+  // explicitly (the fp modes have no such parameter); BM/BK/BN = 32 are the
+  // kernel defaults, spelled out for the trailing implied-bias arg.
   auto kernel = is_implied_bias(biases) ? get_quantized_kernel_wrapped(
                                               d,
                                               kname,
@@ -1558,16 +1562,25 @@ void qmm_splitk(
                                               32,
                                               bn,
                                               true)
-                                        : get_quantized_kernel_wrapped(
-                                              d,
-                                              kname,
-                                              "qmm_t_splitk",
-                                              mode,
-                                              type_string,
-                                              group_size,
-                                              bits,
-                                              aligned,
-                                              use_nax);
+      : affine ? get_quantized_kernel_wrapped(
+                     d,
+                     kname,
+                     "qmm_t_splitk",
+                     mode,
+                     type_string,
+                     group_size,
+                     bits,
+                     aligned,
+                     use_nax)
+               : get_quantized_kernel_wrapped(
+                     d,
+                     kname,
+                     "qmm_t_splitk",
+                     mode,
+                     type_string,
+                     group_size,
+                     bits,
+                     aligned);
 
   compute_encoder.set_compute_pipeline_state(kernel);
 
