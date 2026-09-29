@@ -226,11 +226,13 @@ struct KernelVariant {
   size_t source_hash;
 };
 
-// Shared by all copies of one kernel function. Entries are not changed or
-// removed after insertion, so a pointer to one stays valid without the lock.
+// Shared by all copies of one kernel function. Holds at most
+// `metal_kernel_max_cached_variants` entries and is cleared when full. Callers
+// keep an owning pointer to their entry, so clearing is safe at any time.
 struct VariantCache {
   std::mutex mutex;
-  std::unordered_map<std::string, KernelVariant> variants;
+  std::unordered_map<std::string, std::shared_ptr<const KernelVariant>>
+      variants;
 };
 
 // Encodes each call argument that the name and source depend on. Template
@@ -355,11 +357,11 @@ CustomKernelFunction metal_kernel(
     auto s = resolve_metal_kernel_stream(s_);
 
     auto key = variant_key(inputs, output_dtypes, template_args);
-    const KernelVariant* variant = nullptr;
+    std::shared_ptr<const KernelVariant> variant;
     {
       std::lock_guard lock(cache->mutex);
       if (auto it = cache->variants.find(key); it != cache->variants.end()) {
-        variant = &it->second;
+        variant = it->second;
       }
     }
     if (!variant) {
@@ -415,16 +417,19 @@ CustomKernelFunction metal_kernel(
       }
 
       auto source_hash = std::hash<std::string>{}(kernel_source);
+      variant = std::make_shared<const KernelVariant>(KernelVariant{
+          std::move(kernel_name),
+          std::make_shared<const std::string>(std::move(kernel_source)),
+          source_hash});
       std::lock_guard lock(cache->mutex);
-      variant = &cache->variants
-                     .try_emplace(
-                         std::move(key),
-                         KernelVariant{
-                             std::move(kernel_name),
-                             std::make_shared<const std::string>(
-                                 std::move(kernel_source)),
-                             source_hash})
-                     .first->second;
+      if (auto it = cache->variants.find(key); it != cache->variants.end()) {
+        variant = it->second;
+      } else {
+        if (cache->variants.size() >= metal_kernel_max_cached_variants) {
+          cache->variants.clear();
+        }
+        cache->variants.emplace(std::move(key), variant);
+      }
     }
 
     if (verbose) {

@@ -119,3 +119,45 @@ TEST_CASE("test metal kernel copies share the memo across threads") {
     }
   }
 }
+
+TEST_CASE("test metal kernel variant memo is bounded") {
+  auto kernel = fast::metal_kernel(
+      "value_kernel", {"inp"}, {"out"}, "out[0] = static_cast<int>(V);");
+  auto inp = zeros({1}, int32);
+  auto call = [&](int v) { return call_sizeof(kernel, inp, {{"V", v}}); };
+  auto source_of = [](const array& out) {
+    return static_cast<const fast::CustomKernel&>(out.primitive())
+        .shared_source();
+  };
+
+  // A repeat call shares the memoized source.
+  auto pending = call(0);
+  auto pending_source = source_of(pending);
+  CHECK_EQ(source_of(call(0)), pending_source);
+
+  constexpr int n_values = 3 * fast::metal_kernel_max_cached_variants + 5;
+  std::vector<std::weak_ptr<const std::string>> sources;
+  for (int v = 1; v < n_values; ++v) {
+    auto out = call(v);
+    sources.push_back(source_of(out));
+    CHECK_EQ(out.item<int>(), v);
+  }
+
+  // Only the memo holds the sources of evaluated arrays.
+  size_t live = 0;
+  for (auto& source : sources) {
+    live += !source.expired();
+  }
+  CHECK_GT(live, 0);
+  CHECK_LE(live, fast::metal_kernel_max_cached_variants);
+
+  // The entry for 0 was evicted: a new call builds an equal, new source.
+  auto rebuilt = call(0);
+  CHECK_NE(source_of(rebuilt), pending_source);
+  CHECK_EQ(*source_of(rebuilt), *pending_source);
+
+  // The pending array still owns its source and evaluates correctly.
+  pending_source.reset();
+  CHECK_EQ(pending.item<int>(), 0);
+  CHECK_EQ(rebuilt.item<int>(), 0);
+}

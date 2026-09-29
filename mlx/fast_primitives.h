@@ -433,6 +433,9 @@ class Quantize : public Custom {
 
 using ScalarArg = std::variant<bool, int, float>;
 
+// The most variants that one metal_kernel function keeps built.
+inline constexpr size_t metal_kernel_max_cached_variants = 64;
+
 class CustomKernel : public Primitive {
  public:
   CustomKernel(
@@ -514,6 +517,10 @@ class CustomKernel : public Primitive {
         is_precompiled_,
         shared_memory_,
         compile_options_);
+  }
+
+  const std::shared_ptr<const std::string>& shared_source() const {
+    return source_;
   }
 
  private:

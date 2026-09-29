@@ -1113,6 +1113,35 @@ class TestFast(mlx_tests.MLXTestCase):
             self.assertEqual(call_sizeof(True), 1)
 
     @unittest.skipIf(not mx.metal.is_available(), "Metal is not available")
+    def test_custom_kernel_many_template_values(self):
+        # More variants than the kernel keeps built. An array made before
+        # its variant was evicted must still evaluate correctly.
+        kernel = mx.fast.metal_kernel(
+            name="value_kernel",
+            input_names=["inp"],
+            output_names=["out"],
+            source="out[0] = V;",
+        )
+        a = mx.zeros((1,), dtype=mx.int32)
+
+        def call_value(value):
+            return kernel(
+                inputs=[a],
+                grid=(1, 1, 1),
+                threadgroup=(1, 1, 1),
+                output_shapes=[(1,)],
+                output_dtypes=[mx.int32],
+                template=[("V", value)],
+                stream=mx.gpu,
+            )[0]
+
+        pending = call_value(0)
+        for value in range(1, 200):
+            self.assertEqual(call_value(value).item(), value)
+        self.assertEqual(pending.item(), 0)
+        self.assertEqual(call_value(0).item(), 0)
+
+    @unittest.skipIf(not mx.metal.is_available(), "Metal is not available")
     def test_custom_kernel_same_name_different_source_one_eval(self):
         # Regression test for #3832: two kernels sharing a name but with
         # different sources, dispatched in a SINGLE eval batch, must each run
