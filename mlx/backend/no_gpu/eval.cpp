@@ -27,7 +27,7 @@ void finalize(Stream) {
   throw std::runtime_error("[gpu::finalize] GPU backend is not available");
 }
 
-void synchronize(Stream) {
+void synchronize(Stream, bool) {
   throw std::runtime_error("[gpu::synchronize] GPU backend is not available");
 }
 
