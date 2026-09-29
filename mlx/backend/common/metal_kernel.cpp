@@ -1,7 +1,9 @@
 // Copyright © 2024 Apple Inc.
 
 #include <iostream>
+#include <mutex>
 #include <sstream>
+#include <unordered_map>
 
 #include "mlx/backend/common/compiled.h"
 #include "mlx/backend/metal/metal.h"
@@ -217,6 +219,57 @@ std::string make_template_hash(const std::string& template_def) {
   return template_hash;
 }
 
+// The name, source and source hash of one kernel variant.
+struct KernelVariant {
+  std::string name;
+  std::shared_ptr<const std::string> source;
+  size_t source_hash;
+};
+
+// Shared by all copies of one kernel function. Entries are not changed or
+// removed after insertion, so a pointer to one stays valid without the lock.
+struct VariantCache {
+  std::mutex mutex;
+  std::unordered_map<std::string, KernelVariant> variants;
+};
+
+// Encodes each call argument that the name and source depend on. Template
+// arguments include their kind and name: `int` 1 and `bool` true give the same
+// name but a different signature.
+std::string variant_key(
+    const std::vector<array>& inputs,
+    const std::vector<Dtype>& output_dtypes,
+    const std::vector<std::pair<std::string, TemplateArg>>& template_args) {
+  std::string key;
+  auto append_bytes = [&key](auto v) {
+    key.append(reinterpret_cast<const char*>(&v), sizeof(v));
+  };
+  for (const auto& arr : inputs) {
+    key += static_cast<char>(arr.dtype().val());
+    key += arr.ndim() == 0                     ? 's'
+        : arr.size() < max_constant_array_size ? 'c'
+                                               : 'd';
+  }
+  for (const auto& dtype : output_dtypes) {
+    key += static_cast<char>(dtype.val());
+  }
+  for (const auto& [name, arg] : template_args) {
+    key += static_cast<char>(arg.index());
+    append_bytes(name.size());
+    key += name;
+    std::visit(
+        [&](auto v) {
+          if constexpr (std::is_same_v<decltype(v), Dtype>) {
+            key += static_cast<char>(v.val());
+          } else {
+            append_bytes(v);
+          }
+        },
+        arg);
+  }
+  return key;
+}
+
 } // namespace
 
 CustomKernelFunction metal_kernel(
@@ -270,7 +323,10 @@ CustomKernelFunction metal_kernel(
     }
   }
 
+  auto cache = std::make_shared<VariantCache>();
+
   return [=,
+          cache = std::move(cache),
           shape_infos = std::move(shape_infos),
           attributes = std::move(attributes)](
              const std::vector<array>& inputs,
@@ -298,60 +354,83 @@ CustomKernelFunction metal_kernel(
 
     auto s = resolve_metal_kernel_stream(s_);
 
-    std::string kernel_name = "custom_kernel_" + name;
-    std::string template_def = "";
-    if (!template_args.empty()) {
-      template_def = write_template(template_args);
-      auto template_hash = make_template_hash(template_def);
-      kernel_name += "_";
-      kernel_name += template_hash;
-    }
-
-    // The generated source depends on the dtypes of the inputs and outputs
-    // and on how each input is passed (see `write_signature`). Include them
-    // in the kernel name so that a given name always maps to the same source.
-    for (const auto& arr : inputs) {
-      kernel_name += "_";
-      kernel_name += get_type_string(arr.dtype());
-      if (arr.ndim() == 0) {
-        kernel_name += "s";
-      } else if (arr.size() < max_constant_array_size) {
-        kernel_name += "c";
+    auto key = variant_key(inputs, output_dtypes, template_args);
+    const KernelVariant* variant = nullptr;
+    {
+      std::lock_guard lock(cache->mutex);
+      if (auto it = cache->variants.find(key); it != cache->variants.end()) {
+        variant = &it->second;
       }
     }
-    for (const auto& dtype : output_dtypes) {
-      kernel_name += "_";
-      kernel_name += get_type_string(dtype);
-    }
+    if (!variant) {
+      std::string kernel_name = "custom_kernel_" + name;
+      std::string template_def = "";
+      if (!template_args.empty()) {
+        template_def = write_template(template_args);
+        auto template_hash = make_template_hash(template_def);
+        kernel_name += "_";
+        kernel_name += template_hash;
+      }
 
-    std::string kernel_source = write_signature(
-        kernel_name,
-        header,
-        source,
-        input_names,
-        inputs,
-        output_names,
-        output_dtypes,
-        template_args,
-        attributes,
-        shape_infos,
-        atomic_outputs);
+      // The generated source depends on the dtypes of the inputs and outputs
+      // and on how each input is passed (see `write_signature`). Include them
+      // in the kernel name so that a given name always maps to the same
+      // source.
+      for (const auto& arr : inputs) {
+        kernel_name += "_";
+        kernel_name += get_type_string(arr.dtype());
+        if (arr.ndim() == 0) {
+          kernel_name += "s";
+        } else if (arr.size() < max_constant_array_size) {
+          kernel_name += "c";
+        }
+      }
+      for (const auto& dtype : output_dtypes) {
+        kernel_name += "_";
+        kernel_name += get_type_string(dtype);
+      }
 
-    if (!template_args.empty()) {
-      template_def = kernel_name + template_def;
-      kernel_source += "\ntemplate [[host_name(\"";
-      kernel_source += kernel_name;
-      kernel_source += "\")]] [[kernel]] decltype(";
-      kernel_source += template_def;
-      kernel_source += ") ";
-      kernel_source += template_def;
-      kernel_source += ";\n";
+      std::string kernel_source = write_signature(
+          kernel_name,
+          header,
+          source,
+          input_names,
+          inputs,
+          output_names,
+          output_dtypes,
+          template_args,
+          attributes,
+          shape_infos,
+          atomic_outputs);
+
+      if (!template_args.empty()) {
+        template_def = kernel_name + template_def;
+        kernel_source += "\ntemplate [[host_name(\"";
+        kernel_source += kernel_name;
+        kernel_source += "\")]] [[kernel]] decltype(";
+        kernel_source += template_def;
+        kernel_source += ") ";
+        kernel_source += template_def;
+        kernel_source += ";\n";
+      }
+
+      auto source_hash = std::hash<std::string>{}(kernel_source);
+      std::lock_guard lock(cache->mutex);
+      variant = &cache->variants
+                     .try_emplace(
+                         std::move(key),
+                         KernelVariant{
+                             std::move(kernel_name),
+                             std::make_shared<const std::string>(
+                                 std::move(kernel_source)),
+                             source_hash})
+                     .first->second;
     }
 
     if (verbose) {
       std::cout << "Generated source code for `" << name << "`:" << std::endl
                 << "```" << std::endl
-                << kernel_source << std::endl
+                << *variant->source << std::endl
                 << "```" << std::endl;
     }
 
@@ -360,8 +439,8 @@ CustomKernelFunction metal_kernel(
         std::move(output_dtypes),
         std::make_shared<CustomKernel>(
             s,
-            std::move(kernel_name),
-            std::move(kernel_source),
+            variant->name,
+            variant->source,
             grid,
             threadgroup,
             shape_infos,
@@ -370,7 +449,8 @@ CustomKernelFunction metal_kernel(
             std::vector<ScalarArg>{},
             false,
             0,
-            compile_options.serialize()),
+            compile_options.serialize(),
+            variant->source_hash),
         std::move(inputs));
   };
 }

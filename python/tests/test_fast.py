@@ -1088,6 +1088,30 @@ class TestFast(mlx_tests.MLXTestCase):
         out = call_kernel(a, source)
         self.assertTrue(mx.array_equal(out, mx.ones_like(out)))
 
+        # `int` 1 and `bool` True print the same template value but
+        # declare a different template parameter.
+        kernel = mx.fast.metal_kernel(
+            name="sizeof_kernel",
+            input_names=["inp"],
+            output_names=["out"],
+            source="out[0] = sizeof(V);",
+        )
+
+        def call_sizeof(value):
+            return kernel(
+                inputs=[a],
+                grid=(1, 1, 1),
+                threadgroup=(1, 1, 1),
+                output_shapes=[(1,)],
+                output_dtypes=[mx.int32],
+                template=[("V", value)],
+                stream=mx.gpu,
+            )[0].item()
+
+        for _ in range(2):
+            self.assertEqual(call_sizeof(1), 4)
+            self.assertEqual(call_sizeof(True), 1)
+
     @unittest.skipIf(not mx.metal.is_available(), "Metal is not available")
     def test_custom_kernel_same_name_different_source_one_eval(self):
         # Regression test for #3832: two kernels sharing a name but with
