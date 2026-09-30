@@ -11,7 +11,8 @@ if(MLX_BUILD_METAL OR MLX_BUILD_CUDA)
 endif()
 
 if(MLX_BUILD_METAL)
-  list(APPEND METAL_TEST_SOURCES residency_tests.cpp metal_counters_tests.cpp)
+  list(APPEND METAL_TEST_SOURCES residency_tests.cpp metal_counters_tests.cpp
+       metal_kernel_tests.cpp)
 endif()
 
 include(${doctest_SOURCE_DIR}/scripts/cmake/doctest.cmake)
