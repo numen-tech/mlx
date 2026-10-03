@@ -4788,6 +4788,35 @@ void validate_global_scale(
   }
 }
 
+// Implied bias (a 0-d `biases` array holding a factor f): the contract is that
+// it stands for the materialized per-group bias `scales * T(f)`, formed in the
+// scales' storage dtype T -- f is cast to T first, so a factor that is not
+// exactly representable in T is outside the contract (the reference is still
+// `scales * T(f)`, not `T(f * scales)`). The `_ib` kernels form `T(f) *
+// T(scale)` in place of loading the bias, which honors that definition exactly
+// only when
+//   - the kernel sees the scales in T (the activations' dtype did not promote
+//     them; a promoted kernel would round the product in the wider dtype), and
+//   - the non-JIT Metal library ships the `_ib` instantiation (1/2/4/8-bit; the
+//     3/5/6-bit implied kernels exist in JIT builds only, and a prebuilt
+//     metallib has no fallback for a missing name).
+// Everywhere else the bias is materialized by `materialize_implied_bias` and
+// the ordinary per-group-bias path runs.
+bool implied_bias_kernels_exact(
+    const array& scales,
+    Dtype kernel_dtype,
+    int bits) {
+  return kernel_dtype == scales.dtype() &&
+      (bits == 1 || bits == 2 || bits == 4 || bits == 8);
+}
+
+array materialize_implied_bias(
+    const array& scales,
+    const array& factor,
+    StreamOrDevice s) {
+  return multiply(scales, astype(factor, scales.dtype(), s), s);
+}
+
 array quantized_matmul(
     const array& x,
     const array& w,
@@ -4840,7 +4869,14 @@ array quantized_matmul(
   if (qmode == QuantizationMode::Affine) {
     inputs = {astype(x, dtype), w, astype(scales, dtype)};
     if (biases) {
-      inputs.push_back(astype(*biases, dtype));
+      // An implied-bias factor the kernels cannot honor exactly (see
+      // implied_bias_kernels_exact) is materialized in the scales' storage
+      // dtype here and takes the ordinary per-group-bias path.
+      auto b = (biases->ndim() == 0 &&
+                !implied_bias_kernels_exact(scales, dtype, bits))
+          ? materialize_implied_bias(scales, *biases, s)
+          : *biases;
+      inputs.push_back(astype(b, dtype, s));
     }
   } else {
     inputs = {x, w, scales};
@@ -5378,9 +5414,11 @@ array affine_dequantize(
     wshape.push_back(group_size);
     w = reshape(w, wshape, s);
     w = multiply(w, expand_dims(scales, -1, s), s);
-    // Implied bias: form `factor * scales` per group (exact for the power-of-
-    // two factors this mode exists for) rather than adding the scalar itself.
-    auto b = biases.ndim() == 0 ? multiply(scales, biases, s) : biases;
+    // Implied bias: form `scales * T(f)` per group in the scales' dtype (the
+    // factor is cast first so a wider factor cannot promote the product past
+    // the rounding a materialized bias went through).
+    auto b = biases.ndim() == 0 ? materialize_implied_bias(scales, biases, s)
+                                : biases;
     w = add(w, expand_dims(b, -1, s), s);
     w = reshape(w, sshape, s);
 
@@ -5396,8 +5434,15 @@ array affine_dequantize(
         std::make_shared<fast::Quantize>(
             s, fallback, group_size, bits, QuantizationMode::Affine, true),
         // The dequantize kernel reads the implied-bias factor in the scales'
-        // dtype, so cast a 0-d factor given in another dtype.
-        {w, scales, implied_bias ? astype(biases, scales.dtype(), s) : biases});
+        // dtype, so cast a 0-d factor given in another dtype; when the
+        // non-JIT library has no `_ib` kernel for this bit width, materialize
+        // the bias instead (see implied_bias_kernels_exact).
+        {w,
+         scales,
+         !implied_bias ? biases
+             : implied_bias_kernels_exact(scales, scales.dtype(), bits)
+             ? astype(biases, scales.dtype(), s)
+             : materialize_implied_bias(scales, biases, s)});
   }
   return fallback({w, scales, biases})[0];
 }

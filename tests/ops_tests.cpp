@@ -3531,6 +3531,7 @@ TEST_CASE("test implied-bias affine quantized_matmul and dequantize") {
               dtype,
               cpu);
           auto factor = array(c.factor, dtype);
+          // The contract's reference: `scales * T(f)` in the scales dtype.
           auto rebuilt = multiply(scales, factor, cpu);
           eval(rebuilt);
 
@@ -3647,6 +3648,159 @@ TEST_CASE("test implied-bias affine quantized_matmul and dequantize") {
         quantized_matmul(
             x, w, scales, array({-8.0f}), true, 64, 4, "affine", cpu),
         std::invalid_argument);
+  }
+}
+
+TEST_CASE("test implied-bias factor rounding contract") {
+  // The contract: a 0-d factor f stands for the materialized bias
+  // `scales * T(f)`, formed in the scales' storage dtype T (ops.h). Each block
+  // below is a case where the kernels used to form the bias elsewhere -- in
+  // the activations' promoted dtype, in the factor's wider dtype, or through
+  // an `_ib` kernel the non-JIT library does not ship -- and drifted from that
+  // reference (Codex review of numen-tech/gemma4-qat#190).
+  const auto cpu = Device::cpu;
+  std::vector<Device> devices = {cpu};
+  if (metal::is_available()) {
+    devices.push_back(Device::gpu);
+  }
+  auto reference_bias = [&](const array& scales, const array& f) {
+    auto b = multiply(scales, astype(f, scales.dtype(), cpu), cpu);
+    eval(b);
+    return b;
+  };
+  auto same = [&](const array& a, const array& b) {
+    return a.dtype() == b.dtype() && a.shape() == b.shape() &&
+        array_equal(a, b, cpu).item<bool>();
+  };
+
+  // fp16 scales of 2^-24 (the smallest fp16 subnormal): -0.5 * 2^-24 is not
+  // representable in fp16 and rounds to 0, while a bias formed in fp32 is
+  // -2^-25. 4-bit, group size 128, one group per row, 8 rows.
+  const int bits = 4;
+  const int gs = 128;
+  auto tiny = array(static_cast<float>(std::ldexp(1.0, -24)), float16);
+  auto scales = full({8, 1}, tiny, cpu);
+  eval(scales);
+
+  // 1. Promotion: fp32 activations over fp16 scales. The kernel sees fp32
+  //    scales, so the factor is materialized in fp16 first.
+  {
+    auto w = zeros({8, 16}, uint32, cpu);
+    auto x = ones({1, 128}, float32, cpu);
+    for (auto f : {array(-0.5f, float16), array(-0.5f, float32)}) {
+      auto rebuilt = reference_bias(scales, f);
+      CHECK(same(rebuilt, zeros({8, 1}, float16, cpu)));
+      for (const auto& dev : devices) {
+        auto o_full = quantized_matmul(
+            x, w, scales, rebuilt, true, gs, bits, "affine", dev);
+        auto o_ib =
+            quantized_matmul(x, w, scales, f, true, gs, bits, "affine", dev);
+        CHECK_EQ(o_ib.dtype(), float32);
+        CHECK(same(o_ib, o_full));
+        CHECK(same(o_ib, zeros({1, 8}, float32, cpu)));
+      }
+    }
+  }
+
+  // 2. Dequantize with an fp32 factor: every code is 1 (0x11111111), so the
+  //    reference is 1 * 2^-24 + T(-0.5 * 2^-24) = 2^-24 in fp16; a bias
+  //    formed in fp32 gives 2^-24 - 2^-25 = 2^-25, which the final fp16 cast
+  //    rounds to 0 (the CPU fallback used to do exactly that).
+  {
+    auto w = full({8, 16}, array(0x11111111u, uint32), cpu);
+    auto f = array(-0.5f, float32);
+    auto rebuilt = reference_bias(scales, f);
+    auto expected = full({8, 128}, tiny, cpu);
+    for (const auto& dev : devices) {
+      auto d_full = dequantize(
+          w,
+          scales,
+          rebuilt,
+          gs,
+          bits,
+          "affine",
+          std::nullopt,
+          std::nullopt,
+          dev);
+      auto d_ib = dequantize(
+          w, scales, f, gs, bits, "affine", std::nullopt, std::nullopt, dev);
+      CHECK(same(d_ib, d_full));
+      CHECK(same(d_ib, expected));
+    }
+  }
+
+  // 3. A factor that is not exactly representable in T: the reference is
+  //    `scales * T(f)`, not `T(f * scales)`. fp16 scale 0.10009765625 with
+  //    f = 1.0004: T(f) = 1 in fp16, so the bias is the scale itself, whereas
+  //    T(f * scale) is the next fp16 value up (0.10015869140625).
+  {
+    auto scale = array(0.10009765625f, float16);
+    auto s16 = full({8, 1}, scale, cpu);
+    auto f = array(1.0004f, float32);
+    auto rebuilt = reference_bias(s16, f);
+    CHECK(same(rebuilt, s16));
+    auto other =
+        astype(multiply(astype(s16, float32, cpu), f, cpu), float16, cpu);
+    CHECK_FALSE(array_equal(rebuilt, other, cpu).item<bool>());
+    auto w = zeros({8, 16}, uint32, cpu);
+    auto x = ones({1, 128}, float16, cpu);
+    for (const auto& dev : devices) {
+      auto d_ib = dequantize(
+          w, s16, f, gs, bits, "affine", std::nullopt, std::nullopt, dev);
+      CHECK(same(d_ib, full({8, 128}, scale, cpu)));
+      auto o_full =
+          quantized_matmul(x, w, s16, rebuilt, true, gs, bits, "affine", dev);
+      auto o_ib = quantized_matmul(x, w, s16, f, true, gs, bits, "affine", dev);
+      CHECK(same(o_ib, o_full));
+    }
+  }
+
+  // 4. Bit widths without a non-JIT `_ib` kernel (3/5/6): the bias is
+  //    materialized and the ordinary kernels run, on both devices, for every
+  //    scales dtype.
+  {
+    int seed = 190;
+    for (int b : {3, 5, 6}) {
+      const float factor = -static_cast<float>(1 << (b - 1));
+      for (auto dtype : {float16, bfloat16, float32}) {
+        const int K = 512;
+        const int N = 72;
+        auto w = random::bits({N, K * b / 32}, 4, random::key(seed++), cpu);
+        auto sc = astype(
+            random::uniform(
+                0.01f, 1.0f, {N, K / 64}, float32, random::key(seed++), cpu),
+            dtype,
+            cpu);
+        auto f = array(factor, dtype);
+        auto rebuilt = reference_bias(sc, f);
+        for (const auto& dev : devices) {
+          auto d_full = dequantize(
+              w, sc, rebuilt, 64, b, "affine", std::nullopt, std::nullopt, dev);
+          auto d_ib = dequantize(
+              w, sc, f, 64, b, "affine", std::nullopt, std::nullopt, dev);
+          CHECK(same(d_ib, d_full));
+          for (int M : {1, 3, 8, 33}) {
+            auto x = astype(
+                random::normal({M, K}, float32, random::key(seed++), cpu),
+                dtype,
+                cpu);
+            auto o_full =
+                quantized_matmul(x, w, sc, rebuilt, true, 64, b, "affine", dev);
+            auto o_ib =
+                quantized_matmul(x, w, sc, f, true, 64, b, "affine", dev);
+            CHECK(same(o_ib, o_full));
+          }
+          auto xn = astype(
+              random::normal({2, N}, float32, random::key(seed++), cpu),
+              dtype,
+              cpu);
+          CHECK(same(
+              quantized_matmul(xn, w, sc, f, false, 64, b, "affine", dev),
+              quantized_matmul(
+                  xn, w, sc, rebuilt, false, 64, b, "affine", dev)));
+        }
+      }
+    }
   }
 }
 
