@@ -186,6 +186,99 @@
   instantiate_quantized_sym_types(64, bits)    \
   instantiate_quantized_sym_types(32, bits)
 
+// Implied-bias ("_ib") variants: `biases` is a single factor f and the
+// kernel forms bias = f * scale per group. The trailing `true` is the
+// kernels' `implied_bias` template argument; the defaulted parameters before
+// it (has_global_scale = false, results_per_simdgroup = 4, BM/BK/BN = 32) are
+// spelled out, matching the host's template definition. Only the bit widths
+// of the shipped power-of-two-factor checkpoints (1, 2, 4, 8) are built into
+// the metallib; 3/5/6-bit implied-bias kernels exist in the JIT build only.
+#define instantiate_quantized_ib_qmv(name, type, group_size, bits, batched)  \
+  instantiate_kernel(                                                        \
+      #name "_" #type "_gs_" #group_size "_b_" #bits "_batch_" #batched "_ib", \
+      name, type, group_size, bits, batched, false, 4, true)
+
+#define instantiate_quantized_ib_qvm(type, group_size, bits, batched)        \
+  instantiate_kernel(                                                        \
+      "affine_qvm_" #type "_gs_" #group_size "_b_" #bits "_batch_" #batched "_ib", \
+      affine_qvm, type, group_size, bits, batched, false, true)
+
+#define instantiate_quantized_ib_qmm_n(type, group_size, bits, batched)      \
+  instantiate_kernel(                                                        \
+      "affine_qmm_n_" #type "_gs_" #group_size "_b_" #bits "_batch_" #batched "_ib", \
+      affine_qmm_n, type, group_size, bits, batched, false, 32, 32, 32, true)
+
+#define instantiate_quantized_ib_qmm_t(type, group_size, bits, aligned, batched) \
+  instantiate_kernel(                                                        \
+      "affine_qmm_t_" #type "_gs_" #group_size "_b_" #bits "_alN_" #aligned "_batch_" #batched "_ib", \
+      affine_qmm_t, type, group_size, bits, aligned, batched, 32, 32, 32, true)
+
+#define instantiate_quantized_ib_quad(type, group_size, bits, D, batched)    \
+  instantiate_kernel(                                                        \
+      "affine_qmv_quad_" #type "_gs_" #group_size "_b_" #bits "_d_" #D "_batch_" #batched "_ib", \
+      affine_qmv_quad, type, group_size, bits, D, batched, true)
+
+#define instantiate_quantized_ib_wide(type, group_size, bits, vecs_per_tg, k_lanes, batched) \
+  instantiate_kernel(                                                        \
+      "affine_qmv_wide_" #type "_gs_" #group_size "_b_" #bits "_nv_" #vecs_per_tg "_kl_" #k_lanes "_batch_" #batched "_ib", \
+      affine_qmv_wide, type, group_size, bits, vecs_per_tg, k_lanes, batched, true)
+
+#define instantiate_quantized_ib_split_k(type, group_size, bits, split_k)    \
+  instantiate_kernel(                                                        \
+      "affine_qvm_split_k_" #type "_gs_" #group_size "_b_" #bits "_spk_" #split_k "_ib", \
+      affine_qvm_split_k, type, group_size, bits, split_k, true)
+
+#define instantiate_quantized_ib_splitk_qmm(type, group_size, bits, aligned) \
+  instantiate_kernel(                                                        \
+      "affine_qmm_t_splitk_" #type "_gs_" #group_size "_b_" #bits "_alN_" #aligned "_ib", \
+      affine_qmm_t_splitk, type, group_size, bits, aligned, 32, 32, 32, true)
+
+#define instantiate_quantized_ib_dequantize(type, group_size, bits)          \
+  instantiate_kernel(                                                        \
+      "affine_dequantize_" #type "_gs_" #group_size "_b_" #bits "_ib",       \
+      affine_dequantize, type, group_size, bits, false, true)
+
+#define instantiate_quantized_ib_funcs(type, group_size, bits)               \
+  instantiate_quantized_ib_dequantize(type, group_size, bits)                \
+  instantiate_quantized_ib_qmv(affine_qmv_fast, type, group_size, bits, 1)   \
+  instantiate_quantized_ib_qmv(affine_qmv_fast, type, group_size, bits, 0)   \
+  instantiate_quantized_ib_qmv(affine_qmv, type, group_size, bits, 1)        \
+  instantiate_quantized_ib_qmv(affine_qmv, type, group_size, bits, 0)        \
+  instantiate_quantized_ib_qvm(type, group_size, bits, 1)                    \
+  instantiate_quantized_ib_qvm(type, group_size, bits, 0)                    \
+  instantiate_quantized_ib_qmm_n(type, group_size, bits, 1)                  \
+  instantiate_quantized_ib_qmm_n(type, group_size, bits, 0)                  \
+  instantiate_quantized_ib_qmm_t(type, group_size, bits, true, 1)            \
+  instantiate_quantized_ib_qmm_t(type, group_size, bits, true, 0)            \
+  instantiate_quantized_ib_qmm_t(type, group_size, bits, false, 1)           \
+  instantiate_quantized_ib_qmm_t(type, group_size, bits, false, 0)           \
+  instantiate_quantized_ib_quad(type, group_size, bits, 64, 1)               \
+  instantiate_quantized_ib_quad(type, group_size, bits, 64, 0)               \
+  instantiate_quantized_ib_quad(type, group_size, bits, 128, 1)              \
+  instantiate_quantized_ib_quad(type, group_size, bits, 128, 0)              \
+  instantiate_quantized_ib_wide(type, group_size, bits, 2, 8, 0)             \
+  instantiate_quantized_ib_wide(type, group_size, bits, 2, 8, 1)             \
+  instantiate_quantized_ib_wide(type, group_size, bits, 3, 8, 0)             \
+  instantiate_quantized_ib_wide(type, group_size, bits, 3, 8, 1)             \
+  instantiate_quantized_ib_wide(type, group_size, bits, 4, 8, 0)             \
+  instantiate_quantized_ib_wide(type, group_size, bits, 4, 8, 1)             \
+  instantiate_quantized_ib_wide(type, group_size, bits, 5, 8, 0)             \
+  instantiate_quantized_ib_wide(type, group_size, bits, 5, 8, 1)             \
+  instantiate_quantized_ib_split_k(type, group_size, bits, 8)                \
+  instantiate_quantized_ib_split_k(type, group_size, bits, 32)               \
+  instantiate_quantized_ib_splitk_qmm(type, group_size, bits, true)          \
+  instantiate_quantized_ib_splitk_qmm(type, group_size, bits, false)
+
+#define instantiate_quantized_ib_types(group_size, bits)        \
+  instantiate_quantized_ib_funcs(float, group_size, bits)       \
+  instantiate_quantized_ib_funcs(float16_t, group_size, bits)   \
+  instantiate_quantized_ib_funcs(bfloat16_t, group_size, bits)
+
+#define instantiate_quantized_ib_groups(bits) \
+  instantiate_quantized_ib_types(128, bits)   \
+  instantiate_quantized_ib_types(64, bits)    \
+  instantiate_quantized_ib_types(32, bits)
+
 #define instantiate_quantized_all() \
   instantiate_quantized_groups(1) \
   instantiate_quantized_groups(2) \
@@ -195,6 +288,10 @@
   instantiate_quantized_groups(6) \
   instantiate_quantized_groups(8) \
   instantiate_quantized_sym_groups(1) \
-  instantiate_quantized_sym_groups(2)
+  instantiate_quantized_sym_groups(2) \
+  instantiate_quantized_ib_groups(1) \
+  instantiate_quantized_ib_groups(2) \
+  instantiate_quantized_ib_groups(4) \
+  instantiate_quantized_ib_groups(8)
 
 instantiate_quantized_all() // clang-format on

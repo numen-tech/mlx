@@ -8,6 +8,7 @@ import unittest
 from itertools import product
 
 import mlx.core as mx
+import numpy as np
 import mlx_tests
 
 
@@ -1008,6 +1009,274 @@ class TestQuantized(mlx_tests.MLXTestCase):
                 _, jvp_sym = mx.jvp(lambda x: f_sym(x, scales), [x], [x])
                 _, jvp_biased = mx.jvp(lambda x: f_biased(x, scales), [x], [x])
                 self.assertLess((jvp_sym[0] - jvp_biased[0]).abs().max().item(), 1e-3)
+
+    # Implied bias: a 0-d `biases` array is a factor f and the kernels form
+    # bias = f * scale per group. The factors of the shipped checkpoints are
+    # powers of two, so f * scale is exact in every dtype and the implied path
+    # must reproduce the rebuilt-bias path bit for bit.
+    IMPLIED_BIAS_CASES = [
+        (2, 64, -2.0),  # QAT 2-bit
+        (4, 64, -8.0),  # QAT 4-bit
+        (8, 64, -128.0),  # QAT 8-bit
+        (1, 128, -0.5),  # Bonsai 1-bit
+        (2, 128, -1.0),  # Ternary Bonsai 2 2-bit
+    ]
+
+    def assert_bitwise_equal(self, a, b):
+        self.assertEqual(a.dtype, b.dtype)
+        self.assertEqual(a.shape, b.shape)
+        mx.eval(a, b)
+        self.assertTrue(
+            mx.array_equal(a, b, equal_nan=True).item(),
+            f"max |diff| = {(a.astype(mx.float32) - b.astype(mx.float32)).abs().max().item()}",
+        )
+
+    def test_implied_bias_matmul(self):
+        key = mx.random.key(3)
+        k1, k2 = mx.random.split(key)
+        devices = [mx.cpu]
+        if mx.metal.is_available():
+            devices.append(mx.gpu)
+        for dev in devices:
+            # M = 1..8 (qmv / qmv_quad / qmv_wide), 33 (above every GPU's qmv
+            # batch limit: qmm / qmm_splitk) and a prefill-sized 512.
+            Ms = [1, 2, 3, 4, 5, 6, 7, 8, 33, 512]
+            for dtype, (bits, gs, factor) in product(
+                [mx.float32, mx.float16, mx.bfloat16], self.IMPLIED_BIAS_CASES
+            ):
+                # K = 64 / 128 route to qmv_quad; 512 / 1536 to qmv_fast (and
+                # qmv_wide for 2 <= M <= 8 at bits > 1); N = 72 is not a
+                # multiple of the 32-wide qmm tile.
+                for K, N in product([64, 128, 512, 1536], [256, 72]):
+                    if K < gs:
+                        continue
+                    w = mx.random.normal(shape=(N, K), key=k2).astype(dtype)
+                    w_q, scales, _ = mx.quantize(w, gs, bits, stream=dev)
+                    full = (factor * scales).astype(scales.dtype)
+                    f = mx.array(factor, dtype)
+                    for M in Ms:
+                        with self.subTest(
+                            dev=dev, dtype=dtype, bits=bits, gs=gs, K=K, N=N, M=M
+                        ):
+                            x = mx.random.normal(shape=(M, K), key=k1).astype(dtype)
+                            y_full = mx.quantized_matmul(
+                                x, w_q, scales, full, True, gs, bits, stream=dev
+                            )
+                            y_ib = mx.quantized_matmul(
+                                x, w_q, scales, f, True, gs, bits, stream=dev
+                            )
+                            self.assert_bitwise_equal(y_ib, y_full)
+                    # Non-transposed (qvm): inner dim N < 1024.
+                    for M in [1, 3]:
+                        with self.subTest(
+                            dev=dev, dtype=dtype, bits=bits, gs=gs, K=K, N=N, M=M, qvm=True
+                        ):
+                            xt = mx.random.normal(shape=(M, N), key=k1).astype(dtype)
+                            y_full = mx.quantized_matmul(
+                                xt, w_q, scales, full, False, gs, bits, stream=dev
+                            )
+                            y_ib = mx.quantized_matmul(
+                                xt, w_q, scales, f, False, gs, bits, stream=dev
+                            )
+                            self.assert_bitwise_equal(y_ib, y_full)
+
+    @unittest.skipUnless(mx.metal.is_available(), "GPU dispatch paths")
+    def test_implied_bias_matmul_gpu_paths(self):
+        # The remaining GPU dispatch routes: qvm_split_k (non-transposed with a
+        # large inner dim), batched qmv / qmm (3-d x; the 0-d factor is never
+        # broadcast and its zero batch strides keep it in place), the
+        # non-aligned qmv (N % 8 != 0) and a factor given in another dtype.
+        key = mx.random.key(4)
+        k1, k2 = mx.random.split(key)
+        for dtype, (bits, gs, factor) in product(
+            [mx.float32, mx.float16, mx.bfloat16], self.IMPLIED_BIAS_CASES
+        ):
+            f = mx.array(factor, dtype)
+            # qvm_split_k: w is (1536, 256), x @ w_hat with inner dim 1536.
+            w = mx.random.normal(shape=(1536, 256), key=k2).astype(dtype)
+            w_q, scales, _ = mx.quantize(w, gs, bits)
+            full = (factor * scales).astype(scales.dtype)
+            for M in [1, 3]:
+                with self.subTest(dtype=dtype, bits=bits, gs=gs, M=M, path="qvm_split_k"):
+                    xt = mx.random.normal(shape=(M, 1536), key=k1).astype(dtype)
+                    y_full = mx.quantized_matmul(xt, w_q, scales, full, False, gs, bits)
+                    y_ib = mx.quantized_matmul(xt, w_q, scales, f, False, gs, bits)
+                    self.assert_bitwise_equal(y_ib, y_full)
+
+            # Batched: x is (B, M, K) over a 2-d w (broadcast to B); qmv for
+            # M = 1, qmv_quad for K = 128, qmm for M = 64.
+            for K in [128, 512]:
+                if K < gs:
+                    continue
+                w = mx.random.normal(shape=(256, K), key=k2).astype(dtype)
+                w_q, scales, _ = mx.quantize(w, gs, bits)
+                full = (factor * scales).astype(scales.dtype)
+                for M in [1, 3, 64]:
+                    with self.subTest(dtype=dtype, bits=bits, gs=gs, K=K, M=M, path="batched"):
+                        x = mx.random.normal(shape=(3, M, K), key=k1).astype(dtype)
+                        y_full = mx.quantized_matmul(x, w_q, scales, full, True, gs, bits)
+                        y_ib = mx.quantized_matmul(x, w_q, scales, f, True, gs, bits)
+                        self.assert_bitwise_equal(y_ib, y_full)
+                # Batched w as well (B, N, K) with per-batch scales.
+                wb = mx.random.normal(shape=(2, 256, K), key=k2).astype(dtype)
+                wb_q, scales_b, _ = mx.quantize(wb, gs, bits)
+                full_b = (factor * scales_b).astype(scales_b.dtype)
+                for M in [1, 64]:
+                    with self.subTest(dtype=dtype, bits=bits, gs=gs, K=K, M=M, path="batched_w"):
+                        x = mx.random.normal(shape=(2, M, K), key=k1).astype(dtype)
+                        y_full = mx.quantized_matmul(x, wb_q, scales_b, full_b, True, gs, bits)
+                        y_ib = mx.quantized_matmul(x, wb_q, scales_b, f, True, gs, bits)
+                        self.assert_bitwise_equal(y_ib, y_full)
+
+            # N % 8 != 0: the generic (non-fast) qmv.
+            w = mx.random.normal(shape=(67, 512), key=k2).astype(dtype)
+            w_q, scales, _ = mx.quantize(w, gs, bits)
+            full = (factor * scales).astype(scales.dtype)
+            for M in [1, 4]:
+                with self.subTest(dtype=dtype, bits=bits, gs=gs, M=M, path="qmv_generic"):
+                    x = mx.random.normal(shape=(M, 512), key=k1).astype(dtype)
+                    y_full = mx.quantized_matmul(x, w_q, scales, full, True, gs, bits)
+                    y_ib = mx.quantized_matmul(x, w_q, scales, f, True, gs, bits)
+                    self.assert_bitwise_equal(y_ib, y_full)
+
+            # A float32 factor with half-precision scales adopts the scales'
+            # dtype (no promotion of the whole matmul to float32).
+            if dtype != mx.float32:
+                with self.subTest(dtype=dtype, bits=bits, gs=gs, path="factor_dtype"):
+                    x = mx.random.normal(shape=(2, 512), key=k1).astype(dtype)
+                    y_full = mx.quantized_matmul(x, w_q, scales, full, True, gs, bits)
+                    y_ib = mx.quantized_matmul(
+                        x, w_q, scales, mx.array(factor), True, gs, bits
+                    )
+                    self.assert_bitwise_equal(y_ib, y_full)
+
+    def test_implied_bias_subnormal_scales(self):
+        # Subnormal fp16 scales (Bonsai-27B-1bit / Ternary Bonsai 2 carry a few):
+        # f * scale with f = -0.5 and an odd subnormal mantissa is not
+        # representable in fp16, so the kernels must round the product through
+        # the scales dtype to stay bit-identical to a materialized bias.
+        for bits, gs, factor in [(1, 128, -0.5), (2, 128, -1.0), (2, 64, -2.0)]:
+            K, N = 512, 72
+            w = mx.random.randint(0, 2**31 - 1, (N, K * bits // 32)).astype(
+                mx.uint32
+            )
+            rng = np.random.default_rng(0)
+            s = rng.uniform(0.01, 1.0, (N, K // gs)).astype(np.float16)
+            idx = rng.choice(s.size, 200, replace=False)
+            s.flat[idx] = (rng.integers(1, 1024, 200) * 2.0**-24).astype(np.float16)
+            scales = mx.array(s)
+            f = mx.array(factor, dtype=mx.float16)
+            rebuilt = scales * f
+            for dev in [mx.cpu, mx.gpu]:
+                with self.subTest(bits=bits, factor=factor, dev=dev):
+                    self.assert_bitwise_equal(
+                        mx.dequantize(w, scales, rebuilt, gs, bits, stream=dev),
+                        mx.dequantize(w, scales, f, gs, bits, stream=dev),
+                    )
+                    for M in [1, 2, 3, 8, 64]:
+                        x = mx.random.normal((M, K)).astype(mx.float16)
+                        self.assert_bitwise_equal(
+                            mx.quantized_matmul(
+                                x, w, scales, rebuilt, True, gs, bits, stream=dev
+                            ),
+                            mx.quantized_matmul(
+                                x, w, scales, f, True, gs, bits, stream=dev
+                            ),
+                        )
+
+    def test_implied_bias_dequantize(self):
+        key = mx.random.key(5)
+        devices = [mx.cpu]
+        if mx.metal.is_available():
+            devices.append(mx.gpu)
+        for dev, dtype, (bits, gs, factor) in product(
+            devices, [mx.float32, mx.float16, mx.bfloat16], self.IMPLIED_BIAS_CASES
+        ):
+            with self.subTest(dev=dev, dtype=dtype, bits=bits, gs=gs):
+                w = mx.random.normal(shape=(64, 512), key=key).astype(dtype)
+                w_q, scales, _ = mx.quantize(w, gs, bits, stream=dev)
+                full = (factor * scales).astype(scales.dtype)
+                f = mx.array(factor, dtype)
+                w_full = mx.dequantize(w_q, scales, full, gs, bits, stream=dev)
+                w_ib = mx.dequantize(w_q, scales, f, gs, bits, stream=dev)
+                self.assert_bitwise_equal(w_ib, w_full)
+                # A float32 factor is cast to the scales' dtype.
+                w_ib32 = mx.dequantize(w_q, scales, mx.array(factor), gs, bits, stream=dev)
+                self.assert_bitwise_equal(w_ib32, w_full)
+                # Embedding-style gather: dequantize gathered rows with the
+                # scalar factor (no gather of a bias table).
+                idx = mx.array([3, 0, 63, 3])
+                e_full = mx.dequantize(w_q[idx], scales[idx], full[idx], gs, bits, stream=dev)
+                e_ib = mx.dequantize(w_q[idx], scales[idx], f, gs, bits, stream=dev)
+                self.assert_bitwise_equal(e_ib, e_full)
+
+    def test_implied_bias_grad(self):
+        # Reverse products wrt x and scales use the implied-bias kernels and
+        # the same closed form as the explicit-bias call; there is no gradient
+        # wrt the factor itself.
+        key = mx.random.key(6)
+        k1, k2, k3 = mx.random.split(key, 3)
+        for bits, gs, factor in self.IMPLIED_BIAS_CASES:
+            with self.subTest(bits=bits, gs=gs):
+                x = mx.random.normal(shape=(2, 512), key=k1)
+                w = mx.random.normal(shape=(64, 512), key=k2)
+                w_q, scales, _ = mx.quantize(w, gs, bits)
+                f = mx.array(factor)
+                cotan = mx.random.normal(shape=(2, 64), key=k3)
+
+                def f_ib(x, scales):
+                    return mx.quantized_matmul(x, w_q, scales, f, True, gs, bits)
+
+                def f_full(x, scales):
+                    return mx.quantized_matmul(
+                        x, w_q, scales, factor * scales, True, gs, bits
+                    )
+
+                _, vjp_ib = mx.vjp(f_ib, [x, scales], [cotan])
+                _, vjp_full = mx.vjp(f_full, [x, scales], [cotan])
+                self.assert_bitwise_equal(vjp_ib[0], vjp_full[0])
+                # Same closed form, different fp32 accumulation order (the
+                # explicit path sums the bias term through the multiply's vjp).
+                self.assertTrue(
+                    mx.allclose(vjp_ib[1], vjp_full[1], rtol=1e-4, atol=1e-3)
+                )
+
+                _, jvp_ib = mx.jvp(lambda x: f_ib(x, scales), [x], [x])
+                _, jvp_full = mx.jvp(lambda x: f_full(x, scales), [x], [x])
+                self.assert_bitwise_equal(jvp_ib[0], jvp_full[0])
+
+                with self.assertRaises(RuntimeError):
+                    mx.eval(
+                        mx.vjp(
+                            lambda f: mx.quantized_matmul(
+                                x, w_q, scales, f, True, gs, bits
+                            ),
+                            [f],
+                            [cotan],
+                        )[1]
+                    )
+
+    def test_implied_bias_throws(self):
+        x = mx.random.normal(shape=(2, 512))
+        w = mx.random.normal(shape=(64, 512))
+        w_q, scales, _ = mx.quantize(w, 64, 4)
+        f = mx.array(-8.0)
+        # gather_qmm has no implied-bias kernels: it throws instead of
+        # broadcasting a constant bias.
+        lhs = mx.array([0, 1])
+        rhs = mx.array([0, 0])
+        with self.assertRaises(ValueError):
+            mx.gather_qmm(x, w_q, scales, f, lhs, rhs, True, 64, 4)
+        # Only a 0-d biases array is a factor; a 1-d one is a shape error.
+        with self.assertRaises(ValueError):
+            mx.quantized_matmul(x, w_q, scales, mx.array([-8.0]), True, 64, 4)
+        # The factor must be a real floating type.
+        with self.assertRaises(ValueError):
+            mx.quantized_matmul(x, w_q, scales, mx.array(-8), True, 64, 4)
+        # The fp modes have no biases.
+        w_q4, scales4 = mx.quantize(w, mode="mxfp4")
+        with self.assertRaises(ValueError):
+            mx.quantized_matmul(x, w_q4, scales4, f, True, mode="mxfp4")
 
     def test_qvm(self):
         key = mx.random.key(0)

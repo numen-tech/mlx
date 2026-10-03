@@ -680,7 +680,8 @@ template <
     short reduction_dim,
     short tgp_size,
     short group_size,
-    short bits>
+    short bits,
+    bool implied_bias = false>
 struct QuantizedBlockLoader {
   static_assert(
       BCOLS <= group_size,
@@ -713,6 +714,9 @@ struct QuantizedBlockLoader {
   const device uint8_t* src;
   const device T* scales;
   const device T* biases;
+  // Implied bias: biases_ is a single factor f and the per-group bias is
+  // f * scale (what the loader used to rebuild into a full array).
+  const T bias_factor;
 
   QuantizedBlockLoader(
       const device uint8_t* src_,
@@ -735,7 +739,12 @@ struct QuantizedBlockLoader {
         src(src_ + bi * src_ld * bytes_per_pack / pack_factor +
             bj * bytes_per_pack),
         scales(scales_ + bi * src_ld / group_size),
-        biases(biases_ + bi * src_ld / group_size) {}
+        biases(implied_bias ? biases_ : biases_ + bi * src_ld / group_size),
+        bias_factor(implied_bias ? biases_[0] : T(0)) {}
+
+  T load_bias(T scale) const thread {
+    return implied_bias ? bias_factor * scale : *biases;
+  }
 
   void load_unsafe() const thread {
     if (BCOLS_PACKED * BROWS < tgp_size && bi >= BROWS) {
@@ -743,7 +752,7 @@ struct QuantizedBlockLoader {
     }
 
     T scale = *scales;
-    T bias = *biases;
+    T bias = load_bias(scale);
     for (int i = 0; i < n_reads; i++) {
       dequantize<T, pack_factor, bits>(
           src + i * bytes_per_pack, scale, bias, dst + i * pack_factor);
@@ -770,7 +779,7 @@ struct QuantizedBlockLoader {
     }
 
     T scale = *scales;
-    T bias = *biases;
+    T bias = load_bias(scale);
     for (int i = 0; i < n_reads; i++) {
       dequantize<T, pack_factor, bits>(
           (device uint8_t*)(src + i * bytes_per_pack),
@@ -788,15 +797,21 @@ struct QuantizedBlockLoader {
         if (group_step_cnt == group_steps) {
           group_step_cnt = 0;
           scales++;
-          biases++;
+          if (!implied_bias) {
+            biases++;
+          }
         }
       } else {
         scales++;
-        biases++;
+        if (!implied_bias) {
+          biases++;
+        }
       }
     } else {
       scales += group_stride;
-      biases += group_stride;
+      if (!implied_bias) {
+        biases += group_stride;
+      }
     }
   }
 };
@@ -808,7 +823,8 @@ template <
     short dst_ld,
     short reduction_dim,
     short tgp_size,
-    short bits>
+    short bits,
+    bool implied_bias>
 struct QuantizedBlockLoader<
     T,
     BROWS,
@@ -817,7 +833,8 @@ struct QuantizedBlockLoader<
     reduction_dim,
     tgp_size,
     32,
-    bits> {
+    bits,
+    implied_bias> {
   MLX_MTL_CONST short group_size = 32;
 
   static_assert(
@@ -853,6 +870,9 @@ struct QuantizedBlockLoader<
   const device uint8_t* src;
   const device T* scales;
   const device T* biases;
+  // Implied bias: biases_ is a single factor f and the per-group bias is
+  // f * scale (what the loader used to rebuild into a full array).
+  const T bias_factor;
 
   QuantizedBlockLoader(
       const device uint8_t* src_,
@@ -875,7 +895,14 @@ struct QuantizedBlockLoader<
         src(src_ + bi * src_ld * bytes_per_pack / pack_factor +
             bj * bytes_per_pack),
         scales(scales_ + bi * src_ld / group_size + group_id),
-        biases(biases_ + bi * src_ld / group_size + group_id) {}
+        biases(
+            implied_bias ? biases_
+                         : biases_ + bi * src_ld / group_size + group_id),
+        bias_factor(implied_bias ? biases_[0] : T(0)) {}
+
+  T load_bias(T scale) const thread {
+    return implied_bias ? bias_factor * scale : *biases;
+  }
 
   void load_unsafe() const thread {
     if (BCOLS_PACKED * BROWS < tgp_size && bi >= BROWS) {
@@ -883,7 +910,7 @@ struct QuantizedBlockLoader<
     }
 
     T scale = *scales;
-    T bias = *biases;
+    T bias = load_bias(scale);
     for (int i = 0; i < n_reads; i++) {
       dequantize<T, pack_factor, bits>(
           src + i * bytes_per_pack, scale, bias, dst + i * pack_factor);
@@ -910,7 +937,7 @@ struct QuantizedBlockLoader<
     }
 
     T scale = *scales;
-    T bias = *biases;
+    T bias = load_bias(scale);
     for (int i = 0; i < n_reads; i++) {
       dequantize<T, pack_factor, bits>(
           (device uint8_t*)(src + i * bytes_per_pack),
@@ -932,11 +959,15 @@ struct QuantizedBlockLoader<
       //   }
       // } else {
       scales += n_groups;
-      biases += n_groups;
+      if (!implied_bias) {
+        biases += n_groups;
+      }
       // }
     } else {
       scales += group_stride;
-      biases += group_stride;
+      if (!implied_bias) {
+        biases += group_stride;
+      }
     }
   }
 };
@@ -1043,7 +1074,8 @@ template <
     const int BK = 64,
     const int BN = 64,
     const int WM = 2,
-    const int WN = 2>
+    const int WN = 2,
+    bool implied_bias = false>
 METAL_FUNC void qmm_t_nax_tgp_impl(
     const device uint32_t* w,
     const device T* scales,
@@ -1076,7 +1108,8 @@ METAL_FUNC void qmm_t_nax_tgp_impl(
       1,
       WM * WN * SIMD_SIZE,
       group_size,
-      bits>;
+      bits,
+      implied_bias>;
 
   // Set the block
   const int K_w = K * bytes_per_pack / pack_factor;
@@ -1089,7 +1122,9 @@ METAL_FUNC void qmm_t_nax_tgp_impl(
   x += y_row * static_cast<int64_t>(K);
   wl += y_col * K_w;
   scales += y_col * K_g;
-  biases += y_col * K_g;
+  if (!implied_bias) {
+    biases += y_col * K_g;
+  }
   y += y_row * static_cast<int64_t>(N) + y_col;
 
   // Make the weight loader
@@ -1187,7 +1222,8 @@ template <
     const int BK = 64,
     const int BN = 64,
     const int WM = 2,
-    const int WN = 2>
+    const int WN = 2,
+    bool implied_bias = false>
 METAL_FUNC void qmm_n_nax_tgp_impl(
     const device uint32_t* w,
     const device T* scales,
@@ -1220,7 +1256,8 @@ METAL_FUNC void qmm_n_nax_tgp_impl(
       0,
       WM * WN * SIMD_SIZE,
       group_size,
-      bits>;
+      bits,
+      implied_bias>;
 
   // Set the block
   const int y_row = tid.y * BM;
@@ -1232,7 +1269,9 @@ METAL_FUNC void qmm_n_nax_tgp_impl(
   x += y_row * static_cast<int64_t>(K);
   wl += y_col * bytes_per_pack / pack_factor;
   scales += y_col / group_size;
-  biases += y_col / group_size;
+  if (!implied_bias) {
+    biases += y_col / group_size;
+  }
   y += y_row * static_cast<int64_t>(N) + y_col;
 
   // Make the weight loader
@@ -1317,7 +1356,8 @@ template <
     const int BK = 32,
     const int BN = 64,
     const int WM = 2,
-    const int WN = 2>
+    const int WN = 2,
+    bool implied_bias = false>
 [[kernel]] void affine_qmm_t_nax(
     const device uint32_t* w [[buffer(0)]],
     const device T* scales [[buffer(1)]],
@@ -1363,7 +1403,17 @@ template <
         b_strides,
         tid);
   }
-  qmm_t_nax_tgp_impl<T, group_size, bits, aligned_N, BM, BK, BN, WM, WN>(
+  qmm_t_nax_tgp_impl<
+      T,
+      group_size,
+      bits,
+      aligned_N,
+      BM,
+      BK,
+      BN,
+      WM,
+      WN,
+      implied_bias>(
       w, scales, biases, x, y, Ws, K, N, M, tid, lid, simd_gid, simd_lid);
 }
 
@@ -1376,7 +1426,8 @@ template <
     const int BK = 64,
     const int BN = 64,
     const int WM = 2,
-    const int WN = 2>
+    const int WN = 2,
+    bool implied_bias = false>
 [[kernel]] void affine_qmm_n_nax(
     const device uint32_t* w [[buffer(0)]],
     const device T* scales [[buffer(1)]],
@@ -1423,7 +1474,7 @@ template <
         tid);
   }
 
-  qmm_n_nax_tgp_impl<T, group_size, bits, BM, BK, BN, WM, WN>(
+  qmm_n_nax_tgp_impl<T, group_size, bits, BM, BK, BN, WM, WN, implied_bias>(
       w, scales, biases, x, y, Ws, K, N, M, tid, lid, simd_gid, simd_lid);
 }
 

@@ -3487,6 +3487,169 @@ TEST_CASE("test bias-free affine quantized_matmul decode") {
   }
 }
 
+TEST_CASE("test implied-bias affine quantized_matmul and dequantize") {
+  // An implied bias is a 0-d `biases` array holding a factor f; the kernels
+  // form bias = f * scale in place of loading a per-group bias. The output
+  // must be bit-identical to the rebuilt-bias path (bias = f * scale
+  // materialized in the scales dtype), for every factor the shipped
+  // checkpoints use.
+  const auto cpu = Device::cpu;
+  std::vector<Device> devices = {cpu};
+  if (metal::is_available()) {
+    devices.push_back(Device::gpu);
+  }
+
+  struct Case {
+    int bits;
+    int group_size;
+    float factor;
+  };
+  const Case cases[] = {
+      {2, 64, -2.0f},
+      {4, 64, -8.0f},
+      {8, 64, -128.0f},
+      {1, 128, -0.5f},
+      {2, 128, -1.0f},
+  };
+
+  int seed = 0;
+  for (const auto& dev : devices) {
+    for (auto dtype : {float16, float32}) {
+      for (const auto& c : cases) {
+        for (int K : {128, 512, 1536}) {
+          const int N = 72;
+          auto w =
+              random::bits({N, K * c.bits / 32}, 4, random::key(seed++), cpu);
+          auto scales = astype(
+              random::uniform(
+                  0.01f,
+                  1.0f,
+                  {N, K / c.group_size},
+                  float32,
+                  random::key(seed++),
+                  cpu),
+              dtype,
+              cpu);
+          auto factor = array(c.factor, dtype);
+          auto rebuilt = multiply(scales, factor, cpu);
+          eval(rebuilt);
+
+          // dequantize
+          auto d_full = dequantize(
+              w,
+              scales,
+              rebuilt,
+              c.group_size,
+              c.bits,
+              "affine",
+              std::nullopt,
+              std::nullopt,
+              dev);
+          auto d_ib = dequantize(
+              w,
+              scales,
+              factor,
+              c.group_size,
+              c.bits,
+              "affine",
+              std::nullopt,
+              std::nullopt,
+              dev);
+          CHECK_EQ(d_ib.dtype(), d_full.dtype());
+          CHECK(array_equal(d_full, d_ib, cpu).item<bool>());
+
+          for (int M : {1, 2, 3, 5, 8, 33, 128}) {
+            auto x = astype(
+                random::normal({M, K}, float32, random::key(seed++), cpu),
+                dtype,
+                cpu);
+            auto o_full = quantized_matmul(
+                x,
+                w,
+                scales,
+                rebuilt,
+                true,
+                c.group_size,
+                c.bits,
+                "affine",
+                dev);
+            auto o_ib = quantized_matmul(
+                x,
+                w,
+                scales,
+                factor,
+                true,
+                c.group_size,
+                c.bits,
+                "affine",
+                dev);
+            CHECK_EQ(o_ib.dtype(), o_full.dtype());
+            CHECK_EQ(o_ib.shape(), o_full.shape());
+            CHECK(array_equal(o_full, o_ib, cpu).item<bool>());
+          }
+          // Non-transposed (x @ w): w is (K_in, N_out) packed along N.
+          {
+            auto xn = astype(
+                random::normal({3, N}, float32, random::key(seed++), cpu),
+                dtype,
+                cpu);
+            auto o_full = quantized_matmul(
+                xn,
+                w,
+                scales,
+                rebuilt,
+                false,
+                c.group_size,
+                c.bits,
+                "affine",
+                dev);
+            auto o_ib = quantized_matmul(
+                xn,
+                w,
+                scales,
+                factor,
+                false,
+                c.group_size,
+                c.bits,
+                "affine",
+                dev);
+            CHECK(array_equal(o_full, o_ib, cpu).item<bool>());
+          }
+        }
+      }
+    }
+  }
+
+  // Unsupported paths throw rather than broadcasting a constant bias.
+  {
+    auto w = random::bits({8, 512 * 4 / 32}, 4, random::key(seed++), cpu);
+    auto scales =
+        random::uniform(0.5f, 1.5f, {8, 8}, float32, random::key(seed++), cpu);
+    auto x = random::normal({1, 512}, float32, random::key(seed++), cpu);
+    auto factor = array(-8.0f);
+    CHECK_THROWS_AS(
+        gather_qmm(
+            x,
+            w,
+            scales,
+            factor,
+            std::nullopt,
+            array({0}, int32),
+            true,
+            64,
+            4,
+            "affine",
+            false,
+            cpu),
+        std::invalid_argument);
+    // A 1-d bias of the wrong shape is still rejected.
+    CHECK_THROWS_AS(
+        quantized_matmul(
+            x, w, scales, array({-8.0f}), true, 64, 4, "affine", cpu),
+        std::invalid_argument);
+  }
+}
+
 TEST_CASE("test repeat") {
   auto data = array({13, 3, 16, 6, 14, 4, 15, 5, 11, 1, 12, 2}, {3, 2, 2});
   auto repeat_axis_0 = repeat(data, 2, 0);

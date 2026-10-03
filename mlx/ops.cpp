@@ -121,7 +121,9 @@ void validate_quantized_input(
     throw std::invalid_argument(msg.str());
   }
 
-  if (biases && scales.shape() != biases->shape()) {
+  // A 0-d biases array is an implied-bias factor (biases = factor * scales,
+  // formed in-kernel); it carries no shape to check.
+  if (biases && biases->ndim() != 0 && scales.shape() != biases->shape()) {
     std::ostringstream msg;
     msg << "[" << tag << "] Scales and biases should have the same shape. "
         << "Received scales with shape " << scales.shape()
@@ -4721,8 +4723,13 @@ std::pair<Dtype, QuantizationMode> validate_mode_with_type(
       msg << "[" << tag << "] Biases must be provided for affine quantization.";
       throw std::invalid_argument(msg.str());
     }
-    auto dtype = result_type(scales, *biases);
-    if (!issubdtype(dtype, floating)) {
+    // An implied-bias factor (0-d biases) adopts the scales dtype instead of
+    // promoting it: `mx.array(-8.0)` is float32 but the bias it implies lives
+    // in the scales' precision (exactly, as the factor is a power of two).
+    auto dtype =
+        biases->ndim() == 0 ? scales.dtype() : result_type(scales, *biases);
+    if (!issubdtype(dtype, floating) ||
+        !issubdtype(biases->dtype(), floating)) {
       std::ostringstream msg;
       msg << "[" << tag << "] Only real floating types are supported but "
           << "scales.dtype() == " << scales.dtype()
@@ -4840,7 +4847,17 @@ array quantized_matmul(
   }
 
   if (x.ndim() > 2 && w.ndim() > 2) {
+    // An implied-bias factor (0-d) is never broadcast: the kernels read the
+    // scalar once and form `factor * scale` per group.
+    std::optional<array> implied_bias;
+    if (inputs.size() == 4 && inputs[3].ndim() == 0) {
+      implied_bias = std::move(inputs[3]);
+      inputs.pop_back();
+    }
     inputs = broadcast_arrays(inputs, {-2, -1}, s);
+    if (implied_bias) {
+      inputs.push_back(std::move(*implied_bias));
+    }
   }
   auto out_shape = inputs[0].shape();
   out_shape.back() = w_outer_dims;
@@ -5287,18 +5304,26 @@ array affine_dequantize(
     StreamOrDevice s_) {
   auto wshape = w.shape();
   auto sshape = scales.shape();
-  auto bshape = biases.shape();
-  if (wshape.size() != sshape.size() || wshape.size() != bshape.size()) {
+  // A 0-d biases array is an implied-bias factor: biases = factor * scales.
+  const bool implied_bias = biases.ndim() == 0;
+  if (wshape.size() != sshape.size() ||
+      (!implied_bias && wshape.size() != biases.ndim())) {
     throw std::invalid_argument(
         "[dequantize] Shape of scales and biases does not match the matrix");
   }
   wshape.back() = -1;
   sshape.back() = -1;
-  bshape.back() = -1;
-
-  if (wshape != sshape || wshape != bshape) {
+  if (wshape != sshape) {
     throw std::invalid_argument(
         "[dequantize] Shape of scales and biases does not match the matrix");
+  }
+  if (!implied_bias) {
+    auto bshape = biases.shape();
+    bshape.back() = -1;
+    if (wshape != bshape) {
+      throw std::invalid_argument(
+          "[dequantize] Shape of scales and biases does not match the matrix");
+    }
   }
 
   // Packing into uint32
@@ -5353,7 +5378,10 @@ array affine_dequantize(
     wshape.push_back(group_size);
     w = reshape(w, wshape, s);
     w = multiply(w, expand_dims(scales, -1, s), s);
-    w = add(w, expand_dims(biases, -1, s), s);
+    // Implied bias: form `factor * scales` per group (exact for the power-of-
+    // two factors this mode exists for) rather than adding the scalar itself.
+    auto b = biases.ndim() == 0 ? multiply(scales, biases, s) : biases;
+    w = add(w, expand_dims(b, -1, s), s);
     w = reshape(w, sshape, s);
 
     return {w};
@@ -5367,7 +5395,9 @@ array affine_dequantize(
         scales.dtype(),
         std::make_shared<fast::Quantize>(
             s, fallback, group_size, bits, QuantizationMode::Affine, true),
-        {w, scales, biases});
+        // The dequantize kernel reads the implied-bias factor in the scales'
+        // dtype, so cast a 0-d factor given in another dtype.
+        {w, scales, implied_bias ? astype(biases, scales.dtype(), s) : biases});
   }
   return fallback({w, scales, biases})[0];
 }
@@ -5603,6 +5633,11 @@ array gather_qmm(
 
   auto [out_type, qmode] =
       validate_mode_with_type("gather_qmm", scales, biases, std::nullopt, mode);
+  if (biases && biases->ndim() == 0) {
+    throw std::invalid_argument(
+        "[gather_qmm] An implied-bias factor (0-d biases) is not supported "
+        "with indices; pass the per-group biases.");
+  }
   auto [group_size, bits] =
       quantization_params_from_mode(qmode, group_size_, bits_);
   auto [w_inner_dims, w_outer_dims] = extract_quantized_matmul_dims(
