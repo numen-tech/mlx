@@ -4799,15 +4799,19 @@ void validate_global_scale(
 //     them; a promoted kernel would round the product in the wider dtype), and
 //   - the non-JIT Metal library ships the `_ib` instantiation (1/2/4/8-bit; the
 //     3/5/6-bit implied kernels exist in JIT builds only, and a prebuilt
-//     metallib has no fallback for a missing name).
+//     metallib has no fallback for a missing name), and
+//   - the stream runs on the CPU or on Metal (the CUDA kernels have no
+//     implied-bias variant and would index the 0-d factor as a per-group bias).
 // Everywhere else the bias is materialized by `materialize_implied_bias` and
 // the ordinary per-group-bias path runs.
 bool implied_bias_kernels_exact(
     const array& scales,
     Dtype kernel_dtype,
-    int bits) {
+    int bits,
+    const Stream& stream) {
   return kernel_dtype == scales.dtype() &&
-      (bits == 1 || bits == 2 || bits == 4 || bits == 8);
+      (bits == 1 || bits == 2 || bits == 4 || bits == 8) &&
+      (stream.device == Device::cpu || metal::is_available());
 }
 
 array materialize_implied_bias(
@@ -4873,7 +4877,7 @@ array quantized_matmul(
       // implied_bias_kernels_exact) is materialized in the scales' storage
       // dtype here and takes the ordinary per-group-bias path.
       auto b = (biases->ndim() == 0 &&
-                !implied_bias_kernels_exact(scales, dtype, bits))
+                !implied_bias_kernels_exact(scales, dtype, bits, to_stream(s)))
           ? materialize_implied_bias(scales, *biases, s)
           : *biases;
       inputs.push_back(astype(b, dtype, s));
@@ -5440,7 +5444,7 @@ array affine_dequantize(
         {w,
          scales,
          !implied_bias ? biases
-             : implied_bias_kernels_exact(scales, scales.dtype(), bits)
+             : implied_bias_kernels_exact(scales, scales.dtype(), bits, s)
              ? astype(biases, scales.dtype(), s)
              : materialize_implied_bias(scales, biases, s)});
   }
