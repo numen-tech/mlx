@@ -4730,7 +4730,7 @@ std::pair<Dtype, QuantizationMode> validate_mode_with_type(
     const bool implied = is_implied_bias(*biases);
     auto dtype = implied ? scales.dtype() : result_type(scales, *biases);
     if (!issubdtype(dtype, floating) ||
-        (implied && !issubdtype(biases->dtype(), floating))) {
+        !issubdtype(biases->dtype(), floating)) {
       std::ostringstream msg;
       msg << "[" << tag << "] Only real floating types are supported but "
           << "scales.dtype() == " << scales.dtype()
@@ -4801,8 +4801,9 @@ void validate_global_scale(
 //   - the non-JIT Metal library ships the `_ib` instantiation (1/2/4/8-bit; the
 //     3/5/6-bit implied kernels exist in JIT builds only, and a prebuilt
 //     metallib has no fallback for a missing name), and
-//   - the stream runs on Metal (the `_ib` kernels are Metal-only; the CPU and
-//     CUDA kernels index the bias per group and would misread the 0-d factor).
+//   - the stream runs on the CPU (QuantizedMatmul::eval_cpu expands the factor
+//     itself) or on Metal (the `_ib` kernels); the CUDA kernels have no
+//     implied-bias variant and would index the 0-d factor as a per-group bias.
 // Everywhere else the bias is materialized by `materialize_implied_bias` and
 // the ordinary per-group-bias path runs.
 bool implied_bias_kernels_exact(
@@ -4810,7 +4811,8 @@ bool implied_bias_kernels_exact(
     Dtype kernel_dtype,
     int bits,
     const Stream& stream) {
-  return stream.device == Device::gpu && metal::is_available() &&
+  return (stream.device == Device::cpu ||
+          (stream.device == Device::gpu && metal::is_available())) &&
       kernel_dtype == scales.dtype() &&
       (bits == 1 || bits == 2 || bits == 4 || bits == 8);
 }

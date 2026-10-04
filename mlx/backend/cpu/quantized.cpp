@@ -951,11 +951,64 @@ void QuantizedMatmul::eval_cpu(const std::vector<array>& inputs, array& out) {
     auto biases = ensure_row_contiguous(inputs[3], encoder, stream());
     encoder.set_input_array(biases);
     if (is_implied_bias(biases)) {
-      // The `_ib` kernels are Metal-only; quantized_matmul materializes the
-      // factor (see implied_bias_kernels_exact) before it reaches the CPU.
-      throw std::runtime_error(
-          "[QuantizedMatmul::eval_cpu] Implied-bias (0-d) biases are not "
-          "supported on the CPU; materialize scales * factor first.");
+      // Implied bias: `biases` is a single factor f, exact in the scales'
+      // dtype T by contract. The CPU kernels index a per-group bias array, so
+      // materialize f * scales into a temporary: the float product of two T
+      // values is exact, so rounding it to T matches `scales * T(f)`.
+      array full_biases(scales.shape(), scales.dtype(), nullptr, {});
+      full_biases.set_data(allocator::malloc(full_biases.nbytes()));
+      encoder.add_temporary(full_biases);
+      encoder.set_output_array(full_biases);
+      encoder.dispatch([out = array::unsafe_weak_copy(out),
+                        x = array::unsafe_weak_copy(x),
+                        w = array::unsafe_weak_copy(w),
+                        scales = array::unsafe_weak_copy(scales),
+                        factor = array::unsafe_weak_copy(biases),
+                        full_biases = array::unsafe_weak_copy(full_biases),
+                        group_size_ = group_size_,
+                        bits_ = bits_,
+                        transpose_ = transpose_]() mutable {
+        float f;
+        switch (factor.dtype()) {
+          case float32:
+            f = factor.data<float>()[0];
+            break;
+          case float16:
+            f = static_cast<float>(factor.data<float16_t>()[0]);
+            break;
+          case bfloat16:
+            f = static_cast<float>(factor.data<bfloat16_t>()[0]);
+            break;
+          default:
+            throw std::runtime_error(
+                "[QuantizedMatmul::eval_cpu] Implied-bias factor must be a "
+                "real floating type.");
+        }
+        auto fill = [&](auto* dst, const auto* src) {
+          using T = std::remove_pointer_t<decltype(dst)>;
+          for (size_t i = 0; i < scales.size(); ++i) {
+            dst[i] = static_cast<T>(f * static_cast<float>(src[i]));
+          }
+        };
+        switch (scales.dtype()) {
+          case float32:
+            fill(full_biases.data<float>(), scales.data<float>());
+            break;
+          case float16:
+            fill(full_biases.data<float16_t>(), scales.data<float16_t>());
+            break;
+          case bfloat16:
+            fill(full_biases.data<bfloat16_t>(), scales.data<bfloat16_t>());
+            break;
+          default:
+            throw std::runtime_error(
+                "[QuantizedMatmul::eval_cpu] Only real floating scales are "
+                "supported with an implied bias.");
+        }
+        _qmm_dispatch(
+            out, x, w, scales, full_biases, group_size_, bits_, transpose_);
+      });
+      return;
     }
     encoder.dispatch([out = array::unsafe_weak_copy(out),
                       x = array::unsafe_weak_copy(x),

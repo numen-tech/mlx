@@ -1453,6 +1453,12 @@ class TestQuantized(mlx_tests.MLXTestCase):
         # The factor must be a real floating type.
         with self.assertRaises(ValueError):
             mx.quantized_matmul(x, w_q, scales, mx.array(-8), True, 64, 4)
+        # So must a per-group biases array.
+        int_biases = mx.zeros(scales.shape, dtype=mx.int32)
+        with self.assertRaises(ValueError):
+            mx.quantized_matmul(x, w_q, scales, int_biases, True, 64, 4)
+        with self.assertRaises(ValueError):
+            mx.dequantize(w_q, scales, int_biases, 64, 4)
         # The fp modes have no biases.
         w_q4, scales4 = mx.quantize(w, mode="mxfp4")
         with self.assertRaises(ValueError):
