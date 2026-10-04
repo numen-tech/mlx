@@ -1625,7 +1625,12 @@ MLX_API array from_fp8(array x, Dtype dtype, StreamOrDevice s = {});
 /** Convert a floating point matrix to E4M3 float8. */
 MLX_API array to_fp8(array x, StreamOrDevice s = {});
 
-/** Compute matrix products with matrix-level gather. */
+/** Compute matrix products with matrix-level gather.
+ *
+ * In mode "affine", `biases` may be a 0-d implied-bias factor with the same
+ * meaning as in quantized_matmul(): bias = `scales * T(f)` in the scales'
+ * dtype T.
+ */
 MLX_API array gather_qmm(
     const array& x,
     const array& w,
