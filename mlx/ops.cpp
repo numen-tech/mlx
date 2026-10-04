@@ -9,6 +9,7 @@
 #include <set>
 #include <sstream>
 
+#include "mlx/backend/common/quantized.h"
 #include "mlx/backend/cuda/cuda.h"
 #include "mlx/backend/metal/metal.h"
 #include "mlx/fast_primitives.h"
@@ -121,7 +122,9 @@ void validate_quantized_input(
     throw std::invalid_argument(msg.str());
   }
 
-  if (biases && scales.shape() != biases->shape()) {
+  // An implied-bias factor carries no shape to check.
+  if (biases && !is_implied_bias(*biases) &&
+      scales.shape() != biases->shape()) {
     std::ostringstream msg;
     msg << "[" << tag << "] Scales and biases should have the same shape. "
         << "Received scales with shape " << scales.shape()
@@ -4721,8 +4724,13 @@ std::pair<Dtype, QuantizationMode> validate_mode_with_type(
       msg << "[" << tag << "] Biases must be provided for affine quantization.";
       throw std::invalid_argument(msg.str());
     }
-    auto dtype = result_type(scales, *biases);
-    if (!issubdtype(dtype, floating)) {
+    // An implied-bias factor (0-d biases) adopts the scales dtype instead of
+    // promoting it: `mx.array(-8.0)` is float32 but the bias it implies lives
+    // in the scales' precision (exactly, as the factor is a power of two).
+    const bool implied = is_implied_bias(*biases);
+    auto dtype = implied ? scales.dtype() : result_type(scales, *biases);
+    if (!issubdtype(dtype, floating) ||
+        !issubdtype(biases->dtype(), floating)) {
       std::ostringstream msg;
       msg << "[" << tag << "] Only real floating types are supported but "
           << "scales.dtype() == " << scales.dtype()
@@ -4781,6 +4789,41 @@ void validate_global_scale(
   }
 }
 
+// Implied bias (a 0-d `biases` array holding a factor f): the contract is that
+// it stands for the materialized per-group bias `scales * T(f)`, formed in the
+// scales' storage dtype T -- f is cast to T first, so a factor that is not
+// exactly representable in T is outside the contract (the reference is still
+// `scales * T(f)`, not `T(f * scales)`). The `_ib` kernels form `T(f) *
+// T(scale)` in place of loading the bias, which honors that definition exactly
+// only when
+//   - the kernel sees the scales in T (the activations' dtype did not promote
+//     them; a promoted kernel would round the product in the wider dtype), and
+//   - the non-JIT Metal library ships the `_ib` instantiation (1/2/4/8-bit; the
+//     3/5/6-bit implied kernels exist in JIT builds only, and a prebuilt
+//     metallib has no fallback for a missing name), and
+//   - the stream runs on the CPU (QuantizedMatmul::eval_cpu expands the factor
+//     itself) or on Metal (the `_ib` kernels); the CUDA kernels have no
+//     implied-bias variant and would index the 0-d factor as a per-group bias.
+// Everywhere else the bias is materialized by `materialize_implied_bias` and
+// the ordinary per-group-bias path runs.
+bool implied_bias_kernels_exact(
+    const array& scales,
+    Dtype kernel_dtype,
+    int bits,
+    const Stream& stream) {
+  return (stream.device == Device::cpu ||
+          (stream.device == Device::gpu && metal::is_available())) &&
+      kernel_dtype == scales.dtype() &&
+      (bits == 1 || bits == 2 || bits == 4 || bits == 8);
+}
+
+array materialize_implied_bias(
+    const array& scales,
+    const array& factor,
+    StreamOrDevice s) {
+  return multiply(scales, astype(factor, scales.dtype(), s), s);
+}
+
 array quantized_matmul(
     const array& x,
     const array& w,
@@ -4833,14 +4876,31 @@ array quantized_matmul(
   if (qmode == QuantizationMode::Affine) {
     inputs = {astype(x, dtype), w, astype(scales, dtype)};
     if (biases) {
-      inputs.push_back(astype(*biases, dtype));
+      // An implied-bias factor the kernels cannot honor exactly (see
+      // implied_bias_kernels_exact) is materialized in the scales' storage
+      // dtype here and takes the ordinary per-group-bias path.
+      auto b = (is_implied_bias(*biases) &&
+                !implied_bias_kernels_exact(scales, dtype, bits, to_stream(s)))
+          ? materialize_implied_bias(scales, *biases, s)
+          : *biases;
+      inputs.push_back(astype(b, dtype, s));
     }
   } else {
     inputs = {x, w, scales};
   }
 
   if (x.ndim() > 2 && w.ndim() > 2) {
+    // An implied-bias factor (0-d) is never broadcast: the kernels read the
+    // scalar once and form `factor * scale` per group.
+    std::optional<array> implied_bias;
+    if (inputs.size() == 4 && is_implied_bias(inputs[3])) {
+      implied_bias = std::move(inputs[3]);
+      inputs.pop_back();
+    }
     inputs = broadcast_arrays(inputs, {-2, -1}, s);
+    if (implied_bias) {
+      inputs.push_back(std::move(*implied_bias));
+    }
   }
   auto out_shape = inputs[0].shape();
   out_shape.back() = w_outer_dims;
@@ -5287,18 +5347,25 @@ array affine_dequantize(
     StreamOrDevice s_) {
   auto wshape = w.shape();
   auto sshape = scales.shape();
-  auto bshape = biases.shape();
-  if (wshape.size() != sshape.size() || wshape.size() != bshape.size()) {
+  const bool implied_bias = is_implied_bias(biases);
+  if (wshape.size() != sshape.size() ||
+      (!implied_bias && wshape.size() != biases.ndim())) {
     throw std::invalid_argument(
         "[dequantize] Shape of scales and biases does not match the matrix");
   }
   wshape.back() = -1;
   sshape.back() = -1;
-  bshape.back() = -1;
-
-  if (wshape != sshape || wshape != bshape) {
+  if (wshape != sshape) {
     throw std::invalid_argument(
         "[dequantize] Shape of scales and biases does not match the matrix");
+  }
+  if (!implied_bias) {
+    auto bshape = biases.shape();
+    bshape.back() = -1;
+    if (wshape != bshape) {
+      throw std::invalid_argument(
+          "[dequantize] Shape of scales and biases does not match the matrix");
+    }
   }
 
   // Packing into uint32
@@ -5353,7 +5420,13 @@ array affine_dequantize(
     wshape.push_back(group_size);
     w = reshape(w, wshape, s);
     w = multiply(w, expand_dims(scales, -1, s), s);
-    w = add(w, expand_dims(biases, -1, s), s);
+    // Implied bias: form `scales * T(f)` per group in the scales' dtype (the
+    // factor is cast first so a wider factor cannot promote the product past
+    // the rounding a materialized bias went through).
+    auto b = is_implied_bias(biases)
+        ? materialize_implied_bias(scales, biases, s)
+        : biases;
+    w = add(w, expand_dims(b, -1, s), s);
     w = reshape(w, sshape, s);
 
     return {w};
@@ -5362,12 +5435,20 @@ array affine_dequantize(
   if (s.device == Device::gpu) {
     auto out_shape = w.shape();
     out_shape.back() = out_size;
+    // The dequantize kernel reads the implied-bias factor in the scales'
+    // dtype, so cast a 0-d factor given in another dtype; when the non-JIT
+    // library has no `_ib` kernel for this bit width, materialize the bias
+    // instead (see implied_bias_kernels_exact).
+    array b = !implied_bias ? biases
+        : implied_bias_kernels_exact(scales, scales.dtype(), bits, s)
+        ? astype(biases, scales.dtype(), s)
+        : materialize_implied_bias(scales, biases, s);
     return array(
         std::move(out_shape),
         scales.dtype(),
         std::make_shared<fast::Quantize>(
             s, fallback, group_size, bits, QuantizationMode::Affine, true),
-        {w, scales, biases});
+        {w, scales, std::move(b)});
   }
   return fallback({w, scales, biases})[0];
 }
@@ -5587,7 +5668,7 @@ array gather_qmm(
     const array& x,
     const array& w,
     const array& scales,
-    const std::optional<array>& biases /* = std::nullopt */,
+    const std::optional<array>& biases_ /* = std::nullopt */,
     std::optional<array> lhs_indices_ /* = std::nullopt */,
     std::optional<array> rhs_indices_ /* = std::nullopt */,
     bool transpose /* = true */,
@@ -5598,11 +5679,16 @@ array gather_qmm(
     StreamOrDevice s /* = {} */) {
   if (!lhs_indices_ && !rhs_indices_) {
     return quantized_matmul(
-        x, w, scales, biases, transpose, group_size_, bits_, mode, s);
+        x, w, scales, biases_, transpose, group_size_, bits_, mode, s);
   }
 
-  auto [out_type, qmode] =
-      validate_mode_with_type("gather_qmm", scales, biases, std::nullopt, mode);
+  auto [out_type, qmode] = validate_mode_with_type(
+      "gather_qmm", scales, biases_, std::nullopt, mode);
+  // The gather kernels have no implied-bias variant: materialize the factor.
+  std::optional<array> biases = biases_;
+  if (is_implied_bias(biases_)) {
+    biases = materialize_implied_bias(scales, *biases_, s);
+  }
   auto [group_size, bits] =
       quantization_params_from_mode(qmode, group_size_, bits_);
   auto [w_inner_dims, w_outer_dims] = extract_quantized_matmul_dims(

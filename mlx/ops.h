@@ -1563,7 +1563,13 @@ MLX_API array conv_transpose3d(
     int groups = 1,
     StreamOrDevice s = {});
 
-/** Quantized matmul multiplies x with a quantized matrix w*/
+/** Quantized matmul multiplies x with a quantized matrix w.
+ *
+ * In mode "affine", `biases` may be a 0-d array holding an implied-bias
+ * factor f: it stands for the per-group bias `scales * T(f)`, where T is the
+ * scales' dtype and f is cast to T first. A factor not exactly representable
+ * in T is outside this contract (the result is still that of `scales * T(f)`).
+ */
 MLX_API array quantized_matmul(
     const array& x,
     const array& w,
@@ -1584,7 +1590,12 @@ MLX_API std::vector<array> quantize(
     const std::optional<array>& global_scale = std::nullopt,
     StreamOrDevice s = {});
 
-/** Dequantize a matrix produced by quantize() */
+/** Dequantize a matrix produced by quantize().
+ *
+ * In mode "affine", `biases` may be a 0-d implied-bias factor with the same
+ * meaning as in quantized_matmul(): bias = `scales * T(f)` in the scales'
+ * dtype T.
+ */
 MLX_API array dequantize(
     const array& w,
     const array& scales,
