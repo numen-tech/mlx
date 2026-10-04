@@ -883,6 +883,44 @@ class TestQuantized(mlx_tests.MLXTestCase):
                     self.assertEqual(y_q.shape, y_hat.shape)
                     self.assertLess((y_q - y_hat).abs().max(), 1e-3)
 
+    @unittest.skipUnless(mx.metal.is_available(), "qmv_wide is a Metal kernel")
+    def test_qmv_wide_tile_matches_split(self):
+        # affine qmv_wide runs M = 6..7 as one tile; every other M keeps the
+        # cap of 5 (8 is 4 + 4, 11 is 4 + 4 + 3, 12 is 4 + 4 + 4). A vector's
+        # accumulation does not depend on the tile, so one call over M rows
+        # must match, bit for bit, the same rows run in chunks of at most 5
+        # (one tile each); the tiling itself is not observable from here. All
+        # M are below every GPU's qmv batch limit for K, N <= 2048. Explicit
+        # biases and the 0-d implied-bias factor.
+        key = mx.random.key(6)
+        k1, k2 = mx.random.split(key)
+        cases = [(bits, gs, None) for bits in [2, 3, 4, 5, 6, 8] for gs in [32, 64]]
+        cases += [(b, gs, f) for b, gs, f in self.IMPLIED_BIAS_CASES if b > 1]
+        splits = {6: [3, 3], 7: [4, 3], 8: [4, 4], 11: [4, 4, 3], 12: [4, 4, 4]}
+        for (bits, gs, factor), dtype, K, B in product(
+            cases, self.IMPLIED_BIAS_DTYPES, [512, 1536], [1, 2]
+        ):
+            lead = (B,) if B > 1 else ()
+            N = 72
+            w = mx.random.normal(shape=lead + (N, K), key=k2).astype(dtype)
+            w_q, scales, biases = mx.quantize(w, gs, bits)
+            if factor is not None:
+                biases = mx.array(factor, dtype)
+
+            def qmm(x):
+                return mx.quantized_matmul(x, w_q, scales, biases, True, gs, bits)
+
+            for M, chunks in splits.items():
+                with self.subTest(
+                    bits=bits, gs=gs, factor=factor, dtype=dtype, K=K, B=B, M=M
+                ):
+                    x = mx.random.normal(shape=lead + (M, K), key=k1).astype(dtype)
+                    parts, r = [], 0
+                    for c in chunks:
+                        parts.append(qmm(x[..., r : r + c, :]))
+                        r += c
+                    self.assert_bitwise_equal(qmm(x), mx.concatenate(parts, axis=-2))
+
     @unittest.skipUnless(mx.metal.is_available(), "Bias-free affine is Metal-only")
     def test_qmv_affine_sym(self):
         def assert_sym_matches_biased(y_sym, y_biased):

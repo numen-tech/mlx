@@ -639,6 +639,16 @@ void qmv_wide(
   // them.
   int n_tiles = (M + 4) / 5; // ceil(M / 5); tile size caps at 5
   int vecs_per_tg = (M + n_tiles - 1) / n_tiles;
+  // affine (gen-15+ only, see use_qmv_wide) runs M = 6..7 as one tile, so a
+  // speculative verify of up to 7 rows streams the weights once; a vector's
+  // accumulation does not depend on the tile, so the bits match the split.
+  // Every other M and mode keeps the cap of 5. M3 Max: a tile of 8 costs
+  // 10-16% more than a tile of 7 (MLX's dense gemv_wide caps at 5 for
+  // occupancy), so M = 8 stays 4 + 4.
+  constexpr int max_affine_single_tile = 7;
+  if (mode == "affine" && M <= max_affine_single_tile) {
+    vecs_per_tg = M;
+  }
 
   // k_lanes: lanes reducing K per output row (32/k_lanes rows per simdgroup).
   // The affine subchunk decode has enough ALU per weight load to favor more
