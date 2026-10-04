@@ -3704,27 +3704,21 @@ TEST_CASE("test affine qmv_wide single tile of 6 and 7 vectors") {
         const int N = 72;
         auto w =
             random::bits({N, K * c.bits / 32}, 4, random::key(seed++), cpu);
-        auto scales = astype(
-            random::uniform(
-                0.01f,
-                0.1f,
-                {N, K / c.group_size},
-                float32,
-                random::key(seed++),
-                cpu),
-            dtype,
-            cpu);
-        auto biases = c.factor ? array(*c.factor, dtype)
-                               : astype(
-                                     random::uniform(
-                                         -0.5f,
-                                         0.5f,
-                                         {N, K / c.group_size},
-                                         float32,
-                                         random::key(seed++),
-                                         cpu),
-                                     dtype,
-                                     cpu);
+        auto per_group = [&](float lo, float hi) {
+          return astype(
+              random::uniform(
+                  lo,
+                  hi,
+                  {N, K / c.group_size},
+                  float32,
+                  random::key(seed++),
+                  cpu),
+              dtype,
+              cpu);
+        };
+        auto scales = per_group(0.01f, 0.1f);
+        auto biases =
+            c.factor ? array(*c.factor, dtype) : per_group(-0.5f, 0.5f);
         auto ref_biases =
             c.factor ? implied_bias_reference(scales, biases) : biases;
         auto w_hat = dequantize(
