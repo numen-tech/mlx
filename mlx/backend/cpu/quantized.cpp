@@ -951,10 +951,8 @@ void QuantizedMatmul::eval_cpu(const std::vector<array>& inputs, array& out) {
     auto biases = ensure_row_contiguous(inputs[3], encoder, stream());
     encoder.set_input_array(biases);
     if (is_implied_bias(biases)) {
-      // Implied bias: `biases` is a single factor f, exact in the scales'
-      // dtype T by contract. The CPU kernels index a per-group bias array, so
-      // materialize f * scales into a temporary: the float product of two T
-      // values is exact, so rounding it to T matches `scales * T(f)`.
+      // Implied bias: expand the factor f into a temporary `scales * T(f)`
+      // for the per-group-bias kernels.
       array full_biases(scales.shape(), scales.dtype(), nullptr, {});
       full_biases.set_data(allocator::malloc(full_biases.nbytes()));
       encoder.add_temporary(full_biases);

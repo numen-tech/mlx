@@ -3541,8 +3541,7 @@ std::vector<array> QuantizedMatmul::vjp(
   // -scale for 2-bit. The reverse products run on the biased kernels.
   bool sym = mode_ == QuantizationMode::Affine && primals.size() == 3;
   float sym_c = (bits_ == 1) ? -0.5f : -1.0f;
-  // Implied bias: primals[3] is a 0-d factor f, bias = f * scale. The reverse
-  // product for x passes the factor straight through (the kernels honor it).
+  // Implied bias: primals[3] is a 0-d factor f and bias = f * scale.
   bool implied = mode_ == QuantizationMode::Affine && primals.size() == 4 &&
       is_implied_bias(primals[3]);
   std::optional<array> biases = std::nullopt;
@@ -3573,6 +3572,9 @@ std::vector<array> QuantizedMatmul::vjp(
     else if (arg == 1) {
       throw std::runtime_error(
           "[QuantizedMatmul::vjp] no gradient wrt the quantized weights.");
+    } else if (arg == 3 && implied) {
+      // The implied-bias factor is a constant.
+      vjps.push_back(zeros_like(primals[3], stream()));
     } else {
       if (mode_ != QuantizationMode::Affine) {
         std::ostringstream msg;
@@ -3591,16 +3593,16 @@ std::vector<array> QuantizedMatmul::vjp(
       }
       if (arg == 3) {
         // biases
-        if (implied) {
-          throw std::runtime_error(
-              "[QuantizedMatmul::vjp] no gradient wrt an implied-bias factor.");
-        }
         vjps.push_back(sum(*dsb, -1, false, stream()));
       } else {
         // scales: d(w_hat)/d(scale) is q, or q + c for a derived/implied bias
+        // The factor is a constant, so keep it out of higher-order grads.
         array bias_c = sym ? array(sym_c, primals[2].dtype())
-            : implied      ? astype(primals[3], primals[2].dtype(), stream())
-                           : array(0.0f, primals[2].dtype());
+            : implied      ? astype(
+                            stop_gradient(primals[3], stream()),
+                            primals[2].dtype(),
+                            stream())
+                      : array(0.0f, primals[2].dtype());
         auto wq = dequantize(
             primals[1],
             ones_like(primals[2], stream()),
@@ -3623,9 +3625,17 @@ std::vector<array> QuantizedMatmul::jvp(
     const std::vector<array>& primals,
     const std::vector<array>& tangents,
     const std::vector<int>& argnums) {
-  if (argnums.size() > 1 || argnums[0] != 0) {
-    throw std::runtime_error(
-        "[QuantizedMatmul::jvp] No JVP wrt the quantized matrix yet.");
+  bool implied = mode_ == QuantizationMode::Affine && primals.size() == 4 &&
+      is_implied_bias(primals[3]);
+  for (auto arg : argnums) {
+    if (arg != 0 && !(implied && arg == 3)) {
+      throw std::runtime_error(
+          "[QuantizedMatmul::jvp] No JVP wrt the quantized matrix yet.");
+    }
+  }
+  if (argnums[0] != 0) {
+    // The implied-bias factor is a constant.
+    return {zeros(output_shapes(primals)[0], primals[0].dtype(), stream())};
   }
   return {quantized_matmul(
       tangents[0],

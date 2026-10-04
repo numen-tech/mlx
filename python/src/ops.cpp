@@ -4648,8 +4648,8 @@ void init_ops(nb::module_& m) {
             elements of ``w``. In mode ``"affine"`` a 0-d array is an
             implied-bias factor ``f`` standing for ``scales * T(f)`` in the
             scales' dtype ``T`` (``f`` is cast to ``T`` first; a factor that is
-            not exactly representable in ``T`` is outside this contract).
-            Default: ``None``.
+            not exactly representable in ``T`` is outside this contract). The
+            factor is a constant: its gradient is zero. Default: ``None``.
           transpose (bool, optional): Defines whether to multiply with the
             transposed ``w`` or not, namely whether we are performing
             ``x @ w.T`` or ``x @ w``. Default: ``True``.
@@ -4843,14 +4843,17 @@ void init_ops(nb::module_& m) {
         all but the last two dimensions) of ``x`` and ``w`` respectively.
 
         Note that ``scales`` and ``biases`` must have the same batch dimensions
-        as ``w`` since they represent the same quantized matrix.
+        as ``w`` since they represent the same quantized matrix. An implied-bias
+        factor (a 0-d ``biases``) has no batch dimensions.
 
         Args:
             x (array): Input array
             w (array): Quantized matrix packed in unsigned integers
             scales (array): The scales to use per ``group_size`` elements of ``w``
             biases (array, optional): The biases to use per ``group_size``
-              elements of ``w``. Default: ``None``.
+              elements of ``w``. In mode ``"affine"`` a 0-d array is an
+              implied-bias factor ``f`` standing for ``scales * T(f)`` in the
+              scales' dtype ``T`` (see :func:`quantized_matmul`). Default: ``None``.
             lhs_indices (array, optional): Integer indices for ``x``. Default: ``None``.
             rhs_indices (array, optional): Integer indices for ``w``. Default: ``None``.
             transpose (bool, optional): Defines whether to multiply with the

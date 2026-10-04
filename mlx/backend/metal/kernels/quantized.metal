@@ -186,13 +186,8 @@
   instantiate_quantized_sym_types(64, bits)    \
   instantiate_quantized_sym_types(32, bits)
 
-// Implied-bias ("_ib") variants: `biases` is a single factor f and the
-// kernel forms bias = f * scale per group. The trailing `true` is the
-// kernels' `implied_bias` template argument; the defaulted parameters before
-// it (has_global_scale = false, results_per_simdgroup = 4, BM/BK/BN = 32) are
-// spelled out, matching the host's template definition. Only the bit widths
-// of the shipped power-of-two-factor checkpoints (1, 2, 4, 8) are built into
-// the metallib; 3/5/6-bit implied-bias kernels exist in the JIT build only.
+// Implied-bias ("_ib") variants: 1/2/4/8-bit only. The 3/5/6-bit variants
+// exist in JIT builds only. Defaulted template args are spelled out.
 #define instantiate_quantized_ib_qmv(name, type, group_size, bits, batched)  \
   instantiate_kernel(                                                        \
       #name "_" #type "_gs_" #group_size "_b_" #bits "_batch_" #batched "_ib", \

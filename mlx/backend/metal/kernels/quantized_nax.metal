@@ -101,10 +101,8 @@
   instantiate_quantized_types(64, bits)    \
   instantiate_quantized_types(32, bits)
 
-// Implied-bias ("_ib") variants: `biases` is a single factor f and the
-// kernel forms bias = f * scale per group (trailing `implied_bias = true`).
-// Built for the shipped power-of-two-factor bit widths (1, 2, 4, 8) only;
-// 3/5/6-bit implied-bias NAX kernels exist in the JIT build only.
+// Implied-bias ("_ib") variants: 1/2/4/8-bit only. The 3/5/6-bit variants
+// exist in JIT builds only.
 #define instantiate_quantized_ib_batched(name, type, group_size, bits, bm, bn, bk, wm, wn, batched)     \
   instantiate_kernel(                                                    \
       #name "_" #type "_gs_" #group_size "_b_" #bits "_bm" #bm "_bn" #bn "_bk" #bk "_wm" #wm "_wn" #wn "_batch_" #batched "_ib", \
