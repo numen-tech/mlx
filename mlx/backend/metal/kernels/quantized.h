@@ -958,10 +958,10 @@ METAL_FUNC void qmv_fast_impl(
   }
 
   if (aligned_end < in_vec_size) {
-    // Partial last block: lanes past the end of the row skip the loads (they
-    // would read past the weight buffer) and still join the simd_sum below.
+    // Partial last block: a lane loads only if all its values are in the row,
+    // else it reads nothing. All lanes join the simd_sum below.
     bool in_bounds =
-        (aligned_end + simd_lid * values_per_thread) < in_vec_size;
+        (aligned_end + (simd_lid + 1) * values_per_thread) <= in_vec_size;
     if (in_bounds) {
       U sum = load_vector<T, U, values_per_thread, bits>(x, x_thread);
 
