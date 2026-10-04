@@ -4804,7 +4804,9 @@ array materialize_implied_bias(
     const array& scales,
     const array& factor,
     StreamOrDevice s) {
-  return multiply(scales, astype(factor, scales.dtype(), s), s);
+  // The factor is a constant on every path: no gradient flows to it.
+  auto f = stop_gradient(astype(factor, scales.dtype(), s), s);
+  return multiply(scales, f, s);
 }
 
 array quantized_matmul(

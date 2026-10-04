@@ -1569,6 +1569,7 @@ MLX_API array conv_transpose3d(
  * factor f: it stands for the per-group bias `scales * T(f)`, where T is the
  * scales' dtype and f is cast to T first. A factor not exactly representable
  * in T is outside this contract (the result is still that of `scales * T(f)`).
+ * The factor is a constant: its gradient is zero.
  */
 MLX_API array quantized_matmul(
     const array& x,

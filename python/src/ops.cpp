@@ -4648,8 +4648,8 @@ void init_ops(nb::module_& m) {
             elements of ``w``. In mode ``"affine"`` a 0-d array is an
             implied-bias factor ``f`` standing for ``scales * T(f)`` in the
             scales' dtype ``T`` (``f`` is cast to ``T`` first; a factor that is
-            not exactly representable in ``T`` is outside this contract).
-            Default: ``None``.
+            not exactly representable in ``T`` is outside this contract). The
+            factor is a constant: its gradient is zero. Default: ``None``.
           transpose (bool, optional): Defines whether to multiply with the
             transposed ``w`` or not, namely whether we are performing
             ``x @ w.T`` or ``x @ w``. Default: ``True``.
