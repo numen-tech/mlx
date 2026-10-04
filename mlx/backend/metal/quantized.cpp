@@ -54,10 +54,8 @@ auto get_qmm_nax_kernel_wrapped(
   return get_qmm_nax_kernel(d, name, template_def, mode);
 }
 
-// Implied-bias kernels (is_implied_bias, mlx/backend/common/quantized.h) are
-// selected by an "_ib" kernel-name suffix and a trailing `implied_bias = true`
-// template arg. The affine_sym and fp kernels have no such parameter, so the
-// trailing arg is passed only on the implied branch.
+// Implied-bias kernels have an "_ib" name suffix and a trailing `implied_bias`
+// template arg. Only pass that arg on the implied branch.
 
 inline array
 ensure_row_contiguous(const array& x, metal::Device& d, const Stream& s) {

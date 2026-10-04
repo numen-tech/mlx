@@ -670,9 +670,8 @@ METAL_FUNC U sym_derived_bias(U scale) {
   return bits == 1 ? U(-0.5f) * scale : -scale;
 }
 
-// Per-group bias for the affine kernels. Implied bias: `biases` holds a
-// single factor f and the bias is f * scale, formed in T so it matches a bias
-// materialized in the scales dtype; otherwise the stored bias is read.
+// Per-group bias for the affine kernels. An implied bias is f * scale, formed
+// in T to match a bias materialized in the scales dtype.
 template <typename U, typename T, int bits, bool bias_free, bool implied_bias>
 METAL_FUNC U affine_bias(U scale, T f, T scale_t, const device T* bias) {
   static_assert(
@@ -1744,10 +1743,8 @@ METAL_FUNC void adjust_matrix_offsets(
   y += tid.z * output_stride;
 }
 
-// `implied_bias` (last template parameter of every affine_* kernel below):
-// the biases buffer holds a single factor f and the per-group bias is f *
-// scale, formed in-kernel. The host binds a 0-d array and zero b_strides, so
-// adjust_matrix_offsets leaves the pointer on the factor.
+// `implied_bias`: `biases` holds one factor f and the bias is f * scale. Zero
+// b_strides keep the pointer on f.
 template <
     typename T,
     int group_size,
