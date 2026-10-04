@@ -10,6 +10,7 @@
 #include <sstream>
 #include <stdexcept>
 
+#include "mlx/backend/common/quantized.h"
 #include "mlx/backend/common/utils.h"
 #include "mlx/fft.h"
 #include "mlx/linalg.h"
@@ -3543,7 +3544,7 @@ std::vector<array> QuantizedMatmul::vjp(
   // Implied bias: primals[3] is a 0-d factor f, bias = f * scale. The reverse
   // product for x passes the factor straight through (the kernels honor it).
   bool implied = mode_ == QuantizationMode::Affine && primals.size() == 4 &&
-      primals[3].ndim() == 0;
+      is_implied_bias(primals[3]);
   std::optional<array> biases = std::nullopt;
   if (mode_ == QuantizationMode::Affine) {
     biases = sym

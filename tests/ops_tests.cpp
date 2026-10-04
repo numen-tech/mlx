@@ -3487,17 +3487,32 @@ TEST_CASE("test bias-free affine quantized_matmul decode") {
   }
 }
 
-TEST_CASE("test implied-bias affine quantized_matmul and dequantize") {
-  // An implied bias is a 0-d `biases` array holding a factor f; the kernels
-  // form bias = f * scale in place of loading a per-group bias. The output
-  // must be bit-identical to the rebuilt-bias path (bias = f * scale
-  // materialized in the scales dtype), for every factor the shipped
-  // checkpoints use.
-  const auto cpu = Device::cpu;
-  std::vector<Device> devices = {cpu};
-  if (metal::is_available()) {
+// Implied bias: a 0-d `biases` array holding a factor f stands for the
+// materialized bias `scales * T(f)`, formed in the scales' storage dtype T
+// (ops.h). The implied path must reproduce that reference bit for bit.
+namespace {
+std::vector<Device> implied_bias_devices() {
+  std::vector<Device> devices = {Device::cpu};
+  if (is_available(Device::gpu)) {
     devices.push_back(Device::gpu);
   }
+  return devices;
+}
+array implied_bias_reference(const array& scales, const array& f) {
+  auto b =
+      multiply(scales, astype(f, scales.dtype(), Device::cpu), Device::cpu);
+  eval(b);
+  return b;
+}
+bool same_array(const array& a, const array& b) {
+  return a.dtype() == b.dtype() && a.shape() == b.shape() &&
+      array_equal(a, b, Device::cpu).item<bool>();
+}
+} // namespace
+
+TEST_CASE("test implied-bias affine quantized_matmul and dequantize") {
+  const auto cpu = Device::cpu;
+  const auto devices = implied_bias_devices();
 
   struct Case {
     int bits;
@@ -3531,9 +3546,7 @@ TEST_CASE("test implied-bias affine quantized_matmul and dequantize") {
               dtype,
               cpu);
           auto factor = array(c.factor, dtype);
-          // The contract's reference: `scales * T(f)` in the scales dtype.
-          auto rebuilt = multiply(scales, factor, cpu);
-          eval(rebuilt);
+          auto rebuilt = implied_bias_reference(scales, factor);
 
           // dequantize
           auto d_full = dequantize(
@@ -3556,8 +3569,7 @@ TEST_CASE("test implied-bias affine quantized_matmul and dequantize") {
               std::nullopt,
               std::nullopt,
               dev);
-          CHECK_EQ(d_ib.dtype(), d_full.dtype());
-          CHECK(array_equal(d_full, d_ib, cpu).item<bool>());
+          CHECK(same_array(d_ib, d_full));
 
           for (int M : {1, 2, 3, 5, 8, 33, 128}) {
             auto x = astype(
@@ -3584,9 +3596,7 @@ TEST_CASE("test implied-bias affine quantized_matmul and dequantize") {
                 c.bits,
                 "affine",
                 dev);
-            CHECK_EQ(o_ib.dtype(), o_full.dtype());
-            CHECK_EQ(o_ib.shape(), o_full.shape());
-            CHECK(array_equal(o_full, o_ib, cpu).item<bool>());
+            CHECK(same_array(o_ib, o_full));
           }
           // Non-transposed (x @ w): w is (K_in, N_out) packed along N.
           {
@@ -3614,36 +3624,39 @@ TEST_CASE("test implied-bias affine quantized_matmul and dequantize") {
                 c.bits,
                 "affine",
                 dev);
-            CHECK(array_equal(o_full, o_ib, cpu).item<bool>());
+            CHECK(same_array(o_ib, o_full));
           }
         }
       }
     }
   }
 
-  // Unsupported paths throw rather than broadcasting a constant bias.
+  // gather_qmm has no implied-bias kernels: the factor is materialized and
+  // the result equals the per-group-bias call.
+  {
+    auto w = random::bits({2, 8, 512 * 4 / 32}, 4, random::key(seed++), cpu);
+    auto scales = random::uniform(
+        0.5f, 1.5f, {2, 8, 8}, float32, random::key(seed++), cpu);
+    auto x = random::normal({2, 3, 512}, float32, random::key(seed++), cpu);
+    auto factor = array(-8.0f);
+    auto rebuilt = implied_bias_reference(scales, factor);
+    auto lhs = array({0, 1, 1}, int32);
+    auto rhs = array({1, 0, 1}, int32);
+    for (const auto& dev : devices) {
+      auto o_full = gather_qmm(
+          x, w, scales, rebuilt, lhs, rhs, true, 64, 4, "affine", false, dev);
+      auto o_ib = gather_qmm(
+          x, w, scales, factor, lhs, rhs, true, 64, 4, "affine", false, dev);
+      CHECK(same_array(o_ib, o_full));
+    }
+  }
+
+  // A 1-d bias of the wrong shape is rejected.
   {
     auto w = random::bits({8, 512 * 4 / 32}, 4, random::key(seed++), cpu);
     auto scales =
         random::uniform(0.5f, 1.5f, {8, 8}, float32, random::key(seed++), cpu);
     auto x = random::normal({1, 512}, float32, random::key(seed++), cpu);
-    auto factor = array(-8.0f);
-    CHECK_THROWS_AS(
-        gather_qmm(
-            x,
-            w,
-            scales,
-            factor,
-            std::nullopt,
-            array({0}, int32),
-            true,
-            64,
-            4,
-            "affine",
-            false,
-            cpu),
-        std::invalid_argument);
-    // A 1-d bias of the wrong shape is still rejected.
     CHECK_THROWS_AS(
         quantized_matmul(
             x, w, scales, array({-8.0f}), true, 64, 4, "affine", cpu),
@@ -3652,26 +3665,14 @@ TEST_CASE("test implied-bias affine quantized_matmul and dequantize") {
 }
 
 TEST_CASE("test implied-bias factor rounding contract") {
-  // The contract: a 0-d factor f stands for the materialized bias
-  // `scales * T(f)`, formed in the scales' storage dtype T (ops.h). Each block
-  // below is a case where the kernels used to form the bias elsewhere -- in
+  // Each block below is a case where the bias could be formed elsewhere -- in
   // the activations' promoted dtype, in the factor's wider dtype, or through
-  // an `_ib` kernel the non-JIT library does not ship -- and drifted from that
-  // reference (Codex review of numen-tech/gemma4-qat#190).
+  // an `_ib` kernel the non-JIT library does not ship -- and must still match
+  // the `scales * T(f)` reference.
   const auto cpu = Device::cpu;
-  std::vector<Device> devices = {cpu};
-  if (metal::is_available()) {
-    devices.push_back(Device::gpu);
-  }
-  auto reference_bias = [&](const array& scales, const array& f) {
-    auto b = multiply(scales, astype(f, scales.dtype(), cpu), cpu);
-    eval(b);
-    return b;
-  };
-  auto same = [&](const array& a, const array& b) {
-    return a.dtype() == b.dtype() && a.shape() == b.shape() &&
-        array_equal(a, b, cpu).item<bool>();
-  };
+  const auto devices = implied_bias_devices();
+  const auto& reference_bias = implied_bias_reference;
+  const auto& same = same_array;
 
   // fp16 scales of 2^-24 (the smallest fp16 subnormal): -0.5 * 2^-24 is not
   // representable in fp16 and rounds to 0, while a bias formed in fp32 is

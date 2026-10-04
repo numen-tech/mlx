@@ -30,8 +30,8 @@ auto get_quantized_kernel_wrapped(
   std::string template_def;
   // "affine" -> affine_<func>; "affine_sym" (bias-free) -> affine_sym_<func>;
   // other modes use the fp kernels.
-  std::string fname =
-      (mode.rfind("affine", 0) == 0) ? (mode + "_" + func) : ("fp_" + func);
+  std::string fname = (mode.rfind("affine", 0) == 0) ? (mode + "_" + func)
+                                                     : ("fp_" + func);
   template_def = get_template_definition(
       name, fname, type, group_size, bits, std::forward<Args>(args)...);
   return get_quantized_kernel(d, name, template_def, mode);
@@ -54,11 +54,11 @@ auto get_qmm_nax_kernel_wrapped(
   return get_qmm_nax_kernel(d, name, template_def, mode);
 }
 
-// Implied-bias mode: a 0-d `biases` array holds a single factor f and the
-// kernels form the per-group bias as f * scale. The kernels are selected by an
-// "_ib" kernel-name suffix and a trailing `implied_bias = true` template arg.
-inline bool is_implied_bias(const std::optional<array>& biases) {
-  return biases.has_value() && biases->ndim() == 0;
+// Implied-bias kernels (is_implied_bias, mlx/backend/common/quantized.h) are
+// selected by an "_ib" kernel-name suffix and a trailing `implied_bias`
+// template arg.
+inline const char* implied_bias_suffix(bool implied) {
+  return implied ? "_ib" : "";
 }
 
 inline array
@@ -298,8 +298,7 @@ void quantize_impl(
   auto type_string = dequantize ? get_type_string(out.dtype())
                                 : get_type_string(w_pre.dtype());
   auto mode_string = quantization_mode_to_string(mode);
-  // Implied-bias dequantize: a 0-d biases factor, bias = factor * scale.
-  bool implied_bias = dequantize && has_biases && inputs[2].ndim() == 0;
+  bool implied_bias = dequantize && has_biases && is_implied_bias(inputs[2]);
   std::string kname;
   concatenate(
       kname,
@@ -313,9 +312,9 @@ void quantize_impl(
   if (!has_biases) {
     concatenate(kname, "_hgs_", has_global_scale ? "true" : "false");
   }
-  if (implied_bias) {
-    kname += "_ib";
-  }
+  kname += implied_bias_suffix(implied_bias);
+  // affine_quantize has no implied_bias parameter, so only the dequantize
+  // instantiation takes the trailing arg.
   auto kernel = implied_bias ? get_quantized_kernel_wrapped(
                                    d,
                                    kname,
@@ -464,6 +463,7 @@ void qmv_quad(
   kname.reserve(64);
   std::string type_string = get_type_string(x.dtype());
 
+  const bool implied = is_implied_bias(biases);
   concatenate(
       kname,
       mode + "_qmv_quad_",
@@ -475,28 +475,18 @@ void qmv_quad(
       "_d_",
       K,
       B > 1 ? "_batch_1" : "_batch_0",
-      is_implied_bias(biases) ? "_ib" : "");
-  auto kernel = is_implied_bias(biases) ? get_quantized_kernel_wrapped(
-                                              d,
-                                              kname,
-                                              "qmv_quad",
-                                              mode,
-                                              type_string,
-                                              group_size,
-                                              bits,
-                                              K,
-                                              B > 1,
-                                              true)
-                                        : get_quantized_kernel_wrapped(
-                                              d,
-                                              kname,
-                                              "qmv_quad",
-                                              mode,
-                                              type_string,
-                                              group_size,
-                                              bits,
-                                              K,
-                                              B > 1);
+      implied_bias_suffix(implied));
+  auto kernel = get_quantized_kernel_wrapped(
+      d,
+      kname,
+      "qmv_quad",
+      mode,
+      type_string,
+      group_size,
+      bits,
+      K,
+      B > 1,
+      implied);
   auto& compute_encoder = metal::get_command_encoder(s);
   compute_encoder.set_compute_pipeline_state(kernel);
 
@@ -548,6 +538,7 @@ void qmv(
   MTL::Size group_dims(bk, 2, 1);
   MTL::Size grid_dims(M, (N + bn - 1) / bn, B);
 
+  const bool implied = is_implied_bias(biases);
   concatenate(
       kname,
       mode + (fast ? "_qmv_fast_" : "_qmv_"),
@@ -559,30 +550,19 @@ void qmv(
       use_narrow_qmv ? "_r_2" : "",
       B > 1 ? "_batch_1" : "_batch_0",
       global_scale ? "_hgs" : "",
-      is_implied_bias(biases) ? "_ib" : "");
-  auto kernel = is_implied_bias(biases) ? get_quantized_kernel_wrapped(
-                                              d,
-                                              kname,
-                                              (fast ? "qmv_fast" : "qmv"),
-                                              mode,
-                                              type_string,
-                                              group_size,
-                                              bits,
-                                              B > 1,
-                                              global_scale.has_value(),
-                                              results_per_simdgroup,
-                                              true)
-                                        : get_quantized_kernel_wrapped(
-                                              d,
-                                              kname,
-                                              (fast ? "qmv_fast" : "qmv"),
-                                              mode,
-                                              type_string,
-                                              group_size,
-                                              bits,
-                                              B > 1,
-                                              global_scale.has_value(),
-                                              results_per_simdgroup);
+      implied_bias_suffix(implied));
+  auto kernel = get_quantized_kernel_wrapped(
+      d,
+      kname,
+      (fast ? "qmv_fast" : "qmv"),
+      mode,
+      type_string,
+      group_size,
+      bits,
+      B > 1,
+      global_scale.has_value(),
+      results_per_simdgroup,
+      implied);
 
   auto& compute_encoder = metal::get_command_encoder(s);
   compute_encoder.set_compute_pipeline_state(kernel);
@@ -664,6 +644,7 @@ void qmv_wide(
   std::string kname;
   kname.reserve(64);
   std::string type_string = get_type_string(x.dtype());
+  const bool implied = is_implied_bias(biases);
   concatenate(
       kname,
       mode + "_qmv_wide_",
@@ -677,30 +658,19 @@ void qmv_wide(
       "_kl_",
       k_lanes,
       batched ? "_batch_1" : "_batch_0",
-      is_implied_bias(biases) ? "_ib" : "");
-  auto kernel = is_implied_bias(biases) ? get_quantized_kernel_wrapped(
-                                              d,
-                                              kname,
-                                              "qmv_wide",
-                                              mode,
-                                              type_string,
-                                              group_size,
-                                              bits,
-                                              vecs_per_tg,
-                                              k_lanes,
-                                              batched,
-                                              true)
-                                        : get_quantized_kernel_wrapped(
-                                              d,
-                                              kname,
-                                              "qmv_wide",
-                                              mode,
-                                              type_string,
-                                              group_size,
-                                              bits,
-                                              vecs_per_tg,
-                                              k_lanes,
-                                              batched);
+      implied_bias_suffix(implied));
+  auto kernel = get_quantized_kernel_wrapped(
+      d,
+      kname,
+      "qmv_wide",
+      mode,
+      type_string,
+      group_size,
+      bits,
+      vecs_per_tg,
+      k_lanes,
+      batched,
+      implied);
 
   auto& compute_encoder = metal::get_command_encoder(s);
   compute_encoder.set_compute_pipeline_state(kernel);
@@ -789,6 +759,7 @@ void qvm_split_k(
   std::string type_string = get_type_string(x.dtype());
   std::string kname;
   kname.reserve(64);
+  const bool implied = is_implied_bias(biases);
   concatenate(
       kname,
       mode + "_qvm_split_k_",
@@ -799,28 +770,19 @@ void qvm_split_k(
       bits,
       "_spk_",
       split_k,
-      is_implied_bias(biases) ? "_ib" : "");
+      implied_bias_suffix(implied));
 
   // Encode and dispatch kernel
-  auto kernel = is_implied_bias(biases) ? get_quantized_kernel_wrapped(
-                                              d,
-                                              kname,
-                                              "qvm_split_k",
-                                              mode,
-                                              type_string,
-                                              group_size,
-                                              bits,
-                                              split_k,
-                                              true)
-                                        : get_quantized_kernel_wrapped(
-                                              d,
-                                              kname,
-                                              "qvm_split_k",
-                                              mode,
-                                              type_string,
-                                              group_size,
-                                              bits,
-                                              split_k);
+  auto kernel = get_quantized_kernel_wrapped(
+      d,
+      kname,
+      "qvm_split_k",
+      mode,
+      type_string,
+      group_size,
+      bits,
+      split_k,
+      implied);
 
   compute_encoder.set_compute_pipeline_state(kernel);
 
@@ -893,6 +855,7 @@ void qvm(
   std::string kname;
   kname.reserve(64);
   std::string type_string = get_type_string(x.dtype());
+  const bool implied = is_implied_bias(biases);
   concatenate(
       kname,
       mode + "_qvm_",
@@ -903,28 +866,18 @@ void qvm(
       bits,
       B > 1 ? "_batch_1" : "_batch_0",
       global_scale ? "_hgs" : "",
-      is_implied_bias(biases) ? "_ib" : "");
-  auto kernel = is_implied_bias(biases) ? get_quantized_kernel_wrapped(
-                                              d,
-                                              kname,
-                                              "qvm",
-                                              mode,
-                                              type_string,
-                                              group_size,
-                                              bits,
-                                              B > 1,
-                                              global_scale.has_value(),
-                                              true)
-                                        : get_quantized_kernel_wrapped(
-                                              d,
-                                              kname,
-                                              "qvm",
-                                              mode,
-                                              type_string,
-                                              group_size,
-                                              bits,
-                                              B > 1,
-                                              global_scale.has_value());
+      implied_bias_suffix(implied));
+  auto kernel = get_quantized_kernel_wrapped(
+      d,
+      kname,
+      "qvm",
+      mode,
+      type_string,
+      group_size,
+      bits,
+      B > 1,
+      global_scale.has_value(),
+      implied);
   auto& compute_encoder = metal::get_command_encoder(s);
   compute_encoder.set_compute_pipeline_state(kernel);
 
@@ -976,6 +929,7 @@ void qmm_nax(
   bool aligned = N % 64 == 0;
   bool batched = B > 1;
   std::string type_string = get_type_string(x.dtype());
+  const bool implied = is_implied_bias(biases);
   concatenate(
       kname,
       mode + (transpose ? "_qmm_t_nax_" : "_qmm_n_nax_"),
@@ -996,72 +950,42 @@ void qmm_nax(
       wn,
       transpose ? (aligned ? "_alN_true" : "_alN_false") : "",
       batched ? "_batch_1" : "_batch_0",
-      is_implied_bias(biases) ? "_ib" : "");
+      implied_bias_suffix(implied));
   std::string template_def;
   MTL::ComputePipelineState* kernel;
-  const bool implied_bias = is_implied_bias(biases);
   if (transpose) {
-    kernel = implied_bias ? get_qmm_nax_kernel_wrapped(
-                                d,
-                                kname,
-                                "qmm_t_nax",
-                                mode,
-                                type_string,
-                                group_size,
-                                bits,
-                                aligned,
-                                batched,
-                                bm,
-                                bk,
-                                bn,
-                                wm,
-                                wn,
-                                true)
-                          : get_qmm_nax_kernel_wrapped(
-                                d,
-                                kname,
-                                "qmm_t_nax",
-                                mode,
-                                type_string,
-                                group_size,
-                                bits,
-                                aligned,
-                                batched,
-                                bm,
-                                bk,
-                                bn,
-                                wm,
-                                wn);
+    kernel = get_qmm_nax_kernel_wrapped(
+        d,
+        kname,
+        "qmm_t_nax",
+        mode,
+        type_string,
+        group_size,
+        bits,
+        aligned,
+        batched,
+        bm,
+        bk,
+        bn,
+        wm,
+        wn,
+        implied);
   } else {
-    kernel = implied_bias ? get_qmm_nax_kernel_wrapped(
-                                d,
-                                kname,
-                                "qmm_n_nax",
-                                mode,
-                                type_string,
-                                group_size,
-                                bits,
-                                batched,
-                                bm,
-                                bk,
-                                bn,
-                                wm,
-                                wn,
-                                true)
-                          : get_qmm_nax_kernel_wrapped(
-                                d,
-                                kname,
-                                "qmm_n_nax",
-                                mode,
-                                type_string,
-                                group_size,
-                                bits,
-                                batched,
-                                bm,
-                                bk,
-                                bn,
-                                wm,
-                                wn);
+    kernel = get_qmm_nax_kernel_wrapped(
+        d,
+        kname,
+        "qmm_n_nax",
+        mode,
+        type_string,
+        group_size,
+        bits,
+        batched,
+        bm,
+        bk,
+        bn,
+        wm,
+        wn,
+        implied);
   }
   auto& compute_encoder = metal::get_command_encoder(s);
   compute_encoder.set_compute_pipeline_state(kernel);
@@ -1238,6 +1162,7 @@ void qmm(
   bool aligned = N % 32 == 0;
   bool batched = B > 1;
   std::string type_string = get_type_string(x.dtype());
+  const bool implied = is_implied_bias(biases);
   concatenate(
       kname,
       mode + (transpose ? "_qmm_t_" : "_qmm_n_"),
@@ -1248,55 +1173,40 @@ void qmm(
       bits,
       transpose ? (aligned ? "_alN_true" : "_alN_false") : "",
       batched ? "_batch_1" : "_batch_0",
-      is_implied_bias(biases) ? "_ib" : "");
+      implied_bias_suffix(implied));
   std::string template_def;
   MTL::ComputePipelineState* kernel;
-  const bool implied_bias = is_implied_bias(biases);
-  // The implied-bias variants spell out the default tile sizes (BM/BK/BN =
-  // 32) so the trailing `implied_bias` template argument lands in its slot.
+  // BM/BK/BN = 32 are the kernel defaults, spelled out for the trailing arg.
   if (transpose) {
-    kernel = implied_bias ? get_quantized_kernel_wrapped(
-                                d,
-                                kname,
-                                "qmm_t",
-                                mode,
-                                type_string,
-                                group_size,
-                                bits,
-                                aligned,
-                                batched,
-                                bm,
-                                32,
-                                bn,
-                                true)
-                          : get_quantized_kernel_wrapped(
-                                d,
-                                kname,
-                                "qmm_t",
-                                mode,
-                                type_string,
-                                group_size,
-                                bits,
-                                aligned,
-                                batched);
+    kernel = get_quantized_kernel_wrapped(
+        d,
+        kname,
+        "qmm_t",
+        mode,
+        type_string,
+        group_size,
+        bits,
+        aligned,
+        batched,
+        bm,
+        32,
+        bn,
+        implied);
   } else {
-    kernel = implied_bias
-        ? get_quantized_kernel_wrapped(
-              d,
-              kname,
-              "qmm_n",
-              mode,
-              type_string,
-              group_size,
-              bits,
-              batched,
-              /* has_global_scale = */ false,
-              bm,
-              32,
-              bn,
-              true)
-        : get_quantized_kernel_wrapped(
-              d, kname, "qmm_n", mode, type_string, group_size, bits, batched);
+    kernel = get_quantized_kernel_wrapped(
+        d,
+        kname,
+        "qmm_n",
+        mode,
+        type_string,
+        group_size,
+        bits,
+        batched,
+        /* has_global_scale = */ false,
+        bm,
+        32,
+        bn,
+        implied);
   }
   auto& compute_encoder = metal::get_command_encoder(s);
   compute_encoder.set_compute_pipeline_state(kernel);
@@ -1377,6 +1287,7 @@ void qmm_splitk(
   std::string type_string = get_type_string(x.dtype());
   std::string kname;
   kname.reserve(64);
+  const bool implied = is_implied_bias(biases);
   concatenate(
       kname,
       mode + "_qmm_t_splitk_",
@@ -1386,30 +1297,21 @@ void qmm_splitk(
       "_b_",
       bits,
       aligned ? "_alN_true" : "_alN_false",
-      is_implied_bias(biases) ? "_ib" : "");
+      implied_bias_suffix(implied));
   // BM/BK/BN = 32 are the kernel defaults, spelled out for the trailing arg.
-  auto kernel = is_implied_bias(biases) ? get_quantized_kernel_wrapped(
-                                              d,
-                                              kname,
-                                              "qmm_t_splitk",
-                                              mode,
-                                              type_string,
-                                              group_size,
-                                              bits,
-                                              aligned,
-                                              bm,
-                                              32,
-                                              bn,
-                                              true)
-                                        : get_quantized_kernel_wrapped(
-                                              d,
-                                              kname,
-                                              "qmm_t_splitk",
-                                              mode,
-                                              type_string,
-                                              group_size,
-                                              bits,
-                                              aligned);
+  auto kernel = get_quantized_kernel_wrapped(
+      d,
+      kname,
+      "qmm_t_splitk",
+      mode,
+      type_string,
+      group_size,
+      bits,
+      aligned,
+      bm,
+      32,
+      bn,
+      implied);
 
   compute_encoder.set_compute_pipeline_state(kernel);
 

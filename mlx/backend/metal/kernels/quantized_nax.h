@@ -714,9 +714,7 @@ struct QuantizedBlockLoader {
   const device uint8_t* src;
   const device T* scales;
   const device T* biases;
-  // Implied bias: biases_ is a single factor f and the per-group bias is
-  // f * scale (what the loader used to rebuild into a full array).
-  const T bias_factor;
+  const T bias_factor; // implied bias: the single factor f, bias = f * scale
 
   QuantizedBlockLoader(
       const device uint8_t* src_,
@@ -870,9 +868,7 @@ struct QuantizedBlockLoader<
   const device uint8_t* src;
   const device T* scales;
   const device T* biases;
-  // Implied bias: biases_ is a single factor f and the per-group bias is
-  // f * scale (what the loader used to rebuild into a full array).
-  const T bias_factor;
+  const T bias_factor; // implied bias: the single factor f, bias = f * scale
 
   QuantizedBlockLoader(
       const device uint8_t* src_,
