@@ -3596,9 +3596,13 @@ std::vector<array> QuantizedMatmul::vjp(
         vjps.push_back(sum(*dsb, -1, false, stream()));
       } else {
         // scales: d(w_hat)/d(scale) is q, or q + c for a derived/implied bias
+        // The factor is a constant, so keep it out of higher-order grads.
         array bias_c = sym ? array(sym_c, primals[2].dtype())
-            : implied      ? astype(primals[3], primals[2].dtype(), stream())
-                           : array(0.0f, primals[2].dtype());
+            : implied      ? astype(
+                            stop_gradient(primals[3], stream()),
+                            primals[2].dtype(),
+                            stream())
+                      : array(0.0f, primals[2].dtype());
         auto wq = dequantize(
             primals[1],
             ones_like(primals[2], stream()),

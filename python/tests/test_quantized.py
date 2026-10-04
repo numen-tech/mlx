@@ -1352,6 +1352,41 @@ class TestQuantized(mlx_tests.MLXTestCase):
                 (out,), (tf,) = mx.jvp(op, [f], [mx.array(1.0)])
                 self.assert_bitwise_equal(tf, mx.zeros_like(out))
 
+    def test_implied_bias_factor_mixed_grad(self):
+        # The scales and x gradients must not depend on the factor either, on
+        # the kernel paths (4-bit) and on the materialized path (3-bit).
+        key = mx.random.key(9)
+        k1, k2 = mx.random.split(key)
+        configs = [
+            (mx.float32, mx.float32, 4),
+            (mx.float16, mx.float16, 4),
+            (mx.float32, mx.float32, 3),
+        ]
+        for dev, (x_dtype, s_dtype, bits) in product(
+            self.implied_bias_devices(), configs
+        ):
+            factor = -float(2 ** (bits - 1))
+            w = mx.random.normal(shape=(64, 512), key=k2).astype(s_dtype)
+            w_q, scales, _ = mx.quantize(w, 64, bits, stream=dev)
+            x = mx.random.normal(shape=(1, 512), key=k1).astype(x_dtype)
+
+            def loss(x, scales, f):
+                out = mx.quantized_matmul(x, w_q, scales, f, True, 64, bits, stream=dev)
+                return out.astype(mx.float32).sum()
+
+            def dscales_sum(f):
+                return mx.grad(loss, argnums=1)(x, scales, f).astype(mx.float32).sum()
+
+            def dx_sum(f):
+                return mx.grad(loss, argnums=0)(x, scales, f).astype(mx.float32).sum()
+
+            f = mx.array(factor)
+            for name, fn in [("scales", dscales_sum), ("x", dx_sum)]:
+                with self.subTest(
+                    dev=dev, x_dtype=x_dtype, s_dtype=s_dtype, bits=bits, grad=name
+                ):
+                    self.assertEqual(mx.grad(fn)(f).item(), 0.0)
+
     def test_implied_bias_dtype_promotion(self):
         # fp32 activations over fp16 scales promote the kernel's scales to fp32.
         # The bias must still be the fp16 reference `scales * T(f)`: with the
