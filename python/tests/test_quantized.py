@@ -1010,6 +1010,77 @@ class TestQuantized(mlx_tests.MLXTestCase):
                 _, jvp_biased = mx.jvp(lambda x: f_biased(x, scales), [x], [x])
                 self.assertLess((jvp_sym[0] - jvp_biased[0]).abs().max().item(), 1e-3)
 
+    @unittest.skipUnless(mx.metal.is_available(), "qmv_fast is a Metal kernel")
+    def test_qmv_fast_half_block(self):
+        # Affine 4-bit K % 256 == 0 and 1-bit K % 512 == 0 take qmv_fast with a
+        # partial last block. One extra row (N % 8 != 0) gives the generic qmv.
+        key = mx.random.key(5)
+        k1, k2 = mx.random.split(key)
+        f32 = mx.float32
+        cases = [(4, 256), (4, 768), (4, 3840), (1, 512), (1, 1536), (1, 2560)]
+        dtypes = [f32, mx.float16, mx.bfloat16]
+        for (bits, K), gs, dtype in product(cases, [32, 64, 128], dtypes):
+            for sym, B in product([False, True] if bits == 1 else [False], [0, 2]):
+                with self.subTest(bits=bits, K=K, gs=gs, dtype=dtype, sym=sym, B=B):
+                    N = 64
+                    lead = (B,) if B else ()
+                    w = mx.random.normal(lead + (N + 1, K), key=k2).astype(dtype)
+                    w_q, scales, biases = mx.quantize(w, gs, bits)
+                    ref_b = -0.5 * scales if sym else biases
+                    if sym:
+                        biases = None
+                    x = mx.random.normal(lead + (1, K), key=k1).astype(dtype)
+                    w_hat = mx.dequantize(
+                        w_q, scales.astype(f32), ref_b.astype(f32), gs, bits
+                    )
+                    ref = x.astype(f32) @ mx.swapaxes(w_hat, -1, -2)
+                    ref = ref[..., :N]
+
+                    def qmm(rows):
+                        b = None if biases is None else biases[..., :rows, :]
+                        y = mx.quantized_matmul(
+                            x,
+                            w_q[..., :rows, :],
+                            scales[..., :rows, :],
+                            b,
+                            True,
+                            gs,
+                            bits,
+                        )
+                        return y[..., :N].astype(f32)
+
+                    fast, generic = qmm(N), qmm(N + 1)
+                    err_fast = (fast - ref).abs().max().item()
+                    err_generic = (generic - ref).abs().max().item()
+                    # One ulp of the output dtype covers the rounding of the
+                    # different accumulation order.
+                    ulp = mx.finfo(dtype).eps * ref.abs().max().item()
+                    self.assertLessEqual(err_fast, err_generic + ulp)
+
+        # gather_qmv shares the kernel.
+        for dtype in dtypes:
+            with self.subTest(gather=True, dtype=dtype):
+                w = mx.random.normal((3, 64, 3840), key=k2).astype(dtype)
+                w_q, scales, biases = mx.quantize(w, 32, 4)
+                x = mx.random.normal((2, 1, 3840), key=k1).astype(dtype)
+                idx = mx.array([2, 0])
+                y = mx.gather_qmm(
+                    x,
+                    w_q,
+                    scales,
+                    biases,
+                    rhs_indices=idx,
+                    transpose=True,
+                    group_size=32,
+                    bits=4,
+                )
+                w_hat = mx.dequantize(
+                    w_q, scales.astype(f32), biases.astype(f32), 32, 4
+                )
+                ref = x.astype(f32) @ mx.swapaxes(w_hat[idx], -1, -2)
+                tol = 2 * mx.finfo(dtype).eps * ref.abs().max().item() + 1e-4
+                self.assertLessEqual((y.astype(f32) - ref).abs().max().item(), tol)
+
     # Implied bias: a 0-d `biases` array is a factor f and the kernels form
     # bias = f * scale per group. The factors of the shipped checkpoints are
     # powers of two, so f * scale is exact in every dtype and the implied path
@@ -1060,9 +1131,9 @@ class TestQuantized(mlx_tests.MLXTestCase):
                 self.IMPLIED_BIAS_DTYPES, self.IMPLIED_BIAS_CASES
             ):
                 # K = 64 / 128 route to qmv_quad; 512 / 1536 to qmv_fast (and
-                # qmv_wide for 2 <= M <= 8 at bits > 1); N = 72 is not a
-                # multiple of the 32-wide qmm tile.
-                for K, N in product([64, 128, 512, 1536], [256, 72]):
+                # qmv_wide for 2 <= M <= 8 at bits > 1); K = 768 runs the 4-bit
+                # qmv_fast tail; N = 72 is not a multiple of the 32-wide qmm tile.
+                for K, N in product([64, 128, 512, 768, 1536], [256, 72]):
                     if K < gs:
                         continue
                     w = mx.random.normal(shape=(N, K), key=k2).astype(dtype)

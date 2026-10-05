@@ -152,11 +152,15 @@ inline int get_qmv_batch_limit(int D, int O, metal::Device& d) {
   }
 }
 
-// Must match the K step in qmv_fast_impl (kernels/quantized.h):
-// pack_factor * packs_per_thread * SIMD_SIZE, with one pack per lane for
-// bits <= 2.
-inline int qmv_fast_k_alignment(int bits) {
-  return get_pack_factor(bits, 32) * (bits <= 2 ? 1 : 2) * 32;
+// Block of qmv_fast_impl: pack_factor * packs_per_thread * SIMD_SIZE (must
+// match the kernel). The affine kernel's partial last block only needs
+// K % values_per_thread == 0, which K % group_size already implies; block / 2
+// is the cutoff measured for 1/4-bit, and the other widths stay whole-block
+// until benchmarked. fp_qmv_fast_impl has no tail.
+inline int qmv_fast_k_alignment(int bits, const std::string& mode) {
+  int block = get_pack_factor(bits, 32) * (bits <= 2 ? 1 : 2) * 32;
+  bool affine = mode == "affine" || mode == "affine_sym";
+  return (affine && (bits == 1 || bits == 4)) ? block / 2 : block;
 }
 
 inline int add_strides_and_shapes(
@@ -533,7 +537,7 @@ void qmv(
   std::string kname;
   kname.reserve(64);
   std::string type_string = get_type_string(x.dtype());
-  bool fast = N % bn == 0 && K % qmv_fast_k_alignment(bits) == 0;
+  bool fast = N % bn == 0 && K % qmv_fast_k_alignment(bits, mode) == 0;
   // A narrower output tile reduces register pressure for large
   // floating-point quantized matrix-vector products on M5 Max GPUs.
   bool use_narrow_qmv = fast && N >= 4096 && d.get_architecture_gen() == 17 &&
@@ -1551,7 +1555,7 @@ void gather_qmv(
   std::string kname;
   kname.reserve(64);
   std::string type_string = get_type_string(x.dtype());
-  bool fast = N % bn == 0 && K % qmv_fast_k_alignment(bits) == 0;
+  bool fast = N % bn == 0 && K % qmv_fast_k_alignment(bits, mode) == 0;
   concatenate(
       kname,
       mode + (fast ? "_gather_qmv_fast_" : "_gather_qmv_"),
