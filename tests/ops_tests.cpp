@@ -3752,6 +3752,112 @@ TEST_CASE("test implied-bias affine quantized_matmul and dequantize") {
   }
 }
 
+// One call over M rows must match the split calls bit for bit and stay close
+// to an fp32 reference.
+TEST_CASE("test affine qmv_wide single tile of 6 and 7 vectors") {
+  if (!metal::is_available()) {
+    return;
+  }
+  const auto gpu = Device::gpu;
+  const auto cpu = Device::cpu;
+
+  struct Case {
+    int bits;
+    int group_size;
+    std::optional<float> factor; // implied bias when set
+  };
+  const Case cases[] = {
+      {2, 64, std::nullopt},
+      {3, 64, std::nullopt},
+      {4, 64, std::nullopt},
+      {6, 32, std::nullopt},
+      {8, 64, std::nullopt},
+      {2, 64, -2.0f},
+      {4, 64, -8.0f},
+      {8, 64, -128.0f},
+  };
+  struct Split {
+    int M;
+    std::vector<int> chunks;
+  };
+  const Split splits[] = {{6, {3, 3}}, {7, {4, 3}}, {8, {4, 4}}};
+
+  int seed = 0;
+  for (auto dtype : {float16, bfloat16, float32}) {
+    for (const auto& c : cases) {
+      for (int K : {512, 1536}) {
+        const int N = 72;
+        auto w =
+            random::bits({N, K * c.bits / 32}, 4, random::key(seed++), cpu);
+        auto per_group = [&](float lo, float hi) {
+          return astype(
+              random::uniform(
+                  lo,
+                  hi,
+                  {N, K / c.group_size},
+                  float32,
+                  random::key(seed++),
+                  cpu),
+              dtype,
+              cpu);
+        };
+        auto scales = per_group(0.01f, 0.1f);
+        auto biases =
+            c.factor ? array(*c.factor, dtype) : per_group(-0.5f, 0.5f);
+        auto ref_biases =
+            c.factor ? implied_bias_reference(scales, biases) : biases;
+        auto w_hat = dequantize(
+            w,
+            astype(scales, float32, cpu),
+            astype(ref_biases, float32, cpu),
+            c.group_size,
+            c.bits,
+            "affine",
+            std::nullopt,
+            std::nullopt,
+            cpu);
+        auto qmm = [&](const array& x) {
+          return quantized_matmul(
+              x, w, scales, biases, true, c.group_size, c.bits, "affine", gpu);
+        };
+
+        for (const auto& sp : splits) {
+          auto x = astype(
+              random::normal({sp.M, K}, float32, random::key(seed++), cpu),
+              dtype,
+              cpu);
+          std::vector<array> parts;
+          int r = 0;
+          for (int n : sp.chunks) {
+            parts.push_back(qmm(slice(x, {r, 0}, {r + n, K}, cpu)));
+            r += n;
+          }
+          auto tiled = qmm(x);
+          auto split = concatenate(parts, 0, cpu);
+          INFO(
+              "bits=" << c.bits << " group_size=" << c.group_size
+                      << " implied=" << c.factor.has_value() << " K=" << K
+                      << " M=" << sp.M << " dtype=" << dtype);
+          CHECK_EQ(tiled.shape(), Shape{sp.M, N});
+          CHECK(same_array(tiled, split));
+
+          auto expected =
+              matmul(astype(x, float32, cpu), transpose(w_hat, cpu), cpu);
+          float rtol =
+              dtype == float32 ? 1e-4f : (dtype == float16 ? 4e-3f : 2e-2f);
+          float scale = max(abs(expected, cpu), cpu).item<float>();
+          float max_diff =
+              max(abs(subtract(astype(tiled, float32, cpu), expected, cpu),
+                      cpu),
+                  cpu)
+                  .item<float>();
+          CHECK(max_diff <= 1e-3f + rtol * scale);
+        }
+      }
+    }
+  }
+}
+
 TEST_CASE("test implied-bias factor rounding contract") {
   // Each block below is a case where the bias could be formed elsewhere -- in
   // the activations' promoted dtype, in the factor's wider dtype, or through

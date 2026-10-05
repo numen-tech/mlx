@@ -643,6 +643,11 @@ void qmv_wide(
   // them.
   int n_tiles = (M + 4) / 5; // ceil(M / 5); tile size caps at 5
   int vecs_per_tg = (M + n_tiles - 1) / n_tiles;
+  // affine runs M <= 7 as one tile. The result does not depend on the tile.
+  constexpr int max_affine_single_tile = 7;
+  if (mode == "affine" && M <= max_affine_single_tile) {
+    vecs_per_tg = M;
+  }
 
   // k_lanes: lanes reducing K per output row (32/k_lanes rows per simdgroup).
   // The affine subchunk decode has enough ALU per weight load to favor more
