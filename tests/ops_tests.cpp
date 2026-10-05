@@ -3752,11 +3752,8 @@ TEST_CASE("test implied-bias affine quantized_matmul and dequantize") {
   }
 }
 
-// affine qmv_wide runs M = 6..7 as one tile; M = 8 keeps main's 4 + 4. A
-// vector's accumulation does not depend on the tile, so each call must match,
-// bit for bit, the same rows run in chunks of at most 5 (one tile each), and
-// stay close to an fp32 dequantize-then-matmul reference. The tiling itself is
-// not observable from here. Explicit biases and the 0-d implied-bias factor.
+// One call over M rows must match the split calls bit for bit and stay close
+// to an fp32 reference.
 TEST_CASE("test affine qmv_wide single tile of 6 and 7 vectors") {
   if (!metal::is_available()) {
     return;

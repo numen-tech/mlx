@@ -885,13 +885,7 @@ class TestQuantized(mlx_tests.MLXTestCase):
 
     @unittest.skipUnless(mx.metal.is_available(), "qmv_wide is a Metal kernel")
     def test_qmv_wide_tile_matches_split(self):
-        # affine qmv_wide runs M = 6..7 as one tile; every other M keeps the
-        # cap of 5 (8 is 4 + 4, 11 is 4 + 4 + 3, 12 is 4 + 4 + 4). A vector's
-        # accumulation does not depend on the tile, so one call over M rows
-        # must match, bit for bit, the same rows run in chunks of at most 5
-        # (one tile each); the tiling itself is not observable from here. All
-        # M are below every GPU's qmv batch limit for K, N <= 2048. Explicit
-        # biases and the 0-d implied-bias factor.
+        # One call over M rows must match the split calls bit for bit.
         key = mx.random.key(6)
         k1, k2 = mx.random.split(key)
         cases = [(bits, gs, None) for bits in [2, 3, 4, 5, 6, 8] for gs in [32, 64]]
