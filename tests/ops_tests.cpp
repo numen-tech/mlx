@@ -3394,6 +3394,94 @@ TEST_CASE("test quantize dequantize") {
   }
 }
 
+// Affine 4-bit K % 256 == 0 and 1-bit K % 512 == 0 take qmv_fast with a
+// partial last block. N = 8 puts the last rows at the end of the weight buffer.
+TEST_CASE("test affine qmv_fast tail block") {
+  if (!metal::is_available()) {
+    return;
+  }
+  const auto gpu = Device::gpu;
+  const auto cpu = Device::cpu;
+
+  struct Case {
+    int bits;
+    int K;
+    int N;
+    int group_size;
+  };
+  const Case cases[] = {
+      {4, 256, 8, 32}, // tail block only
+      {4, 768, 8, 64}, // one 512 block + tail
+      {4, 3840, 8, 32}, // Gemma 4 12B hidden size
+      {4, 3840, 64, 128}, // several row groups
+      {4, 11008, 8, 128},
+      {1, 1536, 8, 64}, // 1-bit, one 1024 block + tail
+      {4, 4096, 8, 32}, // no tail
+  };
+
+  int seed = 0;
+  for (auto dtype : {float16, bfloat16, float32}) {
+    for (const auto& c : cases) {
+      auto w =
+          random::bits({c.N, c.K * c.bits / 32}, 4, random::key(seed++), cpu);
+      auto scales = astype(
+          random::uniform(
+              0.01f,
+              0.1f,
+              {c.N, c.K / c.group_size},
+              float32,
+              random::key(seed++),
+              cpu),
+          dtype,
+          cpu);
+      auto biases = astype(
+          random::uniform(
+              -0.5f,
+              0.5f,
+              {c.N, c.K / c.group_size},
+              float32,
+              random::key(seed++),
+              cpu),
+          dtype,
+          cpu);
+      auto x = astype(
+          random::normal({1, c.K}, float32, random::key(seed++), cpu),
+          dtype,
+          cpu);
+
+      auto w_hat = dequantize(
+          w,
+          astype(scales, float32, cpu),
+          astype(biases, float32, cpu),
+          c.group_size,
+          c.bits,
+          "affine",
+          std::nullopt,
+          std::nullopt,
+          cpu);
+      auto expected =
+          matmul(astype(x, float32, cpu), transpose(w_hat, cpu), cpu);
+
+      auto out = quantized_matmul(
+          x, w, scales, biases, true, c.group_size, c.bits, "affine", gpu);
+      CHECK_EQ(out.dtype(), dtype);
+      CHECK_EQ(out.shape(), Shape{1, c.N});
+
+      float rtol =
+          dtype == float32 ? 1e-4f : (dtype == float16 ? 4e-3f : 2e-2f);
+      float scale = max(abs(expected, cpu), cpu).item<float>();
+      float max_diff =
+          max(abs(subtract(astype(out, float32, cpu), expected, cpu), cpu), cpu)
+              .item<float>();
+      INFO(
+          "bits=" << c.bits << " K=" << c.K << " N=" << c.N
+                  << " group_size=" << c.group_size << " dtype=" << dtype
+                  << " max_diff=" << max_diff << " max|expected|=" << scale);
+      CHECK(max_diff <= 1e-3f + rtol * scale);
+    }
+  }
+}
+
 // Bias-free affine decode on Metal: the affine_sym_qmv[_fast] kernels load in
 // both the metallib and JIT builds and match the derived-bias reference.
 TEST_CASE("test bias-free affine quantized_matmul decode") {
@@ -3410,14 +3498,14 @@ TEST_CASE("test bias-free affine quantized_matmul decode") {
     int group_size;
   };
   const Case cases[] = {
-      {1, 512, 8, 128}, // 1-bit, K % 1024 != 0: generic affine_sym_qmv
-      {1, 1536, 8, 128}, // ditto (one full 1024 block + 512)
+      {1, 512, 8, 128}, // 1-bit fast path, tail block only
+      {1, 1536, 8, 128}, // 1-bit fast path, one 1024 block + tail
       {1, 1024, 8, 128}, // 1-bit fast path (K % 1024 == 0), no tail
       {2, 512, 8, 128}, // 2-bit fast path (K % 512 == 0)
-      {1, 1536, 64, 128}, // generic, several row groups
-      {1, 512, 8, 64}, // generic, group 64
+      {1, 1536, 64, 128}, // fast path + tail, several row groups
+      {1, 512, 8, 64}, // fast path + tail, group 64
       {2, 1536, 64, 64}, // 2-bit fast path, group 64, several row groups
-      {1, 544, 8, 32}, // K % 512 != 0 on either line: generic affine_sym_qmv
+      {1, 544, 8, 32}, // K % 512 != 0: generic affine_sym_qmv
       {2, 544, 8, 32}, // ditto, 2-bit
   };
 
