@@ -233,16 +233,19 @@ inline U qdot(
   U accum = 0;
 
   if (bits == 1) {
-    for (int i = 0; i < (values_per_thread / 8); i++) {
-      uint8_t wb = w[i];
-      accum += select(U(0), x_thread[8 * i], bool(wb & 0x01));
-      accum += select(U(0), x_thread[8 * i + 1], bool(wb & 0x02));
-      accum += select(U(0), x_thread[8 * i + 2], bool(wb & 0x04));
-      accum += select(U(0), x_thread[8 * i + 3], bool(wb & 0x08));
-      accum += select(U(0), x_thread[8 * i + 4], bool(wb & 0x10));
-      accum += select(U(0), x_thread[8 * i + 5], bool(wb & 0x20));
-      accum += select(U(0), x_thread[8 * i + 6], bool(wb & 0x40));
-      accum += select(U(0), x_thread[8 * i + 7], bool(wb & 0x80));
+    // 1-bit: read 32 packed weights as one 32-bit word (one load instead of
+    // four byte loads). Little-endian bit order and accumulation order are
+    // those of the per-byte path, so the result is bit-exact with it. Needs
+    // values_per_thread % 32 == 0 and a 4-byte aligned w, which every 1-bit
+    // caller (qmv_fast, qmv, qmv_quad with D == 128) provides.
+    // (numen-tech/gemma4-qat#179: large mobile decode win)
+    const device uint32_t* w32 = (const device uint32_t*)w;
+    for (int i = 0; i < (values_per_thread / 32); i++) {
+      uint32_t wb = w32[i];
+      const thread U* xt = x_thread + 32 * i;
+      for (int b = 0; b < 32; b++) {
+        accum += select(U(0), xt[b], bool((wb >> b) & 1u));
+      }
     }
   }
 
@@ -859,8 +862,9 @@ METAL_FUNC void qmv_fast_impl(
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
-  constexpr int packs_per_thread =
-      bits <= 2 ? 1 : 2; // 1-bit: 1 pack (vpt=32) for occupancy
+  // numen-tech/mlx#3: 1-bit uses 1 pack/thread (vpt=32) for occupancy
+  // (~+11% decode).
+  constexpr int packs_per_thread = bits <= 2 ? 1 : 2;
   constexpr int num_simdgroups = 2;
   constexpr int results_per_simdgroup = 4;
   constexpr int pack_factor = get_pack_factor<bits, 32>();
@@ -925,10 +929,18 @@ METAL_FUNC void qmv_fast_impl(
     x += block_size;
   }
 
-  // Tail block: handles K that is a multiple of 512 (dispatch gate) but not
-  // of block_size. Only 1-bit has block_size > 512 (it uses 2048), so for
-  // >=2-bit this is a no-op. Out-of-bounds lanes skip the qdot call entirely;
-  // their result[row] stays at 0 and contributes 0 to the simd_sum below.
+  // Partial last block (in_vec_size % block_size != 0), reached only when the
+  // host's K gate (qmv_fast_k_alignment) is finer than block_size. A lane
+  // whose first value lies past the end of the row reads nothing (x, weights,
+  // scales, biases) and skips the row loop: its result[row] stays 0 and it
+  // still joins the simd_sum below. Masking such lanes instead (zeroed
+  // x_thread, scale and bias) would still run qdot, whose weight reads land
+  // past the end of the row and, for the last output rows, past the end of
+  // the weight buffer. A lane that starts inside the row also ends inside it
+  // because the K gate keeps in_vec_size a multiple of values_per_thread; a
+  // gate that did not would need the stricter predicate
+  // aligned_end + (simd_lid + 1) * values_per_thread <= in_vec_size.
+  // (numen-tech/gemma4-qat#179, #282)
   if (aligned_end < in_vec_size) {
     bool in_bounds = (aligned_end + simd_lid * values_per_thread) < in_vec_size;
     if (in_bounds) {
