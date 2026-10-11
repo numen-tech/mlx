@@ -1013,14 +1013,8 @@ bool is_nax_available() {
     }
     auto& d = metal::device(mlx::core::Device::gpu);
     auto gen = d.get_architecture_gen();
-    // gen-17 desktop parts (M5-class, applegpu_g17*) take the nax path under
-    // the old `gen >= 17` gate but compute WRONG results in the nax steel-gemm
-    // and qmm_t kernels (measured 2026-07-05: fp16 GEMM max|err| ~4 vs fp32 for
-    // every shape routed to steel_gemm_fused_nax; quantized qmm_t ~400 abs err;
-    // non-nax fallback bit-matches stock mlx). Require gen >= 18 on every
-    // device class until the g17 path is fixed and correctness-gated. Every
-    // NAX dispatch site (matmul, quantized, sdpa, gated delta) asks this
-    // predicate, so this one gate keeps gen 17 off all of them.
+    // NAX GEMM and qmm_t kernels give wrong results on gen 17 (M5-class).
+    // All NAX dispatch sites use this function.
     can_use_nax &= gen >= 18;
     return can_use_nax;
   };
