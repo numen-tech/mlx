@@ -850,7 +850,22 @@ METAL_FUNC void qmv_quad_impl(
   }
 }
 
-template <typename T, int group_size, int bits, bool partial_rows = false>
+// Bias-free formats derive the bias from the scale: -scale/2 for 1-bit,
+// -scale for 2-bit.
+template <typename U, int bits, bool bias_free>
+METAL_FUNC U sym_derived_bias(U scale) {
+  static_assert(
+      !bias_free || bits == 1 || bits == 2,
+      "bias-free (symmetric) path is only defined for 1- and 2-bit formats");
+  return bits == 1 ? U(-0.5f) * scale : -scale;
+}
+
+template <
+    typename T,
+    int group_size,
+    int bits,
+    bool partial_rows = false,
+    bool bias_free = false>
 METAL_FUNC void qmv_fast_impl(
     const device uint32_t* w,
     const device T* scales,
@@ -919,7 +934,7 @@ METAL_FUNC void qmv_fast_impl(
       const device T* bl = biases + src * in_vec_size_g;
 
       U s = sl[0];
-      U b = bl[0];
+      U b = bias_free ? sym_derived_bias<U, bits, bias_free>(s) : (U)bl[0];
       result[row] += qdot<U, values_per_thread, bits>(wl, x_thread, s, b, sum);
     }
 
@@ -956,7 +971,7 @@ METAL_FUNC void qmv_fast_impl(
         const device T* bl = biases + src * in_vec_size_g;
 
         U s = sl[0];
-        U b = bl[0];
+        U b = bias_free ? sym_derived_bias<U, bits, bias_free>(s) : (U)bl[0];
         result[row] +=
             qdot<U, values_per_thread, bits>(wl, x_thread, s, b, sum);
       }
@@ -971,7 +986,7 @@ METAL_FUNC void qmv_fast_impl(
   }
 }
 
-template <typename T, int group_size, int bits>
+template <typename T, int group_size, int bits, bool bias_free = false>
 METAL_FUNC void qmv_impl(
     const device uint32_t* w,
     const device T* scales,
@@ -1033,7 +1048,7 @@ METAL_FUNC void qmv_impl(
         const device T* bl = biases + row * in_vec_size_g;
 
         U s = sl[0];
-        U b = bl[0];
+        U b = bias_free ? sym_derived_bias<U, bits, bias_free>(s) : (U)bl[0];
         result[row] +=
             qdot<U, values_per_thread, bits>(wl, x_thread, s, b, sum);
       }
@@ -1059,7 +1074,7 @@ METAL_FUNC void qmv_impl(
         const device T* bl = biases + row * in_vec_size_g;
 
         U s = sl[0];
-        U b = bl[0];
+        U b = bias_free ? sym_derived_bias<U, bits, bias_free>(s) : (U)bl[0];
         result[row] += qdot_safe<U, values_per_thread, bits>(
             wl, x_thread, s, b, sum, remaining);
       }
@@ -1094,7 +1109,7 @@ METAL_FUNC void qmv_impl(
         const device T* bl = biases + row * in_vec_size_g;
 
         U s = sl[0];
-        U b = bl[0];
+        U b = bias_free ? sym_derived_bias<U, bits, bias_free>(s) : (U)bl[0];
         result[row] +=
             qdot<U, values_per_thread, bits>(wl, x_thread, s, b, sum);
       }
@@ -1118,7 +1133,7 @@ METAL_FUNC void qmv_impl(
         const device T* bl = biases + row * in_vec_size_g;
 
         U s = sl[0];
-        U b = bl[0];
+        U b = bias_free ? sym_derived_bias<U, bits, bias_free>(s) : (U)bl[0];
         result[row] += qdot_safe<U, values_per_thread, bits>(
             wl, x_thread, s, b, sum, remaining);
       }
@@ -1855,6 +1870,124 @@ template <
         tid);
   }
   qmv_impl<T, group_size, bits>(
+      w,
+      scales,
+      biases,
+      x,
+      y,
+      in_vec_size,
+      out_vec_size,
+      tid,
+      simd_gid,
+      simd_lid);
+}
+
+// Bias-free decode kernels: same buffer layout as affine_qmv* with the biases
+// slot (buffer 2) unbound; the bias comes from sym_derived_bias.
+template <
+    typename T,
+    int group_size,
+    int bits,
+    bool batched,
+    bool partial_rows = false,
+    bool has_global_scale = false,
+    int results_per_simdgroup = 4>
+[[kernel]] void affine_sym_qmv_fast(
+    const device uint32_t* w [[buffer(0)]],
+    const device T* scales [[buffer(1)]],
+    const device T* x [[buffer(3)]],
+    device T* y [[buffer(4)]],
+    const constant int& in_vec_size [[buffer(5)]],
+    const constant int& out_vec_size [[buffer(6)]],
+    const constant int& x_batch_ndims [[buffer(7)]],
+    const constant int* x_shape [[buffer(8)]],
+    const constant int64_t* x_strides [[buffer(9)]],
+    const constant int& w_batch_ndims [[buffer(10)]],
+    const constant int* w_shape [[buffer(11)]],
+    const constant int64_t* w_strides [[buffer(12)]],
+    const constant int64_t* s_strides [[buffer(13)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  const device T* biases = scales; // dummy; never dereferenced when bias_free
+  if (batched) {
+    int M = x_shape[x_batch_ndims];
+    adjust_matrix_offsets<T>(
+        x,
+        w,
+        scales,
+        biases,
+        y,
+        out_vec_size * M,
+        x_batch_ndims,
+        x_shape,
+        x_strides,
+        w_batch_ndims,
+        w_shape,
+        w_strides,
+        s_strides,
+        s_strides,
+        tid);
+  }
+  qmv_fast_impl<T, group_size, bits, partial_rows, /*bias_free=*/true>(
+      w,
+      scales,
+      biases,
+      x,
+      y,
+      in_vec_size,
+      out_vec_size,
+      tid,
+      simd_gid,
+      simd_lid);
+}
+
+template <
+    typename T,
+    int group_size,
+    int bits,
+    bool batched,
+    bool partial_rows = false,
+    bool has_global_scale = false,
+    int results_per_simdgroup = 4>
+[[kernel]] void affine_sym_qmv(
+    const device uint32_t* w [[buffer(0)]],
+    const device T* scales [[buffer(1)]],
+    const device T* x [[buffer(3)]],
+    device T* y [[buffer(4)]],
+    const constant int& in_vec_size [[buffer(5)]],
+    const constant int& out_vec_size [[buffer(6)]],
+    const constant int& x_batch_ndims [[buffer(7)]],
+    const constant int* x_shape [[buffer(8)]],
+    const constant int64_t* x_strides [[buffer(9)]],
+    const constant int& w_batch_ndims [[buffer(10)]],
+    const constant int* w_shape [[buffer(11)]],
+    const constant int64_t* w_strides [[buffer(12)]],
+    const constant int64_t* s_strides [[buffer(13)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  const device T* biases = scales; // dummy; never dereferenced when bias_free
+  if (batched) {
+    int M = x_shape[x_batch_ndims];
+    adjust_matrix_offsets<T>(
+        x,
+        w,
+        scales,
+        biases,
+        y,
+        out_vec_size * M,
+        x_batch_ndims,
+        x_shape,
+        x_strides,
+        w_batch_ndims,
+        w_shape,
+        w_strides,
+        s_strides,
+        s_strides,
+        tid);
+  }
+  qmv_impl<T, group_size, bits, /*bias_free=*/true>(
       w,
       scales,
       biases,
