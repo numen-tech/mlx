@@ -871,9 +871,9 @@ class TestQuantized(mlx_tests.MLXTestCase):
         # qmv at non-aligned K. The host gate takes 1-bit K % 512 and affine
         # 4-bit K % 256 (half a kernel block; numen-tech/gemma4-qat#192), so
         # the 1-bit K = 1536/2560 and 4-bit K = 768/1280 shapes run the
-        # qmv_fast partial tail and, at N = 67, the last-row clamp (M = 3 only
-        # where it stays on qmv, i.e. before gen 15): the GPU cannot match the
-        # CPU if a tail lane reads past K or past the last row.
+        # qmv_fast partial tail and, at N = 67, the last-row clamp (M = 3 where
+        # it stays on qmv: 1-bit, and 4-bit before gen 15): the GPU cannot
+        # match the CPU if a tail lane reads past K or past the last row.
         cases = [
             (bits, gs, K, N, 1)
             for bits, gs in ((1, 32), (1, 64), (4, 32), (4, 64))
@@ -1073,8 +1073,9 @@ class TestQuantized(mlx_tests.MLXTestCase):
     def test_qmv_wide(self):
         tol = 5e-2 if mx.cuda.is_available() else 1e-3
         # M in [2, vector_limit) routes to qmv_wide -- except K in {64, 128}
-        # with power-of-2 bits, which stays on qmv_quad. Check both paths
-        # against a dequantize-then-matmul reference, with ragged M (token
+        # with power-of-2 bits, which stays on qmv_quad, and affine 1-bit (and
+        # 2-bit at M = 2) or affine before gen 15, which stay on qmv. Check all
+        # paths against a dequantize-then-matmul reference, with ragged M (token
         # tail) and ragged N (output-tile remainder). B > 1 stacks a distinct
         # weight matrix per slab and exercises the batched variant.
         key = mx.random.key(0)
@@ -1087,7 +1088,7 @@ class TestQuantized(mlx_tests.MLXTestCase):
 
         # Affine: every bit-width and group size.
         for group_size, bits, K in product(
-            [32, 64, 128], [2, 3, 4, 5, 6, 8], [128, 512]
+            [32, 64, 128], [1, 2, 3, 4, 5, 6, 8], [128, 512]
         ):
             for M, N, B in product(Ms, Ns, Bs):
                 with self.subTest(M=M, N=N, K=K, B=B, group_size=group_size, bits=bits):
@@ -1121,7 +1122,12 @@ class TestQuantized(mlx_tests.MLXTestCase):
 
         # Tiny shapes (M, K, N): small K and non-multiple output rows.
         tiny = [(2, 32, 10), (4, 32, 7), (3, 64, 5), (5, 64, 3)]
-        settings = [(4, 32, "affine"), (6, 32, "affine"), (4, 16, "nvfp4")]
+        settings = [
+            (1, 32, "affine"),
+            (4, 32, "affine"),
+            (6, 32, "affine"),
+            (4, 16, "nvfp4"),
+        ]
         for M, K, N in tiny:
             for bits, group_size, mode in settings:
                 with self.subTest(
@@ -1147,6 +1153,38 @@ class TestQuantized(mlx_tests.MLXTestCase):
                     y_hat = x @ mx.swapaxes(w_hat, -1, -2)
                     self.assertEqual(y_q.shape, y_hat.shape)
                     self.assertLess((y_q - y_hat).abs().max(), tol)
+
+    @unittest.skipUnless(mx.metal.is_available(), "qmv_wide is a Metal kernel")
+    def test_qmv_wide_tile_matches_split(self):
+        # One call over M rows must match the split calls bit for bit.
+        key = mx.random.key(6)
+        k1, k2 = mx.random.split(key)
+        cases = [(bits, gs, None) for bits in [2, 3, 4, 5, 6, 8] for gs in [32, 64]]
+        cases += [(b, gs, f) for b, gs, f in self.IMPLIED_BIAS_CASES if b > 1]
+        splits = {6: [3, 3], 7: [4, 3], 8: [4, 4], 11: [4, 4, 3], 12: [4, 4, 4]}
+        for (bits, gs, factor), dtype, K, B in product(
+            cases, self.IMPLIED_BIAS_DTYPES, [512, 1536], [1, 2]
+        ):
+            lead = (B,) if B > 1 else ()
+            N = 72
+            w = mx.random.normal(shape=lead + (N, K), key=k2).astype(dtype)
+            w_q, scales, biases = mx.quantize(w, gs, bits)
+            if factor is not None:
+                biases = mx.array(factor, dtype)
+
+            def qmm(x):
+                return mx.quantized_matmul(x, w_q, scales, biases, True, gs, bits)
+
+            for M, chunks in splits.items():
+                with self.subTest(
+                    bits=bits, gs=gs, factor=factor, dtype=dtype, K=K, B=B, M=M
+                ):
+                    x = mx.random.normal(shape=lead + (M, K), key=k1).astype(dtype)
+                    parts, r = [], 0
+                    for c in chunks:
+                        parts.append(qmm(x[..., r : r + c, :]))
+                        r += c
+                    self.assert_bitwise_equal(qmm(x), mx.concatenate(parts, axis=-2))
 
     @unittest.skipUnless(mx.metal.is_available(), "Bias-free affine is Metal-only")
     def test_qmv_affine_sym(self):
@@ -1405,8 +1443,9 @@ class TestQuantized(mlx_tests.MLXTestCase):
                 self.IMPLIED_BIAS_DTYPES, self.IMPLIED_BIAS_CASES
             ):
                 # K = 64 / 128 route to qmv_quad; 512 / 1536 to qmv_fast (and
-                # qmv_wide for 2 <= M <= 8 at bits > 1); K = 768 runs the 4-bit
-                # qmv_fast tail; N = 72 is not a multiple of the 32-wide qmm tile.
+                # qmv_wide for 2 <= M <= 8 at bits > 1, from M = 3 at 2-bit);
+                # K = 768 runs the 4-bit qmv_fast tail; N = 72 is not a
+                # multiple of the 32-wide qmm tile.
                 for K, N in product([64, 128, 512, 768, 1536], [256, 72]):
                     if K < gs:
                         continue

@@ -615,12 +615,22 @@ void qmv(
 }
 
 // affine qmv_wide only beats qmv on gen-15+; fp benefits on every gen.
-// affine_sym has no qmv_wide kernel.
-inline bool use_qmv_wide(const std::string& mode, metal::Device& d) {
+// affine_sym has no qmv_wide kernel. The 1-bit path has so little weight
+// traffic that unpacking into registers dominates even when several input
+// rows reuse the result. The 2-bit path breaks even after two rows and wins
+// once three or more rows share a block.
+inline bool
+use_qmv_wide(const std::string& mode, int bits, int M, metal::Device& d) {
   if (mode == "affine_sym") {
     return false;
   }
-  return mode != "affine" || d.get_architecture_gen() >= 15;
+  if (mode != "affine") {
+    return true;
+  }
+  if (bits == 1 || (bits == 2 && M < 3)) {
+    return false;
+  }
+  return d.get_architecture_gen() >= 15;
 }
 
 // Dispatches qmv_wide (fp modes -> fp_qmv_wide, affine -> affine_qmv_wide):
@@ -644,6 +654,11 @@ void qmv_wide(
   // them.
   int n_tiles = (M + 4) / 5; // ceil(M / 5); tile size caps at 5
   int vecs_per_tg = (M + n_tiles - 1) / n_tiles;
+  // affine runs M <= 7 as one tile. The result does not depend on the tile.
+  constexpr int max_affine_single_tile = 7;
+  if (mode == "affine" && M <= max_affine_single_tile) {
+    vecs_per_tg = M;
+  }
 
   // k_lanes: lanes reducing K per output row (32/k_lanes rows per simdgroup).
   // The affine subchunk decode has enough ALU per weight load to favor more
@@ -2073,7 +2088,7 @@ void dispatch_qmv(
 
   // Small batch so route to qmv_wide, which reuses each weight group across the
   // M vectors.
-  if (M >= 2 && use_qmv_wide(mode, d) && !global_scale) {
+  if (M >= 2 && use_qmv_wide(mode, bits, M, d) && !global_scale) {
     qmv_wide(x, w, scales, biases, out, group_size, bits, M, N, K, d, s, mode);
     return;
   }
