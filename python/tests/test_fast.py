@@ -1474,6 +1474,21 @@ class TestFast(mlx_tests.MLXTestCase):
             with self.subTest(K=K, compare="default vs cpu"):
                 self.assertEqual(results["default"], results["cpu-fallback"])
 
+    def test_spec_decode_verify_rejects_non_integer_drafts(self):
+        lg = mx.zeros((1, 3, 8))
+        for dtype in (mx.float32, mx.float16, mx.bfloat16, mx.bool_):
+            draft = mx.array([[1.9, 0.0]]).astype(dtype)
+            for path, stream in (("default", None), ("cpu-fallback", mx.cpu)):
+                with self.subTest(dtype=dtype, path=path):
+                    kw = {"stream": stream} if stream is not None else {}
+                    with self.assertRaises(ValueError):
+                        mx.fast.spec_decode_verify(draft, lg, **kw)
+        for dtype in (mx.int64, mx.uint32, mx.int16):
+            with self.subTest(dtype=dtype):
+                draft = mx.array([[0, 0]], dtype=dtype)
+                n, c = mx.fast.spec_decode_verify(draft, lg)
+                self.assertEqual(n.tolist(), [2])
+
     def test_spec_decode_verify_strided_inputs(self):
         # Drafts and logits that are views, not dense rows: the fused kernel
         # must see the logical values, like the CPU composition does.

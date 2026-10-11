@@ -1257,6 +1257,12 @@ std::vector<array> spec_decode_verify(
     throw std::invalid_argument(
         "[spec_decode_verify] target_logits must be 3D [B, K+1, V].");
   }
+  if (!issubdtype(draft_tokens.dtype(), integer)) {
+    std::ostringstream msg;
+    msg << "[spec_decode_verify] draft_tokens must be integer token ids but got "
+        << draft_tokens.dtype() << ".";
+    throw std::invalid_argument(msg.str());
+  }
   int B = draft_tokens.shape(0);
   int K = draft_tokens.shape(1);
   if (target_logits.shape(0) != B) {
