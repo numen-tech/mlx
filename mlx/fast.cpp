@@ -1321,7 +1321,9 @@ std::vector<array> spec_decode_verify(
   };
 
   std::vector<array> prim_inputs = {dft, tgt};
-  if (SpecDecodeVerify::use_fallback(s)) {
+  // K = 0 also takes the composition: an empty draft has no buffer to bind
+  // at the kernel's index 0 (the Metal API validation layer rejects that).
+  if (K == 0 || SpecDecodeVerify::use_fallback(s)) {
     return fallback(prim_inputs);
   }
   return array::make_arrays(
