@@ -1438,6 +1438,25 @@ class TestFast(mlx_tests.MLXTestCase):
                 mx.zeros((1, 3), dtype=mx.int32), mx.zeros((1, 3, 8))
             )
 
+    def test_spec_decode_verify_empty_draft(self):
+        # K = 0: nothing to accept, the bonus token is the argmax at the only
+        # position. The CPU composition must match the fused kernel.
+        for B, bonus in ((1, [5]), (2, [5, 3])):
+            lg = [[[-10.0] * 8] for _ in range(B)]
+            for b, t in enumerate(bonus):
+                lg[b][0][t] = 10.0
+            lg = mx.array(lg)
+            draft = mx.zeros((B, 0), dtype=mx.int32)
+            for path, stream in (("default", None), ("cpu-fallback", mx.cpu)):
+                with self.subTest(B=B, path=path):
+                    kw = {"stream": stream} if stream is not None else {}
+                    n, c = mx.fast.spec_decode_verify(draft, lg, **kw)
+                    mx.eval(n, c)
+                    self.assertEqual(n.shape, (B,))
+                    self.assertEqual(c.shape, (B, 1))
+                    self.assertEqual(n.tolist(), [0] * B)
+                    self.assertEqual(c.tolist(), [[t] for t in bonus])
+
     def test_spec_decode_verify_strided_inputs(self):
         # Drafts and logits that are views, not dense rows: the fused kernel
         # must see the logical values, like the CPU composition does.
