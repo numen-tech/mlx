@@ -134,7 +134,7 @@ void init_fast(nb::module_& parent_module) {
         ``[last] + draft``, returns the greedy accept result.
 
         Args:
-            draft_tokens (array): int32 ``[B, K]`` drafted tokens.
+            draft_tokens (array): ``[B, K]`` drafted token ids of an integer type.
             target_logits (array): ``[B, K+1, V]`` target logits over the
               ``[last] + draft`` positions.
 
