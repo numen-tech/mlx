@@ -343,7 +343,11 @@ array eval_impl(std::vector<array> outputs, bool async) {
     }
     for (auto& s : open_streams) {
       try {
-        synchronize(s);
+        if (s.device == Device::gpu) {
+          gpu::synchronize(s, /* explicit_sync = */ false);
+        } else {
+          synchronize(s);
+        }
       } catch (...) {
         // Preserve the original exception.
       }
