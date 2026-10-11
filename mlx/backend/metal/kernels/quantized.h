@@ -981,15 +981,16 @@ METAL_FUNC void qmv_fast_impl(
   }
 
   // Partial last block (in_vec_size % block_size != 0), reached only when the
-  // host's K gate (qmv_fast_k_alignment) is finer than block_size. A lane
-  // whose first value lies past the end of the row reads nothing (x, weights,
-  // scales, biases) and skips the row loop: its result[row] stays 0 and it
-  // still joins the simd_sum below. Masking such lanes instead (zeroed
-  // x_thread, scale and bias) would still run qdot, whose weight reads land
-  // past the end of the row and, for the last output rows, past the end of
-  // the weight buffer. A lane that starts inside the row also ends inside it
-  // because the K gate keeps in_vec_size a multiple of values_per_thread; a
-  // gate that did not would need the stricter predicate
+  // host's K gate (qmv_fast_k_alignment) is finer than block_size: affine
+  // 1/4-bit take K % (block_size / 2) == 0. A lane whose first value lies
+  // past the end of the row reads nothing (x, weights, scales, biases) and
+  // skips the row loop: its result[row] stays 0 and it still joins the
+  // simd_sum below. Masking such lanes instead (zeroed x_thread, scale and
+  // bias) would still run qdot, whose weight reads land past the end of the
+  // row and, for the last output rows, past the end of the weight buffer. A
+  // lane that starts inside the row also ends inside it because the K gate
+  // keeps in_vec_size a multiple of values_per_thread; a gate that did not
+  // would need the stricter predicate
   // aligned_end + (simd_lid + 1) * values_per_thread <= in_vec_size.
   // (numen-tech/gemma4-qat#179, #282)
   if (aligned_end < in_vec_size) {
@@ -1976,6 +1977,7 @@ template <
     int bits,
     bool batched,
     bool partial_rows = false,
+    // Unused (shared qmv instantiation macro and kname scheme):
     bool has_global_scale = false,
     int results_per_simdgroup = 4>
 [[kernel]] void affine_sym_qmv_fast(
@@ -2034,6 +2036,7 @@ template <
     int bits,
     bool batched,
     bool partial_rows = false,
+    // Unused (shared qmv instantiation macro and kname scheme):
     bool has_global_scale = false,
     int results_per_simdgroup = 4>
 [[kernel]] void affine_sym_qmv(

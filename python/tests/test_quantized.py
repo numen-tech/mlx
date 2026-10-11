@@ -869,15 +869,13 @@ class TestQuantized(mlx_tests.MLXTestCase):
         # GPU vs CPU for K that is a multiple of the group size but not of
         # qmv_fast's block, with N = 67 not a multiple of 8.
         #
-        # On the current host K gate (2048 for 1-bit, 512 for 4-bit) no shape
-        # here reaches the qmv_fast partial tail or the partial_rows clamp:
-        # they all route to plain qmv (or qmv_wide for M = 3 on gen 15+), so
-        # this covers plain qmv at non-aligned K. Once the routing patch
-        # widens the gate (1-bit K % 512, affine 4-bit K % 256;
-        # numen-tech/gemma4-qat#192), the 1-bit K = 1536/2560 and 4-bit
-        # K = 768/1280 shapes run the partial tail and, at N = 67, the
-        # last-row clamp, and this becomes the tail guard: the GPU cannot
-        # match the CPU if a tail lane reads past K or past the last row.
+        # The gs * 17 / gs * 33 shapes are on no qmv_fast gate and cover plain
+        # qmv at non-aligned K. The host gate takes 1-bit K % 512 and affine
+        # 4-bit K % 256 (half a kernel block; numen-tech/gemma4-qat#192), so
+        # the 1-bit K = 1536/2560 and 4-bit K = 768/1280 shapes run the
+        # qmv_fast partial tail and, at N = 67, the last-row clamp (M = 3 only
+        # where it stays on qmv, i.e. before gen 15): the GPU cannot match the
+        # CPU if a tail lane reads past K or past the last row.
         cases = [
             (bits, gs, K, N, 1)
             for bits, gs in ((1, 32), (1, 64), (4, 32), (4, 64))
@@ -1279,6 +1277,86 @@ class TestQuantized(mlx_tests.MLXTestCase):
                 _, jvp_biased = mx.jvp(lambda x: f_biased(x, scales), [x], [x])
                 self.assertLess((jvp_sym[0] - jvp_biased[0]).abs().max().item(), 1e-3)
 
+    @unittest.skipUnless(mx.metal.is_available(), "qmv_fast is a Metal kernel")
+    def test_qmv_fast_half_block(self):
+        # Affine 4-bit K % 256 == 0 and 1-bit K % 512 == 0 take qmv_fast with a
+        # partial last block. The generic qmv baseline runs the same product
+        # with K padded by one group that x zeroes out: K + gs is on no
+        # qmv_fast gate. (An extra output row no longer leaves qmv_fast: since
+        # ml-explore/mlx#4516 N % 8 != 0 takes its partial_rows variant.) The
+        # fast call's x is a view whose memory past K is that group drawn
+        # non-zero, so a tail lane that read past K would show.
+        key = mx.random.key(5)
+        k1, k2 = mx.random.split(key)
+        f32 = mx.float32
+        cases = [(4, 256), (4, 768), (4, 3840), (1, 512), (1, 1536), (1, 2560)]
+        dtypes = [f32, mx.float16, mx.bfloat16]
+        for (bits, K), gs, dtype in product(cases, [32, 64, 128], dtypes):
+            for sym, B in product([False, True] if bits == 1 else [False], [0, 2]):
+                with self.subTest(bits=bits, K=K, gs=gs, dtype=dtype, sym=sym, B=B):
+                    N = 64
+                    Kp = K + gs
+                    lead = (B,) if B else ()
+                    w = mx.random.normal(lead + (N, Kp), key=k2).astype(dtype)
+                    w_q, scales, biases = mx.quantize(w, gs, bits)
+                    ref_b = -0.5 * scales if sym else biases
+                    if sym:
+                        biases = None
+                    x = mx.random.normal(lead + (1, Kp), key=k1).astype(dtype)
+                    pad = mx.zeros(lead + (1, gs), dtype)
+                    x0 = mx.concatenate([x[..., :K], pad], axis=-1)
+                    w_hat = mx.dequantize(
+                        w_q, scales.astype(f32), ref_b.astype(f32), gs, bits
+                    )
+                    ref = x0.astype(f32) @ mx.swapaxes(w_hat, -1, -2)
+
+                    def qmm(x, k):
+                        b = None if biases is None else biases[..., : k // gs]
+                        y = mx.quantized_matmul(
+                            x[..., :k],
+                            w_q[..., : k * bits // 32],
+                            scales[..., : k // gs],
+                            b,
+                            True,
+                            gs,
+                            bits,
+                        )
+                        return y.astype(f32)
+
+                    fast, generic = qmm(x, K), qmm(x0, Kp)
+                    err_fast = (fast - ref).abs().max().item()
+                    err_generic = (generic - ref).abs().max().item()
+                    # One ulp of the output dtype covers the rounding of the
+                    # different accumulation order in fp16 / bf16; in fp32 the
+                    # order itself shows (up to ~1.1 ulp here), so allow 4.
+                    n_ulp = 4 if dtype == f32 else 1
+                    ulp = n_ulp * mx.finfo(dtype).eps * ref.abs().max().item()
+                    self.assertLessEqual(err_fast, err_generic + ulp)
+
+        # gather_qmv shares the kernel.
+        for dtype in dtypes:
+            with self.subTest(gather=True, dtype=dtype):
+                w = mx.random.normal((3, 64, 3840), key=k2).astype(dtype)
+                w_q, scales, biases = mx.quantize(w, 32, 4)
+                x = mx.random.normal((2, 1, 3840), key=k1).astype(dtype)
+                idx = mx.array([2, 0])
+                y = mx.gather_qmm(
+                    x,
+                    w_q,
+                    scales,
+                    biases,
+                    rhs_indices=idx,
+                    transpose=True,
+                    group_size=32,
+                    bits=4,
+                )
+                w_hat = mx.dequantize(
+                    w_q, scales.astype(f32), biases.astype(f32), 32, 4
+                )
+                ref = x.astype(f32) @ mx.swapaxes(w_hat[idx], -1, -2)
+                tol = 2 * mx.finfo(dtype).eps * ref.abs().max().item() + 1e-4
+                self.assertLessEqual((y.astype(f32) - ref).abs().max().item(), tol)
+
     # Implied bias: a 0-d `biases` array is a factor f and the kernels form
     # bias = f * scale per group. The factors of the shipped checkpoints are
     # powers of two, so f * scale is exact in every dtype and the implied path
@@ -1329,9 +1407,9 @@ class TestQuantized(mlx_tests.MLXTestCase):
                 self.IMPLIED_BIAS_DTYPES, self.IMPLIED_BIAS_CASES
             ):
                 # K = 64 / 128 route to qmv_quad; 512 / 1536 to qmv_fast (and
-                # qmv_wide for 2 <= M <= 8 at bits > 1); N = 72 is not a
-                # multiple of the 32-wide qmm tile.
-                for K, N in product([64, 128, 512, 1536], [256, 72]):
+                # qmv_wide for 2 <= M <= 8 at bits > 1); K = 768 runs the 4-bit
+                # qmv_fast tail; N = 72 is not a multiple of the 32-wide qmm tile.
+                for K, N in product([64, 128, 512, 768, 1536], [256, 72]):
                     if K < gs:
                         continue
                     w = mx.random.normal(shape=(N, K), key=k2).astype(dtype)
@@ -1429,15 +1507,15 @@ class TestQuantized(mlx_tests.MLXTestCase):
                     x = mx.random.normal(shape=(2, M, K), key=k1).astype(dtype)
                     check(x, wb_q, scales_b, full_b, K=K, M=M, path="batched_w")
 
-            # N % 8 != 0: qmv_fast with partial rows where K is fast-aligned
-            # (2/4/8-bit here), else the generic qmv (1-bit); qmv_wide for
-            # M = 4 where the device routes affine there.
+            # N % 8 != 0: qmv_fast with partial rows (K = 512 is fast-aligned
+            # for every width here); qmv_wide for M = 4 where the device routes
+            # affine there.
             w = mx.random.normal(shape=(67, 512), key=k2).astype(dtype)
             w_q, scales, _ = mx.quantize(w, gs, bits)
             full = self.reference_bias(scales, factor)
             for M in [1, 4]:
                 x = mx.random.normal(shape=(M, 512), key=k1).astype(dtype)
-                check(x, w_q, scales, full, M=M, path="qmv_generic")
+                check(x, w_q, scales, full, M=M, path="n_not_mult_8")
 
             # A float32 factor with half-precision scales adopts the scales'
             # dtype (no promotion of the whole matmul to float32).
