@@ -1269,6 +1269,12 @@ std::vector<array> spec_decode_verify(
   }
   auto s = to_stream(s_);
 
+  // B = 0: nothing to verify. Return empty results without the argmax (which
+  // rejects a zero-size input) or the fused kernel.
+  if (B == 0) {
+    return {zeros(Shape{0}, int32, s), zeros(Shape{0, K + 1}, int32, s)};
+  }
+
   // Reuse mlx's fast argmax on-device (result stays on the GPU); the fused
   // primitive does only the tiny per-row prefix-match. Primitive inputs are
   // int32 token arrays, so the kernel needs no large-V reduction.

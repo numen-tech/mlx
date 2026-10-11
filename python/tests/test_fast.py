@@ -1457,6 +1457,23 @@ class TestFast(mlx_tests.MLXTestCase):
                     self.assertEqual(n.tolist(), [0] * B)
                     self.assertEqual(c.tolist(), [[t] for t in bonus])
 
+    def test_spec_decode_verify_empty_batch(self):
+        # B = 0: empty, correctly shaped int32 results on every backend.
+        for K in (3, 0):
+            draft = mx.zeros((0, K), dtype=mx.int32)
+            lg = mx.zeros((0, K + 1, 8))
+            results = {}
+            for path, stream in (("default", None), ("cpu-fallback", mx.cpu)):
+                with self.subTest(K=K, path=path):
+                    kw = {"stream": stream} if stream is not None else {}
+                    n, c = mx.fast.spec_decode_verify(draft, lg, **kw)
+                    mx.eval(n, c)
+                    self.assertEqual((n.shape, n.dtype), ((0,), mx.int32))
+                    self.assertEqual((c.shape, c.dtype), ((0, K + 1), mx.int32))
+                    results[path] = (n.shape, n.dtype, c.shape, c.dtype)
+            with self.subTest(K=K, compare="default vs cpu"):
+                self.assertEqual(results["default"], results["cpu-fallback"])
+
     def test_spec_decode_verify_strided_inputs(self):
         # Drafts and logits that are views, not dense rows: the fused kernel
         # must see the logical values, like the CPU composition does.
