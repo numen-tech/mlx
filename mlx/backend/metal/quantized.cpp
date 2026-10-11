@@ -1852,7 +1852,9 @@ void dispatch_qmv(
     metal::Device& d,
     const Stream& s,
     const std::string& mode) {
-  // It is a qmv with a small inner dimension so route to qmv_quad kernel
+  // It is a qmv with a small inner dimension so route to qmv_quad kernel.
+  // 1-bit needs K == 128: at K == 64 a quad lane holds 16 values, less than
+  // the one 32-value uint32 pack that qmv_quad_impl and qdot<bits=1> read.
   if ((K == 128 || (K == 64 && bits >= 2)) && is_power_of_2(bits) &&
       !global_scale) {
     qmv_quad(x, w, scales, biases, out, group_size, bits, M, N, K, d, s, mode);

@@ -863,6 +863,23 @@ class TestQuantized(mlx_tests.MLXTestCase):
                 self.assertEqual(y.shape, y_hat.shape)
                 self.assertLess((y - y_hat).abs().max().item(), tol)
 
+    def test_qmv_fast_tail_non_aligned_k(self):
+        # K is a multiple of the group size but not of qmv_fast's block, and N is not a multiple
+        # of 8, so the partial tail and the last-row clamp both run. The GPU must match the CPU
+        # (no tail lanes there), which it cannot do if a lane reads past K or past the last row.
+        key = mx.random.key(0)
+        for bits, gs in ((1, 32), (1, 64), (4, 32), (4, 64)):
+            for K in (gs * 17, gs * 33):
+                for N in (67, 256):
+                    with self.subTest(bits=bits, gs=gs, K=K, N=N):
+                        k1, k2, key = mx.random.split(key, 3)
+                        w = mx.random.normal((N, K), key=k1)
+                        x = mx.random.normal((1, K), key=k2).astype(mx.float16)
+                        wq, s, b = mx.quantize(w, group_size=gs, bits=bits)
+                        y = mx.quantized_matmul(x, wq, s, b, True, gs, bits, stream=mx.gpu)
+                        y_cpu = mx.quantized_matmul(x, wq, s, b, True, gs, bits, stream=mx.cpu)
+                        self.assertTrue(mx.allclose(y, y_cpu, atol=1e-2, rtol=1e-2))
+
     @unittest.skipIf(not mx.metal.is_available(), "requires Metal")
     def test_fp_qmv_fast_unaligned_n(self):
         for n, k, mode, dtype, batched in product(
