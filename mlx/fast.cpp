@@ -1282,6 +1282,11 @@ std::vector<array> spec_decode_verify(
       [B, K, s](const std::vector<array>& inputs) -> std::vector<array> {
     auto d = inputs[0]; // [B, K] int32
     auto t = inputs[1]; // [B, K+1] int32
+    if (K == 0) {
+      // Nothing to accept; committed is the bonus token t[:, 0], as the
+      // fused kernel writes it. (min over the empty axis below would throw.)
+      return {zeros(Shape{B}, int32, s), t};
+    }
     auto t_pref = slice(t, Shape{0, 0}, Shape{B, K}, s);
     auto mism = not_equal(d, t_pref, s);
     auto j = broadcast_to(
