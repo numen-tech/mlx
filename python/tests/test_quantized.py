@@ -863,22 +863,47 @@ class TestQuantized(mlx_tests.MLXTestCase):
                 self.assertEqual(y.shape, y_hat.shape)
                 self.assertLess((y - y_hat).abs().max().item(), tol)
 
+    @unittest.skipIf(not mx.metal.is_available(), "requires Metal")
     def test_qmv_fast_tail_non_aligned_k(self):
-        # K is a multiple of the group size but not of qmv_fast's block, and N is not a multiple
-        # of 8, so the partial tail and the last-row clamp both run. The GPU must match the CPU
-        # (no tail lanes there), which it cannot do if a lane reads past K or past the last row.
+        # GPU vs CPU for K that is a multiple of the group size but not of
+        # qmv_fast's block, with N = 67 not a multiple of 8.
+        #
+        # On the current host K gate (2048 for 1-bit, 512 for 4-bit) no shape
+        # here reaches the qmv_fast partial tail or the partial_rows clamp:
+        # they all route to plain qmv (or qmv_wide for M = 3 on gen 15+), so
+        # this covers plain qmv at non-aligned K. Once the routing patch
+        # widens the gate (1-bit K % 512, affine 4-bit K % 256;
+        # numen-tech/gemma4-qat#192), the 1-bit K = 1536/2560 and 4-bit
+        # K = 768/1280 shapes run the partial tail and, at N = 67, the
+        # last-row clamp, and this becomes the tail guard: the GPU cannot
+        # match the CPU if a tail lane reads past K or past the last row.
+        cases = [
+            (bits, gs, K, N, 1)
+            for bits, gs in ((1, 32), (1, 64), (4, 32), (4, 64))
+            for K in (gs * 17, gs * 33)
+            for N in (67, 256)
+        ]
+        cases += [
+            (bits, gs, K, N, M)
+            for bits, gss, Ks in (
+                (1, (32, 64, 128), (1536, 2560)),
+                (4, (32, 64), (768, 1280)),
+            )
+            for gs in gss
+            for K in Ks
+            for N in (67, 256)
+            for M in (1, 3)
+        ]
         key = mx.random.key(0)
-        for bits, gs in ((1, 32), (1, 64), (4, 32), (4, 64)):
-            for K in (gs * 17, gs * 33):
-                for N in (67, 256):
-                    with self.subTest(bits=bits, gs=gs, K=K, N=N):
-                        k1, k2, key = mx.random.split(key, 3)
-                        w = mx.random.normal((N, K), key=k1)
-                        x = mx.random.normal((1, K), key=k2).astype(mx.float16)
-                        wq, s, b = mx.quantize(w, group_size=gs, bits=bits)
-                        y = mx.quantized_matmul(x, wq, s, b, True, gs, bits, stream=mx.gpu)
-                        y_cpu = mx.quantized_matmul(x, wq, s, b, True, gs, bits, stream=mx.cpu)
-                        self.assertTrue(mx.allclose(y, y_cpu, atol=1e-2, rtol=1e-2))
+        for bits, gs, K, N, M in cases:
+            with self.subTest(bits=bits, gs=gs, K=K, N=N, M=M):
+                k1, k2, key = mx.random.split(key, 3)
+                w = mx.random.normal((N, K), key=k1)
+                x = mx.random.normal((M, K), key=k2).astype(mx.float16)
+                wq, s, b = mx.quantize(w, group_size=gs, bits=bits)
+                y = mx.quantized_matmul(x, wq, s, b, True, gs, bits, stream=mx.gpu)
+                y_cpu = mx.quantized_matmul(x, wq, s, b, True, gs, bits, stream=mx.cpu)
+                self.assertTrue(mx.allclose(y, y_cpu, atol=1e-2, rtol=1e-2))
 
     @unittest.skipIf(not mx.metal.is_available(), "requires Metal")
     def test_fp_qmv_fast_unaligned_n(self):
