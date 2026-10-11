@@ -3,11 +3,28 @@
 #include <algorithm>
 
 #include "mlx/allocator.h"
+#include "mlx/backend/gpu/copy.h"
 #include "mlx/backend/metal/device.h"
 #include "mlx/backend/metal/utils.h"
 #include "mlx/fast_primitives.h"
 
 namespace mlx::core::fast {
+
+namespace {
+
+// The kernel indexes dense rows (row * K, row * (K + 1)). A row-contiguous
+// input is bound as is; a view (transposed, sliced, broadcast) is copied
+// first and the copy kept alive until the command buffer completes.
+array ensure_row_contiguous(const array& x, const Stream& s) {
+  if (x.flags().row_contiguous) {
+    return x;
+  }
+  array x_copy = contiguous_copy_gpu(x, s);
+  metal::get_command_encoder(s).add_temporary(x_copy);
+  return x_copy;
+}
+
+} // namespace
 
 bool SpecDecodeVerify::use_fallback(Stream s) {
   // Fused kernel only on the GPU; CPU uses the op-level composition fallback.
@@ -17,8 +34,10 @@ bool SpecDecodeVerify::use_fallback(Stream s) {
 void SpecDecodeVerify::eval_gpu(
     const std::vector<array>& inputs,
     std::vector<array>& outputs) {
-  auto& draft = inputs[0]; // [B, K] int32
-  auto& target = inputs[1]; // [B, K+1] int32
+  auto& s = stream();
+  // Copies (if any) are encoded before this kernel's pipeline is set.
+  array draft = ensure_row_contiguous(inputs[0], s); // [B, K] int32
+  array target = ensure_row_contiguous(inputs[1], s); // [B, K+1] int32
   auto& n_accepted = outputs[0]; // [B] int32
   auto& committed = outputs[1]; // [B, K+1] int32
 
@@ -28,7 +47,6 @@ void SpecDecodeVerify::eval_gpu(
   int B = draft.shape(0);
   int K = draft.shape(1);
 
-  auto& s = stream();
   auto& d = metal::device(s.device);
   auto kernel = d.get_kernel("spec_decode_verify");
   auto& compute_encoder = metal::get_command_encoder(s);

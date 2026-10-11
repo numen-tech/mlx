@@ -1438,6 +1438,65 @@ class TestFast(mlx_tests.MLXTestCase):
                 mx.zeros((1, 3), dtype=mx.int32), mx.zeros((1, 3, 8))
             )
 
+    def test_spec_decode_verify_strided_inputs(self):
+        # Drafts and logits that are views, not dense rows: the fused kernel
+        # must see the logical values, like the CPU composition does.
+        def onehot(tokens, V=8):
+            lg = [[[-10.0] * V for _ in row] for row in tokens]
+            for b, row in enumerate(tokens):
+                for j, t in enumerate(row):
+                    lg[b][j][t] = 10.0
+            return mx.array(lg)
+
+        full = mx.array([[9, 1, 2, 9], [9, 3, 4, 9]], dtype=mx.int32)
+        logits = onehot([[1, 2, 5], [3, 4, 6]])
+        cases = [
+            # (name, draft view, target logits, expected n, expected committed)
+            (
+                "transposed",
+                mx.array([[1, 3], [2, 4]], dtype=mx.int32).T,
+                logits,
+                [2, 2],
+                [[1, 2, 5], [3, 4, 6]],
+            ),
+            (
+                "broadcast",
+                mx.broadcast_to(mx.array([[1, 2]], dtype=mx.int32), (2, 2)),
+                onehot([[1, 2, 5], [1, 2, 6]]),
+                [2, 2],
+                [[1, 2, 5], [1, 2, 6]],
+            ),
+            ("sliced", full[:, 1:3], logits, [2, 2], [[1, 2, 5], [3, 4, 6]]),
+            (
+                # Dense draft: isolates the logits view (argmax reads strides).
+                "transposed-logits",
+                mx.array([[1, 2], [3, 4]], dtype=mx.int32),
+                mx.swapaxes(mx.swapaxes(logits, 0, 1).astype(mx.float16), 0, 1),
+                [2, 2],
+                [[1, 2, 5], [3, 4, 6]],
+            ),
+            (
+                "mismatch-transposed",
+                mx.array([[1, 3], [7, 4]], dtype=mx.int32).T,
+                logits,
+                [1, 2],
+                [[1, 2, 0], [3, 4, 6]],
+            ),
+        ]
+        for name, draft, lg, exp_n, exp_c in cases:
+            for path, stream in (("default", None), ("cpu-fallback", mx.cpu)):
+                with self.subTest(case=name, path=path):
+                    kw = {"stream": stream} if stream is not None else {}
+                    n, c = mx.fast.spec_decode_verify(draft, lg, **kw)
+                    mx.eval(n, c)
+                    self.assertEqual(n.tolist(), exp_n)
+                    got = c.tolist()
+                    # Positions past the bonus token are unspecified.
+                    self.assertEqual(
+                        [got[b][: exp_n[b] + 1] for b in range(len(exp_n))],
+                        [exp_c[b][: exp_n[b] + 1] for b in range(len(exp_n))],
+                    )
+
 
 if __name__ == "__main__":
     mlx_tests.MLXTestRunner()
