@@ -1319,9 +1319,11 @@ class TestQuantized(mlx_tests.MLXTestCase):
         # partial last block. The generic qmv baseline runs the same product
         # with K padded by one group that x zeroes out: K + gs is on no
         # qmv_fast gate. (An extra output row no longer leaves qmv_fast: since
-        # ml-explore/mlx#4516 N % 8 != 0 takes its partial_rows variant.) The
-        # fast call's x is a view whose memory past K is that group drawn
-        # non-zero, so a tail lane that read past K would show.
+        # ml-explore/mlx#4516 N % 8 != 0 takes its partial_rows variant.) At
+        # B = 0 the fast call's x is a view whose memory past K is that group
+        # drawn non-zero, so a tail lane that read past K would show. At B = 2
+        # ensure_row_contiguous_matrix copies the slice: past K, batch 0 reads
+        # batch 1's x (still non-zero) and batch 1 reads past the buffer.
         key = mx.random.key(5)
         k1, k2 = mx.random.split(key)
         f32 = mx.float32
@@ -1442,8 +1444,9 @@ class TestQuantized(mlx_tests.MLXTestCase):
             for dtype, (bits, gs, factor) in product(
                 self.IMPLIED_BIAS_DTYPES, self.IMPLIED_BIAS_CASES
             ):
-                # K = 64 / 128 route to qmv_quad; 512 / 1536 to qmv_fast (and
-                # qmv_wide for 2 <= M <= 8 at bits > 1, from M = 3 at 2-bit);
+                # K = 64 / 128 route to qmv_quad; 512 / 1536 to qmv_fast (and,
+                # on gen 15+, affine qmv_wide for 2 <= M <= 8 at bits > 1, from
+                # M = 3 at 2-bit);
                 # K = 768 runs the 4-bit qmv_fast tail; N = 72 is not a
                 # multiple of the 32-wide qmm tile.
                 for K, N in product([64, 128, 512, 768, 1536], [256, 72]):
