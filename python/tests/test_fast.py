@@ -2,6 +2,7 @@
 
 import math
 import os
+import random
 import unittest
 
 import mlx.core as mx
@@ -1129,6 +1130,59 @@ class TestFast(mlx_tests.MLXTestCase):
         out = call_kernel(a, source)
         self.assertTrue(mx.array_equal(out, mx.ones_like(out)))
 
+        # `int` 1 and `bool` True print the same template value but
+        # declare a different template parameter.
+        kernel = mx.fast.metal_kernel(
+            name="sizeof_kernel",
+            input_names=["inp"],
+            output_names=["out"],
+            source="out[0] = sizeof(V);",
+        )
+
+        def call_sizeof(value):
+            return kernel(
+                inputs=[a],
+                grid=(1, 1, 1),
+                threadgroup=(1, 1, 1),
+                output_shapes=[(1,)],
+                output_dtypes=[mx.int32],
+                template=[("V", value)],
+                stream=mx.gpu,
+            )[0].item()
+
+        for _ in range(2):
+            self.assertEqual(call_sizeof(1), 4)
+            self.assertEqual(call_sizeof(True), 1)
+
+    @unittest.skipIf(not mx.metal.is_available(), "Metal is not available")
+    def test_custom_kernel_many_template_values(self):
+        # More variants than the kernel keeps built. An array made before
+        # its variant was evicted must still evaluate correctly.
+        kernel = mx.fast.metal_kernel(
+            name="value_kernel",
+            input_names=["inp"],
+            output_names=["out"],
+            source="out[0] = V;",
+        )
+        a = mx.zeros((1,), dtype=mx.int32)
+
+        def call_value(value):
+            return kernel(
+                inputs=[a],
+                grid=(1, 1, 1),
+                threadgroup=(1, 1, 1),
+                output_shapes=[(1,)],
+                output_dtypes=[mx.int32],
+                template=[("V", value)],
+                stream=mx.gpu,
+            )[0]
+
+        pending = call_value(0)
+        for value in range(1, 200):
+            self.assertEqual(call_value(value).item(), value)
+        self.assertEqual(pending.item(), 0)
+        self.assertEqual(call_value(0).item(), 0)
+
     @unittest.skipIf(not mx.metal.is_available(), "Metal is not available")
     def test_custom_kernel_same_name_different_source_one_eval(self):
         # Regression test for #3832: two kernels sharing a name but with
@@ -1302,6 +1356,197 @@ class TestFast(mlx_tests.MLXTestCase):
         )
         mx.eval(out)
         self.assertEqual(out.tolist(), [-1, -1, -1, -1])
+
+    def test_spec_decode_verify(self):
+        # Validate mx.fast.spec_decode_verify against a pure-Python oracle that
+        # mirrors the greedy verify loop. On a Metal build the default device
+        # exercises the fused kernel and stream=mx.cpu the op-composition
+        # fallback; both must agree with the oracle.
+        def oracle(draft, tgt_tokens):
+            B, K = len(draft), len(draft[0])
+            n_acc, committed = [], []
+            for b in range(B):
+                na = K
+                for j in range(K):
+                    if draft[b][j] != tgt_tokens[b][j]:
+                        na = j
+                        break
+                n_acc.append(na)
+                committed.append(draft[b][:na] + [tgt_tokens[b][na]])
+            return n_acc, committed
+
+        # One-hot logits make the greedy argmax token unambiguous while still
+        # driving the same large-V reduction the real caller feeds in.
+        def onehot_logits(tgt_tokens, V, dtype):
+            B, L = len(tgt_tokens), len(tgt_tokens[0])
+            lg = [[[-10.0] * V for _ in range(L)] for _ in range(B)]
+            for b in range(B):
+                for j in range(L):
+                    lg[b][j][tgt_tokens[b][j]] = 10.0
+            return mx.array(lg).astype(dtype)
+
+        def check(draft, tgt_tokens, V, dtype, stream):
+            exp_n, exp_c = oracle(draft, tgt_tokens)
+            lg = onehot_logits(tgt_tokens, V, dtype)
+            kw = {"stream": stream} if stream is not None else {}
+            n, c = mx.fast.spec_decode_verify(mx.array(draft, dtype=mx.int32), lg, **kw)
+            mx.eval(n, c)
+            n, c = n.tolist(), c.tolist()
+            got_c = [c[b][: exp_n[b] + 1] for b in range(len(draft))]
+            self.assertEqual(n, exp_n)
+            self.assertEqual(got_c, exp_c)
+
+        cases = [
+            ("full-accept", [[5, 6, 7]], [[5, 6, 7, 9]]),
+            ("mismatch@2", [[5, 6, 7]], [[5, 6, 1, 9]]),
+            ("reject-all", [[5, 6, 7]], [[2, 6, 7, 9]]),
+            ("K=1", [[3]], [[3, 4]]),
+            (
+                "batch2-K4",
+                [[1, 2, 3, 4], [1, 2, 3, 4]],
+                [[1, 2, 9, 4, 7], [1, 2, 3, 4, 8]],
+            ),
+            ("batch3-K1", [[7], [7], [7]], [[7, 1], [2, 3], [7, 9]]),
+        ]
+        # stream=None is the default device (fused kernel on Metal); mx.cpu is
+        # the op-composition fallback.
+        for path, stream in (("default", None), ("cpu-fallback", mx.cpu)):
+            for dtype in (mx.float32, mx.float16, mx.bfloat16):
+                for name, draft, tgt in cases:
+                    with self.subTest(path=path, dtype=str(dtype), case=name):
+                        check(draft, tgt, 32, dtype, stream)
+
+        # Randomized sweep over prefix lengths, batch shapes, and corrected-token
+        # positions that are awkward to enumerate by hand.
+        rng = random.Random(7)
+        for i in range(40):
+            b, k, v = rng.randint(1, 4), rng.randint(1, 8), rng.randint(8, 96)
+            target = [[rng.randrange(v) for _ in range(k + 1)] for _ in range(b)]
+            draft = [
+                [
+                    row[j] if rng.random() < 0.5 else (row[j] + rng.randrange(1, v)) % v
+                    for j in range(k)
+                ]
+                for row in target
+            ]
+            with self.subTest(sweep=i, b=b, k=k, v=v):
+                check(draft, target, v, mx.float16, None)
+
+        # target_logits.shape[1] must equal draft.shape[1] + 1.
+        with self.assertRaises(ValueError):
+            mx.fast.spec_decode_verify(
+                mx.zeros((1, 3), dtype=mx.int32), mx.zeros((1, 3, 8))
+            )
+
+    def test_spec_decode_verify_empty_draft(self):
+        # K = 0: nothing to accept, the bonus token is the argmax at the only
+        # position. The CPU composition must match the fused kernel.
+        for B, bonus in ((1, [5]), (2, [5, 3])):
+            lg = [[[-10.0] * 8] for _ in range(B)]
+            for b, t in enumerate(bonus):
+                lg[b][0][t] = 10.0
+            lg = mx.array(lg)
+            draft = mx.zeros((B, 0), dtype=mx.int32)
+            for path, stream in (("default", None), ("cpu-fallback", mx.cpu)):
+                with self.subTest(B=B, path=path):
+                    kw = {"stream": stream} if stream is not None else {}
+                    n, c = mx.fast.spec_decode_verify(draft, lg, **kw)
+                    mx.eval(n, c)
+                    self.assertEqual(n.shape, (B,))
+                    self.assertEqual(c.shape, (B, 1))
+                    self.assertEqual(n.tolist(), [0] * B)
+                    self.assertEqual(c.tolist(), [[t] for t in bonus])
+
+    def test_spec_decode_verify_empty_batch(self):
+        # B = 0: empty, correctly shaped int32 results on every backend.
+        for K in (3, 0):
+            draft = mx.zeros((0, K), dtype=mx.int32)
+            lg = mx.zeros((0, K + 1, 8))
+            results = {}
+            for path, stream in (("default", None), ("cpu-fallback", mx.cpu)):
+                with self.subTest(K=K, path=path):
+                    kw = {"stream": stream} if stream is not None else {}
+                    n, c = mx.fast.spec_decode_verify(draft, lg, **kw)
+                    mx.eval(n, c)
+                    self.assertEqual((n.shape, n.dtype), ((0,), mx.int32))
+                    self.assertEqual((c.shape, c.dtype), ((0, K + 1), mx.int32))
+                    results[path] = (n.shape, n.dtype, c.shape, c.dtype)
+            with self.subTest(K=K, compare="default vs cpu"):
+                self.assertEqual(results["default"], results["cpu-fallback"])
+
+    def test_spec_decode_verify_rejects_non_integer_drafts(self):
+        lg = mx.zeros((1, 3, 8))
+        for dtype in (mx.float32, mx.float16, mx.bfloat16, mx.bool_):
+            draft = mx.array([[1.9, 0.0]]).astype(dtype)
+            for path, stream in (("default", None), ("cpu-fallback", mx.cpu)):
+                with self.subTest(dtype=dtype, path=path):
+                    kw = {"stream": stream} if stream is not None else {}
+                    with self.assertRaises(ValueError):
+                        mx.fast.spec_decode_verify(draft, lg, **kw)
+        for dtype in (mx.int64, mx.uint32, mx.int16):
+            with self.subTest(dtype=dtype):
+                draft = mx.array([[0, 0]], dtype=dtype)
+                n, c = mx.fast.spec_decode_verify(draft, lg)
+                self.assertEqual(n.tolist(), [2])
+
+    def test_spec_decode_verify_strided_inputs(self):
+        # Drafts and logits that are views, not dense rows: the fused kernel
+        # must see the logical values, like the CPU composition does.
+        def onehot(tokens, V=8):
+            lg = [[[-10.0] * V for _ in row] for row in tokens]
+            for b, row in enumerate(tokens):
+                for j, t in enumerate(row):
+                    lg[b][j][t] = 10.0
+            return mx.array(lg)
+
+        full = mx.array([[9, 1, 2, 9], [9, 3, 4, 9]], dtype=mx.int32)
+        logits = onehot([[1, 2, 5], [3, 4, 6]])
+        cases = [
+            # (name, draft view, target logits, expected n, expected committed)
+            (
+                "transposed",
+                mx.array([[1, 3], [2, 4]], dtype=mx.int32).T,
+                logits,
+                [2, 2],
+                [[1, 2, 5], [3, 4, 6]],
+            ),
+            (
+                "broadcast",
+                mx.broadcast_to(mx.array([[1, 2]], dtype=mx.int32), (2, 2)),
+                onehot([[1, 2, 5], [1, 2, 6]]),
+                [2, 2],
+                [[1, 2, 5], [1, 2, 6]],
+            ),
+            ("sliced", full[:, 1:3], logits, [2, 2], [[1, 2, 5], [3, 4, 6]]),
+            (
+                # Dense draft: isolates the logits view (argmax reads strides).
+                "transposed-logits",
+                mx.array([[1, 2], [3, 4]], dtype=mx.int32),
+                mx.swapaxes(mx.swapaxes(logits, 0, 1).astype(mx.float16), 0, 1),
+                [2, 2],
+                [[1, 2, 5], [3, 4, 6]],
+            ),
+            (
+                "mismatch-transposed",
+                mx.array([[1, 3], [7, 4]], dtype=mx.int32).T,
+                logits,
+                [1, 2],
+                [[1, 2, 0], [3, 4, 6]],
+            ),
+        ]
+        for name, draft, lg, exp_n, exp_c in cases:
+            for path, stream in (("default", None), ("cpu-fallback", mx.cpu)):
+                with self.subTest(case=name, path=path):
+                    kw = {"stream": stream} if stream is not None else {}
+                    n, c = mx.fast.spec_decode_verify(draft, lg, **kw)
+                    mx.eval(n, c)
+                    self.assertEqual(n.tolist(), exp_n)
+                    got = c.tolist()
+                    # Positions past the bonus token are unspecified.
+                    self.assertEqual(
+                        [got[b][: exp_n[b] + 1] for b in range(len(exp_n))],
+                        [exp_c[b][: exp_n[b] + 1] for b in range(len(exp_n))],
+                    )
 
 
 if __name__ == "__main__":
