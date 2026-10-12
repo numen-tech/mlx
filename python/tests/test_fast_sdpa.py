@@ -1330,6 +1330,29 @@ class TestFastSDPA(mlx_tests.MLXTestCase):
                     q, k, v, scale=512**-0.5, force_fused=True
                 )
 
+        # Head dim 512 vector attention defaults to GPU generation 17 or newer;
+        # setting MLX_SDPA_D512_MIN_KL enables it on every generation.
+        arch = mx.device_info()["architecture"]
+        arch_gen = int(arch[-3:-1]) if arch[-3:-1].isdigit() else 0
+        q, k, v = make_qkv(1, 2048, 512, qH=8, kH=1)
+        ref = mlx_ref_attn(q, k, v, scale=512**-0.5)
+        with mlx_tests.scoped_env(MLX_SDPA_D512_MIN_KL=None):
+            if arch_gen < 17:
+                with self.assertRaisesRegex(ValueError, "GPU generation 17"):
+                    mx.fast.scaled_dot_product_attention(
+                        q, k, v, scale=512**-0.5, force_fused=True
+                    )
+            else:
+                out = mx.fast.scaled_dot_product_attention(
+                    q, k, v, scale=512**-0.5, force_fused=True
+                )
+                self.assertTrue(mx.allclose(ref, out, atol=1e-3, rtol=1e-3))
+        with mlx_tests.scoped_env(MLX_SDPA_D512_MIN_KL="1024"):
+            out = mx.fast.scaled_dot_product_attention(
+                q, k, v, scale=512**-0.5, force_fused=True
+            )
+            self.assertTrue(mx.allclose(ref, out, atol=1e-3, rtol=1e-3))
+
         # No CPU fused kernel.
         with mx.stream(mx.cpu):
             q, k, v = make_qkv(8, 128, 8)
