@@ -1018,9 +1018,16 @@ std::tuple<bool, std::string> has_fused_kernel(
     }
     // Head dim 512 uses the generic vector kernel, reading K/V is its main
     // cost. By default, use it only for one query, GQA factor 8, and no array
-    // mask.
+    // mask, and only on GPU generation 17 or newer: on an M3 Max (generation
+    // 15) it decodes Gemma 4 E2B (8 query heads, 1 KV head) 3-4% slower than
+    // the fallback beyond 1024 keys. Setting MLX_SDPA_D512_MIN_KL enables it
+    // on every generation.
     if (query_head_dim == 512) {
-      int min_key_sequence_length = env::get_var("MLX_SDPA_D512_MIN_KL", 1024);
+      int env_min_key_sequence_length =
+          env::get_var("MLX_SDPA_D512_MIN_KL", -1);
+      bool use_default = (env_min_key_sequence_length < 0);
+      int min_key_sequence_length =
+          use_default ? 1024 : env_min_key_sequence_length;
       bool always = (min_key_sequence_length == 0);
       if (!always && query_sequence_length != 1) {
         msg << "the vector attention kernel for head dim 512 defaults to "
@@ -1043,6 +1050,13 @@ std::tuple<bool, std::string> has_fused_kernel(
         msg << "the vector attention kernel for head dim 512 requires at "
             << "least " << min_key_sequence_length << " keys; got key length "
             << key_sequence_length << ".";
+        return {false, msg.str()};
+      }
+      int arch_gen = metal::device(s.device).get_architecture_gen();
+      if (use_default && arch_gen < 17) {
+        msg << "the vector attention kernel for head dim 512 defaults to GPU "
+            << "generation 17 or newer unless MLX_SDPA_D512_MIN_KL is set; got "
+            << "generation " << arch_gen << ".";
         return {false, msg.str()};
       }
     }
