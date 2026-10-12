@@ -749,6 +749,47 @@ class TestExportImport(mlx_tests.MLXTestCase):
         imported = mx.import_function(path)
         self.assertTrue(mx.array_equal(imported(x, y, z)[0], fun(x, y, z)))
 
+    def test_export_import_spec_decode_verify(self):
+        def fun(draft, logits):
+            return mx.fast.spec_decode_verify(draft, logits)
+
+        def onehot(tokens, V=8):
+            lg = [[[-10.0] * V for _ in row] for row in tokens]
+            for b, row in enumerate(tokens):
+                for j, t in enumerate(row):
+                    lg[b][j][t] = 10.0
+            return mx.array(lg)
+
+        # On Metal, B > 0 and K > 0 run the fused primitive; K = 0 and B = 0
+        # take the op composition.
+        cases = [
+            ("full-accept", [[5, 6, 7]], [[5, 6, 7, 1]], [3]),
+            ("reject@0", [[5, 6, 7]], [[2, 6, 7, 1]], [0]),
+            ("batch2", [[1, 2, 3], [1, 2, 3]], [[1, 4, 3, 5], [1, 2, 3, 6]], [1, 3]),
+            ("K=0", [[], []], [[5], [3]], [0, 0]),
+        ]
+        path = os.path.join(self.test_dir, "spec_decode_verify.mlxfn")
+        for name, draft, target, expected in cases:
+            with self.subTest(case=name):
+                K = len(target[0]) - 1
+                draft = mx.array(draft, dtype=mx.int32).reshape(len(target), K)
+                logits = onehot(target)
+                mx.export_function(path, fun, draft, logits)
+                imported = mx.import_function(path)
+                n, committed = imported(draft, logits)
+                n_ref, committed_ref = fun(draft, logits)
+                self.assertEqual(n.tolist(), expected)
+                self.assertTrue(mx.array_equal(n, n_ref))
+                self.assertTrue(mx.array_equal(committed, committed_ref))
+
+        with self.subTest(case="B=0"):
+            draft = mx.zeros((0, 3), dtype=mx.int32)
+            logits = mx.zeros((0, 4, 8))
+            mx.export_function(path, fun, draft, logits)
+            n, committed = mx.import_function(path)(draft, logits)
+            self.assertEqual((n.shape, n.dtype), ((0,), mx.int32))
+            self.assertEqual((committed.shape, committed.dtype), ((0, 4), mx.int32))
+
     def test_export_matmul_shapeless_mid_dim(self):
         path = os.path.join(self.test_dir, "matmul_shapeless.mlxfn")
 
