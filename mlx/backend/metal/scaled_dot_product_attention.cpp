@@ -1017,11 +1017,8 @@ std::tuple<bool, std::string> has_fused_kernel(
       return {false, msg.str()};
     }
     // Head dim 512 uses the generic vector kernel, reading K/V is its main
-    // cost. By default, use it only for one query, GQA factor 8, and no array
-    // mask, and only on GPU generation 17 or newer: on an M3 Max (generation
-    // 15) it decodes Gemma 4 E2B (8 query heads, 1 KV head) 3-4% slower than
-    // the fallback beyond 1024 keys. Setting MLX_SDPA_D512_MIN_KL enables it
-    // on every generation.
+    // cost. By default, use it only for one query, GQA factor 8, no array mask
+    // and GPU generation 17+; setting MLX_SDPA_D512_MIN_KL lifts the gen gate.
     if (query_head_dim == 512) {
       int env_min_key_sequence_length =
           env::get_var("MLX_SDPA_D512_MIN_KL", -1);
