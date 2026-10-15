@@ -1490,7 +1490,9 @@ class TestFast(mlx_tests.MLXTestCase):
             ([[]], [[7]]),
             ([[], []], [[7], [2]]),
         ]
-        for device in (mx.cpu, mx.gpu):
+        # CUDA GPU streams still take the shape-dependent composition.
+        devices = [mx.cpu] + ([mx.gpu] if mx.metal.is_available() else [])
+        for device in devices:
             for first in ("K>0", "K=0"):
                 order = cases if first == "K>0" else cases[::-1]
                 fun = mx.compile(mx.fast.spec_decode_verify, shapeless=True)
