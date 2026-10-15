@@ -874,9 +874,8 @@ METAL_FUNC void qmv_quad_impl(
     const device T* sl = scales + row * in_vec_size_g * quads_per_simd;
     const device T* bl = biases + row * in_vec_size_g * quads_per_simd;
 
-    // Rows past out_vec_size exist only on a ragged last tile (N % 64 != 0):
-    // read no scale or bias for them (gemma4-qat#302; the store below was
-    // already guarded).
+    // Rows past out_vec_size occur only on a ragged last tile: skip their
+    // scale and bias reads.
     if (row * quads_per_simd + out_row < out_vec_size) {
       U s = sl[0];
       U b = affine_bias<U, T, bits, false, implied_bias>(s, f, sl[0], bl);
