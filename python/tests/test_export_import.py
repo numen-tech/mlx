@@ -760,8 +760,8 @@ class TestExportImport(mlx_tests.MLXTestCase):
                     lg[b][j][t] = 10.0
             return mx.array(lg)
 
-        # On Metal, B > 0 and K > 0 run the fused primitive; K = 0 and B = 0
-        # take the op composition.
+        # B > 0 runs the primitive (K = 0 included); B = 0 returns empty
+        # arrays without it.
         cases = [
             ("full-accept", [[5, 6, 7]], [[5, 6, 7, 1]], [3]),
             ("reject@0", [[5, 6, 7]], [[2, 6, 7, 1]], [0]),

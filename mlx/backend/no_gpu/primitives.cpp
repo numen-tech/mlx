@@ -73,7 +73,7 @@ bool fast::GatedDeltaUpdateVJP::use_fallback(
 }
 
 bool fast::SpecDecodeVerify::use_fallback(Stream s) {
-  return true;
+  return false;
 }
 NO_GPU_MULTI(fast::SpecDecodeVerify)
 

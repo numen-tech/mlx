@@ -1246,7 +1246,7 @@ bool ConvertFP8::is_equivalent(const Primitive& other) const {
 }
 
 // The verify as a plain op composition on (draft_tokens [B, K], target_tokens
-// [B, K+1]). It is the CPU path, the fallback for transforms, and the oracle.
+// [B, K+1]). It is the fallback for transforms and for backends with no kernel.
 static std::vector<array> spec_decode_verify_composition(
     const std::vector<array>& inputs,
     Stream s) {
@@ -1326,9 +1326,8 @@ std::vector<array> spec_decode_verify(
   auto tgt = astype(argmax(target_logits, -1, false, s), int32, s); // [B, K+1]
 
   std::vector<array> prim_inputs = {dft, tgt};
-  // K = 0 also takes the composition: an empty draft has no buffer to bind
-  // at the kernel's index 0 (the Metal API validation layer rejects that).
-  if (K == 0 || SpecDecodeVerify::use_fallback(s)) {
+  // Every K takes the primitive, so a shapeless compile does not fix K.
+  if (SpecDecodeVerify::use_fallback(s)) {
     return spec_decode_verify_composition(prim_inputs, s);
   }
   return array::make_arrays(

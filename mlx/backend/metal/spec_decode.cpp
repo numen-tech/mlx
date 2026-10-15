@@ -27,8 +27,7 @@ array ensure_row_contiguous(const array& x, const Stream& s) {
 } // namespace
 
 bool SpecDecodeVerify::use_fallback(Stream s) {
-  // Fused kernel only on the GPU; CPU uses the op-level composition fallback.
-  return s.device == Device::cpu;
+  return false;
 }
 
 void SpecDecodeVerify::eval_gpu(
@@ -51,7 +50,8 @@ void SpecDecodeVerify::eval_gpu(
   auto kernel = d.get_kernel("spec_decode_verify");
   auto& compute_encoder = metal::get_command_encoder(s);
   compute_encoder.set_compute_pipeline_state(kernel);
-  compute_encoder.set_input_array(draft, 0);
+  // K = 0 has no draft buffer, and the kernel reads none: bind target there.
+  compute_encoder.set_input_array(K > 0 ? draft : target, 0);
   compute_encoder.set_input_array(target, 1);
   compute_encoder.set_output_array(n_accepted, 2);
   compute_encoder.set_output_array(committed, 3);

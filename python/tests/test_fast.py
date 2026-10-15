@@ -1360,8 +1360,8 @@ class TestFast(mlx_tests.MLXTestCase):
     def test_spec_decode_verify(self):
         # Validate mx.fast.spec_decode_verify against a pure-Python oracle that
         # mirrors the greedy verify loop. On a Metal build the default device
-        # exercises the fused kernel and stream=mx.cpu the op-composition
-        # fallback; both must agree with the oracle.
+        # exercises the fused kernel and stream=mx.cpu the CPU kernel; both
+        # must agree with the oracle.
         def oracle(draft, tgt_tokens):
             B, K = len(draft), len(draft[0])
             n_acc, committed = [], []
@@ -1409,8 +1409,8 @@ class TestFast(mlx_tests.MLXTestCase):
             ("batch3-K1", [[7], [7], [7]], [[7, 1], [2, 3], [7, 9]]),
         ]
         # stream=None is the default device (fused kernel on Metal); mx.cpu is
-        # the op-composition fallback.
-        for path, stream in (("default", None), ("cpu-fallback", mx.cpu)):
+        # the CPU kernel.
+        for path, stream in (("default", None), ("cpu", mx.cpu)):
             for dtype in (mx.float32, mx.float16, mx.bfloat16):
                 for name, draft, tgt in cases:
                     with self.subTest(path=path, dtype=str(dtype), case=name):
@@ -1440,14 +1440,14 @@ class TestFast(mlx_tests.MLXTestCase):
 
     def test_spec_decode_verify_empty_draft(self):
         # K = 0: nothing to accept, the bonus token is the argmax at the only
-        # position. The CPU composition must match the fused kernel.
+        # position. The CPU kernel must match the fused kernel.
         for B, bonus in ((1, [5]), (2, [5, 3])):
             lg = [[[-10.0] * 8] for _ in range(B)]
             for b, t in enumerate(bonus):
                 lg[b][0][t] = 10.0
             lg = mx.array(lg)
             draft = mx.zeros((B, 0), dtype=mx.int32)
-            for path, stream in (("default", None), ("cpu-fallback", mx.cpu)):
+            for path, stream in (("default", None), ("cpu", mx.cpu)):
                 with self.subTest(B=B, path=path):
                     kw = {"stream": stream} if stream is not None else {}
                     n, c = mx.fast.spec_decode_verify(draft, lg, **kw)
@@ -1463,7 +1463,7 @@ class TestFast(mlx_tests.MLXTestCase):
             draft = mx.zeros((0, K), dtype=mx.int32)
             lg = mx.zeros((0, K + 1, 8))
             results = {}
-            for path, stream in (("default", None), ("cpu-fallback", mx.cpu)):
+            for path, stream in (("default", None), ("cpu", mx.cpu)):
                 with self.subTest(K=K, path=path):
                     kw = {"stream": stream} if stream is not None else {}
                     n, c = mx.fast.spec_decode_verify(draft, lg, **kw)
@@ -1472,13 +1472,47 @@ class TestFast(mlx_tests.MLXTestCase):
                     self.assertEqual((c.shape, c.dtype), ((0, K + 1), mx.int32))
                     results[path] = (n.shape, n.dtype, c.shape, c.dtype)
             with self.subTest(K=K, compare="default vs cpu"):
-                self.assertEqual(results["default"], results["cpu-fallback"])
+                self.assertEqual(results["default"], results["cpu"])
+
+    def test_spec_decode_verify_shapeless_compile(self):
+        # One shapeless compile must serve every K, whichever K it traced first.
+        def onehot(rows, V=16):
+            lg = [[[-10.0] * V for _ in row] for row in rows]
+            for b, row in enumerate(rows):
+                for j, t in enumerate(row):
+                    lg[b][j][t] = 10.0
+            return mx.array(lg)
+
+        cases = [
+            ([[1, 2, 3]], [[1, 4, 3, 5]]),
+            ([[1, 2, 3, 4, 5]], [[1, 2, 3, 4, 5, 6]]),
+            ([[1, 2], [3, 4]], [[1, 2, 9], [3, 0, 9]]),
+            ([[]], [[7]]),
+            ([[], []], [[7], [2]]),
+        ]
+        for device in (mx.cpu, mx.gpu):
+            for first in ("K>0", "K=0"):
+                order = cases if first == "K>0" else cases[::-1]
+                fun = mx.compile(mx.fast.spec_decode_verify, shapeless=True)
+                with mx.stream(device):
+                    for draft, target in order:
+                        K = len(target[0]) - 1
+                        draft = mx.array(draft, dtype=mx.int32)
+                        draft = draft.reshape(len(target), K)
+                        logits = onehot(target)
+                        with self.subTest(device=device, first=first, K=K):
+                            n, c = fun(draft, logits)
+                            n_ref, c_ref = mx.fast.spec_decode_verify(draft, logits)
+                            self.assertEqual(n.shape, n_ref.shape)
+                            self.assertEqual(c.shape, c_ref.shape)
+                            self.assertTrue(mx.array_equal(n, n_ref))
+                            self.assertTrue(mx.array_equal(c, c_ref))
 
     def test_spec_decode_verify_rejects_non_integer_drafts(self):
         lg = mx.zeros((1, 3, 8))
         for dtype in (mx.float32, mx.float16, mx.bfloat16, mx.bool_):
             draft = mx.array([[1.9, 0.0]]).astype(dtype)
-            for path, stream in (("default", None), ("cpu-fallback", mx.cpu)):
+            for path, stream in (("default", None), ("cpu", mx.cpu)):
                 with self.subTest(dtype=dtype, path=path):
                     kw = {"stream": stream} if stream is not None else {}
                     with self.assertRaises(ValueError):
@@ -1491,7 +1525,7 @@ class TestFast(mlx_tests.MLXTestCase):
 
     def test_spec_decode_verify_strided_inputs(self):
         # Drafts and logits that are views, not dense rows: the fused kernel
-        # must see the logical values, like the CPU composition does.
+        # must see the logical values, like the CPU kernel does.
         def onehot(tokens, V=8):
             lg = [[[-10.0] * V for _ in row] for row in tokens]
             for b, row in enumerate(tokens):
@@ -1535,7 +1569,7 @@ class TestFast(mlx_tests.MLXTestCase):
             ),
         ]
         for name, draft, lg, exp_n, exp_c in cases:
-            for path, stream in (("default", None), ("cpu-fallback", mx.cpu)):
+            for path, stream in (("default", None), ("cpu", mx.cpu)):
                 with self.subTest(case=name, path=path):
                     kw = {"stream": stream} if stream is not None else {}
                     n, c = mx.fast.spec_decode_verify(draft, lg, **kw)
