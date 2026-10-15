@@ -1438,6 +1438,14 @@ class TestFast(mlx_tests.MLXTestCase):
                 mx.zeros((1, 3), dtype=mx.int32), mx.zeros((1, 3, 8))
             )
 
+        # An empty vocab has no argmax, for any B.
+        for B in (1, 0):
+            with self.subTest(empty_vocab=B):
+                with self.assertRaises(ValueError):
+                    mx.fast.spec_decode_verify(
+                        mx.zeros((B, 2), dtype=mx.int32), mx.zeros((B, 3, 0))
+                    )
+
     def test_spec_decode_verify_empty_draft(self):
         # K = 0: nothing to accept, the bonus token is the argmax at the only
         # position. The CPU kernel must match the fused kernel.
@@ -1507,6 +1515,47 @@ class TestFast(mlx_tests.MLXTestCase):
                             n_ref, c_ref = mx.fast.spec_decode_verify(draft, logits)
                             self.assertEqual(n.shape, n_ref.shape)
                             self.assertEqual(c.shape, c_ref.shape)
+                            self.assertTrue(mx.array_equal(n, n_ref))
+                            self.assertTrue(mx.array_equal(c, c_ref))
+
+    def test_spec_decode_verify_shapeless_compile_batch(self):
+        # One shapeless compile must serve every B, B = 0 included, whichever
+        # B it traced first.
+        V = 16
+
+        def onehot(rows, K):
+            lg = [[[-10.0] * V for _ in row] for row in rows]
+            for b, row in enumerate(rows):
+                for j, t in enumerate(row):
+                    lg[b][j][t] = 10.0
+            return mx.array(lg).reshape(len(rows), K + 1, V)
+
+        # (K, draft, target) per call; B = len(target).
+        cases = [
+            (3, [], []),
+            (3, [[1, 2, 3]], [[1, 4, 3, 5]]),
+            (3, [[1, 2, 3], [3, 4, 9]], [[1, 2, 3, 5], [3, 0, 9, 9]]),
+            (0, [], []),
+            (0, [[], []], [[7], [2]]),
+            (1, [[7], [7], [7]], [[7, 1], [2, 3], [7, 9]]),
+        ]
+        # CUDA GPU streams still take the shape-dependent composition.
+        devices = [mx.cpu] + ([mx.gpu] if mx.metal.is_available() else [])
+        for device in devices:
+            for first in ("B=0", "B>0"):
+                order = cases if first == "B=0" else cases[1:] + cases[:1]
+                fun = mx.compile(mx.fast.spec_decode_verify, shapeless=True)
+                with mx.stream(device):
+                    for K, draft, target in order:
+                        B = len(target)
+                        draft = mx.array(draft, dtype=mx.int32).reshape(B, K)
+                        logits = onehot(target, K)
+                        with self.subTest(device=device, first=first, B=B, K=K):
+                            n, c = fun(draft, logits)
+                            n_ref, c_ref = mx.fast.spec_decode_verify(draft, logits)
+                            self.assertEqual(n.shape, n_ref.shape)
+                            self.assertEqual(c.shape, c_ref.shape)
+                            self.assertEqual((n.dtype, c.dtype), (mx.int32, mx.int32))
                             self.assertTrue(mx.array_equal(n, n_ref))
                             self.assertTrue(mx.array_equal(c, c_ref))
 

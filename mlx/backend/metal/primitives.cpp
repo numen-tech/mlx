@@ -63,6 +63,9 @@ void ArgReduce::eval_gpu(const std::vector<array>& inputs, array& out) {
   assert(inputs.size() == 1);
   auto& in = inputs[0];
   out.set_data(allocator::malloc(out.nbytes()));
+  if (out.size() == 0) {
+    return;
+  }
   auto& s = stream();
   auto& d = metal::device(s.device);
   std::string op_name;

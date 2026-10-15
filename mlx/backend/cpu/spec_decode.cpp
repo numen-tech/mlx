@@ -15,6 +15,9 @@ void SpecDecodeVerify::eval_cpu(
   auto& committed = outputs[1]; // [B, K+1] int32
   n_accepted.set_data(allocator::malloc(n_accepted.nbytes()));
   committed.set_data(allocator::malloc(committed.nbytes()));
+  if (n_accepted.size() == 0) {
+    return;
+  }
 
   auto& encoder = cpu::get_command_encoder(stream());
   encoder.set_input_array(draft);

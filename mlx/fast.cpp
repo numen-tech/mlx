@@ -1311,23 +1311,37 @@ std::vector<array> spec_decode_verify(
     throw std::invalid_argument(
         "[spec_decode_verify] target_logits.shape[1] must equal draft_tokens.shape[1] + 1.");
   }
+  if (target_logits.shape(2) == 0) {
+    throw std::invalid_argument(
+        "[spec_decode_verify] target_logits must have a non-empty vocab axis.");
+  }
   auto s = to_stream(s_);
 
-  // B = 0: nothing to verify. Return empty results without the argmax (which
-  // rejects a zero-size input) or the fused kernel.
-  if (B == 0) {
+  // CUDA GPU streams take the composition, which captures B and K as
+  // constants (arange, full, zeros), so it is not shapeless-safe for any
+  // change of B or K, B = 0 included. B = 0 returns empty results there
+  // without the argmax.
+  bool fallback = SpecDecodeVerify::use_fallback(s);
+  if (fallback && B == 0) {
     return {zeros(Shape{0}, int32, s), zeros(Shape{0, K + 1}, int32, s)};
   }
 
   // Reuse mlx's fast argmax on-device (result stays on the GPU); the fused
   // primitive does only the tiny per-row prefix-match. Primitive inputs are
-  // int32 token arrays, so the kernel needs no large-V reduction.
+  // int32 token arrays, so the kernel needs no large-V reduction. The ArgMax
+  // primitive is built directly because the argmax op rejects any zero-size
+  // input, B = 0 included; V > 0 is checked above.
   auto dft = astype(draft_tokens, int32, s);
-  auto tgt = astype(argmax(target_logits, -1, false, s), int32, s); // [B, K+1]
+  auto tgt = array(
+      Shape{B, K + 1, 1},
+      uint32,
+      std::make_shared<ArgReduce>(s, ArgReduce::ArgMax, 2),
+      {target_logits});
+  tgt = astype(squeeze(tgt, 2, s), int32, s); // [B, K+1]
 
   std::vector<array> prim_inputs = {dft, tgt};
-  // Every K takes the primitive, so a shapeless compile does not fix K.
-  if (SpecDecodeVerify::use_fallback(s)) {
+  // Every B and K takes the primitive, so a shapeless compile fixes neither.
+  if (fallback) {
     return spec_decode_verify_composition(prim_inputs, s);
   }
   return array::make_arrays(

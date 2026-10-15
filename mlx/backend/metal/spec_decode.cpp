@@ -42,6 +42,9 @@ void SpecDecodeVerify::eval_gpu(
 
   n_accepted.set_data(allocator::malloc(n_accepted.nbytes()));
   committed.set_data(allocator::malloc(committed.nbytes()));
+  if (n_accepted.size() == 0) {
+    return;
+  }
 
   int B = draft.shape(0);
   int K = draft.shape(1);
