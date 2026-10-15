@@ -782,6 +782,18 @@ class TestExportImport(mlx_tests.MLXTestCase):
                 self.assertTrue(mx.array_equal(n, n_ref))
                 self.assertTrue(mx.array_equal(committed, committed_ref))
 
+        with self.subTest(case="vmap"):
+            # Two independent [1, 3] verifies (accept 1, accept 3).
+            draft = mx.array([[[1, 2, 3]], [[1, 2, 3]]], dtype=mx.int32)
+            logits = mx.stack([onehot([[1, 4, 3, 5]]), onehot([[1, 2, 3, 6]])])
+            mx.export_function(path, fun, draft[0], logits[0])
+            imported = mx.import_function(path)
+            n, committed = mx.vmap(imported)(draft, logits)
+            n_ref, committed_ref = mx.vmap(fun)(draft, logits)
+            self.assertEqual(n.tolist(), [[1], [3]])
+            self.assertTrue(mx.array_equal(n, n_ref))
+            self.assertTrue(mx.array_equal(committed, committed_ref))
+
         with self.subTest(case="B=0"):
             draft = mx.zeros((0, 3), dtype=mx.int32)
             logits = mx.zeros((0, 4, 8))
