@@ -233,12 +233,8 @@ inline U qdot(
   U accum = 0;
 
   if (bits == 1) {
-    // 1-bit: read 32 packed weights as one 32-bit word (one load instead of
-    // four byte loads). Little-endian bit order and accumulation order are
-    // those of the per-byte path, so the result is bit-exact with it. Needs
-    // values_per_thread % 32 == 0 and a 4-byte aligned w, which every 1-bit
-    // caller (qmv_fast, qmv, qmv_quad with D == 128) provides.
-    // (numen-tech/gemma4-qat#179: large mobile decode win)
+    // One 32-bit load per 32 weights, bit-exact with the byte path. Needs
+    // values_per_thread % 32 == 0 and a 4-byte aligned w.
     const device uint32_t* w32 = (const device uint32_t*)w;
     for (int i = 0; i < (values_per_thread / 32); i++) {
       uint32_t wb = w32[i];
