@@ -905,6 +905,46 @@ class TestQuantized(mlx_tests.MLXTestCase):
                 self.assertTrue(mx.allclose(y, y_cpu, atol=1e-2, rtol=1e-2))
 
     @unittest.skipIf(not mx.metal.is_available(), "requires Metal")
+    def test_qmv_quad_ragged_n(self):
+        # qmv_quad (K = 128, or K = 64 at bits >= 2; power-of-two bits) runs
+        # ceil(N / 64) tiles with no N % 64 restriction. On a ragged last tile,
+        # quad rows past N must read no scale or bias (gemma4-qat#302). N = 65
+        # leaves one valid row in tile 2, N = 72 leaves eight. Explicit and
+        # implied (0-d factor) biases are both covered; affine_sym never reaches
+        # qmv_quad.
+        key = mx.random.key(7)
+        cases = [
+            (bits, gs, K) for bits in (1, 2, 4, 8) for gs in (32, 64) for K in (64, 128)
+        ]
+        for bits, gs, K in cases:
+            if K == 64 and bits == 1:
+                continue  # 1-bit qmv_quad needs K == 128
+            for N in (65, 72):
+                for implied in (False, True):
+                    with self.subTest(bits=bits, gs=gs, K=K, N=N, implied=implied):
+                        k1, k2, key = mx.random.split(key, 3)
+                        w = mx.random.normal((N, K), key=k1).astype(mx.float16)
+                        x = mx.random.normal((1, K), key=k2).astype(mx.float16)
+                        wq, s, b = mx.quantize(w, group_size=gs, bits=bits)
+                        if implied:
+                            f = -(2.0 ** (bits - 1)) if bits > 1 else -0.5
+                            b = mx.array(f, mx.float16)
+                            full = s * b
+                        else:
+                            full = b
+                        y = mx.quantized_matmul(
+                            x, wq, s, b, True, gs, bits, stream=mx.gpu
+                        )
+                        w_ref = mx.dequantize(wq, s, full, gs, bits, stream=mx.cpu)
+                        y_ref = x.astype(mx.float32) @ w_ref.astype(mx.float32).T
+                        self.assertEqual(y.shape, (1, N))
+                        self.assertTrue(
+                            mx.allclose(
+                                y.astype(mx.float32), y_ref, atol=2e-2, rtol=2e-2
+                            )
+                        )
+
+    @unittest.skipIf(not mx.metal.is_available(), "requires Metal")
     def test_fp_qmv_fast_unaligned_n(self):
         for n, k, mode, dtype, batched in product(
             [1, 3, 5, 7, 8, 9, 12, 17],
