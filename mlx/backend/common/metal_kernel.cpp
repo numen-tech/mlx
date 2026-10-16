@@ -358,11 +358,11 @@ CustomKernelFunction metal_kernel(
 
     auto key = variant_key(inputs, output_dtypes, template_args);
     std::shared_ptr<const KernelVariant> variant;
-    {
-      std::lock_guard lock(cache->mutex);
-      if (auto it = cache->variants.find(key); it != cache->variants.end()) {
-        variant = it->second;
-      }
+    // Build a missing variant under the lock, so concurrent first callers
+    // build it once.
+    std::unique_lock lock(cache->mutex);
+    if (auto it = cache->variants.find(key); it != cache->variants.end()) {
+      variant = it->second;
     }
     if (!variant) {
       std::string kernel_name = "custom_kernel_" + name;
@@ -421,16 +421,12 @@ CustomKernelFunction metal_kernel(
           std::move(kernel_name),
           std::make_shared<const std::string>(std::move(kernel_source)),
           source_hash});
-      std::lock_guard lock(cache->mutex);
-      if (auto it = cache->variants.find(key); it != cache->variants.end()) {
-        variant = it->second;
-      } else {
-        if (cache->variants.size() >= metal_kernel_max_cached_variants) {
-          cache->variants.clear();
-        }
-        cache->variants.emplace(std::move(key), variant);
+      if (cache->variants.size() >= metal_kernel_max_cached_variants) {
+        cache->variants.clear();
       }
+      cache->variants.emplace(std::move(key), variant);
     }
+    lock.unlock();
 
     if (verbose) {
       std::cout << "Generated source code for `" << name << "`:" << std::endl
