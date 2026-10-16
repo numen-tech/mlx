@@ -4,12 +4,8 @@
 
 using namespace metal;
 
-// Greedy speculative-decoding verify, one thread per batch row.
-//   draft   [B, K]    int32  — drafted tokens
-//   target  [B, K+1]  int32  — target argmax tokens over [last] + draft
-// Writes:
-//   n_accepted [B]      — longest matching prefix length (0..K)
-//   committed  [B, K+1] — draft prefix (< n) then the corrected token at n.
+// Greedy speculative-decode verify, one thread per row: n_accepted is the
+// matching draft prefix length, committed is that prefix then the target token.
 [[kernel]] void spec_decode_verify(
     const device int* draft [[buffer(0)]],
     const device int* target [[buffer(1)]],

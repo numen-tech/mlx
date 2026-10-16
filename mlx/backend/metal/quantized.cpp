@@ -156,13 +156,8 @@ inline int get_qmv_batch_limit(int D, int O, metal::Device& d) {
   }
 }
 
-// Block of qmv_fast_impl (kernels/quantized.h): pack_factor *
-// packs_per_thread * SIMD_SIZE, with one pack per lane for bits <= 2 (must
-// match the kernel). The affine kernel's partial last block only needs
-// K % values_per_thread == 0, which K % group_size already implies; block / 2
-// is the cutoff measured for 1/4-bit, and the other widths stay whole-block
-// until benchmarked. fp_qmv_fast_impl has no tail, so the fp modes (which
-// share bits == 4) keep the whole block.
+// K alignment for qmv_fast_impl; the block must match the kernel. Affine
+// 1/4-bit takes half a block (measured), the rest a whole block.
 inline int qmv_fast_k_alignment(int bits, const std::string& mode) {
   int block = get_pack_factor(bits, 32) * (bits <= 2 ? 1 : 2) * 32;
   bool affine = mode == "affine" || mode == "affine_sym";
