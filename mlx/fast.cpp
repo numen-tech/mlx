@@ -1317,11 +1317,14 @@ std::vector<array> spec_decode_verify(
   }
   auto s = to_stream(s_);
 
-  // CUDA GPU streams take the composition, which captures B and K as
-  // constants (arange, full, zeros), so it is not shapeless-safe for any
-  // change of B or K, B = 0 included. B = 0 returns empty results there
-  // without the argmax.
+  // CUDA GPU streams take the composition, which fixes B and K at trace
+  // time (arange, full, zeros): refuse a shapeless trace, not a stale graph.
   bool fallback = SpecDecodeVerify::use_fallback(s);
+  if (fallback && detail::in_dynamic_tracing()) {
+    throw std::invalid_argument(
+        "[spec_decode_verify] Shapeless compile is not supported on this "
+        "stream; compile with shapeless=False.");
+  }
   if (fallback && B == 0) {
     return {zeros(Shape{0}, int32, s), zeros(Shape{0, K + 1}, int32, s)};
   }
@@ -1340,7 +1343,8 @@ std::vector<array> spec_decode_verify(
   tgt = astype(squeeze(tgt, 2, s), int32, s); // [B, K+1]
 
   std::vector<array> prim_inputs = {dft, tgt};
-  // Every B and K takes the primitive, so a shapeless compile fixes neither.
+  // Off CUDA every B and K takes the primitive, so a shapeless compile fixes
+  // neither.
   if (fallback) {
     return spec_decode_verify_composition(prim_inputs, s);
   }
