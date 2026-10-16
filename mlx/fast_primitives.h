@@ -505,6 +505,9 @@ class Quantize : public Custom {
 
 using ScalarArg = std::variant<bool, int, float>;
 
+// The most variants that one metal_kernel function keeps built.
+inline constexpr size_t metal_kernel_max_cached_variants = 64;
+
 class CustomKernel : public Primitive {
  public:
   CustomKernel(
@@ -520,9 +523,40 @@ class CustomKernel : public Primitive {
       bool is_precompiled,
       int shared_memory,
       CompileOptions::Data compile_options = {})
+      : CustomKernel(
+            stream,
+            std::move(name),
+            std::make_shared<const std::string>(std::move(source)),
+            grid,
+            threadgroup,
+            std::move(shape_infos),
+            ensure_row_contiguous,
+            init_value,
+            std::move(scalar_arguments),
+            is_precompiled,
+            shared_memory,
+            compile_options) {}
+
+  // Kernels built from one source can share it and its hash.
+  CustomKernel(
+      Stream stream,
+      std::string name,
+      std::shared_ptr<const std::string> source,
+      std::tuple<int, int, int> grid,
+      std::tuple<int, int, int> threadgroup,
+      std::vector<std::tuple<bool, bool, bool>> shape_infos,
+      bool ensure_row_contiguous,
+      std::optional<float> init_value,
+      std::vector<ScalarArg> scalar_arguments,
+      bool is_precompiled,
+      int shared_memory,
+      CompileOptions::Data compile_options,
+      std::optional<size_t> source_hash = std::nullopt)
       : Primitive(stream),
         name_(std::move(name)),
         source_(std::move(source)),
+        source_hash_(
+            source_hash ? *source_hash : std::hash<std::string>{}(*source_)),
         grid_(grid),
         threadgroup_(threadgroup),
         shape_infos_(std::move(shape_infos)),
@@ -545,7 +579,7 @@ class CustomKernel : public Primitive {
   auto state() const {
     return std::make_tuple(
         name_,
-        source_,
+        *source_,
         grid_,
         threadgroup_,
         shape_infos_,
@@ -557,9 +591,14 @@ class CustomKernel : public Primitive {
         compile_options_);
   }
 
+  const std::shared_ptr<const std::string>& shared_source() const {
+    return source_;
+  }
+
  private:
   std::string name_;
-  std::string source_;
+  std::shared_ptr<const std::string> source_;
+  size_t source_hash_;
   std::tuple<int, int, int> grid_;
   std::tuple<int, int, int> threadgroup_;
   std::vector<std::tuple<bool, bool, bool>> shape_infos_;
@@ -569,6 +608,23 @@ class CustomKernel : public Primitive {
   bool is_precompiled_;
   int shared_memory_;
   CompileOptions::Data compile_options_;
+};
+
+// Greedy speculative-decoding verify on int32 [B, K] and [B, K+1] tokens.
+class SpecDecodeVerify : public Custom {
+ public:
+  explicit SpecDecodeVerify(Stream stream);
+
+  static bool use_fallback(Stream stream);
+
+  void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override;
+  void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override;
+
+  DEFINE_NAME(SpecDecodeVerify);
+  bool is_equivalent(const Primitive& other) const override;
+  std::vector<Shape> output_shapes(const std::vector<array>& inputs) override;
 };
 
 } // namespace mlx::core::fast

@@ -49,6 +49,10 @@ NO_GPU_MULTI(SVD)
 NO_GPU(Inverse)
 NO_GPU_MULTI(Eig)
 NO_GPU_MULTI(Eigh)
+bool fast::SpecDecodeVerify::use_fallback(Stream s) {
+  return s.device == Device::gpu;
+}
+NO_GPU_MULTI(fast::SpecDecodeVerify)
 
 namespace fast {
 NO_GPU_MULTI(GatedDeltaUpdate)

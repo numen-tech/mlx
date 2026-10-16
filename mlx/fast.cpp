@@ -1245,4 +1245,127 @@ bool ConvertFP8::is_equivalent(const Primitive& other) const {
   return to_fp8_ == a_other.to_fp8_;
 }
 
+// The verify as a plain op composition on (draft_tokens [B, K], target_tokens
+// [B, K+1]). It is the fallback for transforms and for backends with no kernel.
+static std::vector<array> spec_decode_verify_composition(
+    const std::vector<array>& inputs,
+    Stream s) {
+  int B = inputs[0].shape(0);
+  int K = inputs[0].shape(1);
+  auto d = inputs[0]; // [B, K] int32
+  auto t = inputs[1]; // [B, K+1] int32
+  if (K == 0) {
+    // Nothing to accept; committed is the bonus token t[:, 0], as the
+    // fused kernel writes it. (min over the empty axis below would throw.)
+    return {zeros(Shape{B}, int32, s), t};
+  }
+  auto t_pref = slice(t, Shape{0, 0}, Shape{B, K}, s);
+  auto mism = not_equal(d, t_pref, s);
+  auto j = broadcast_to(
+      reshape(arange(K, int32, s), Shape{1, K}, s), Shape{B, K}, s);
+  auto n_acc =
+      min(where(mism, j, full(Shape{B, K}, K, int32, s), s),
+          /*axis=*/1,
+          /*keepdims=*/false,
+          s); // [B]
+  auto n_acc2 = reshape(n_acc, Shape{B, 1}, s);
+  auto corrected = take_along_axis(t, n_acc2, /*axis=*/1, s); // [B, 1]
+  auto j1 = broadcast_to(
+      reshape(arange(K + 1, int32, s), Shape{1, K + 1}, s), Shape{B, K + 1}, s);
+  auto nacc_b = broadcast_to(n_acc2, Shape{B, K + 1}, s);
+  auto d_ext = concatenate({d, zeros(Shape{B, 1}, int32, s)}, /*axis=*/1, s);
+  auto corr_b = broadcast_to(corrected, Shape{B, K + 1}, s);
+  auto committed = where(
+      less(j1, nacc_b, s),
+      d_ext,
+      where(equal(j1, nacc_b, s), corr_b, zeros(Shape{B, K + 1}, int32, s), s),
+      s);
+  return {n_acc, committed};
+}
+
+std::vector<array> spec_decode_verify(
+    const array& draft_tokens,
+    const array& target_logits,
+    StreamOrDevice s_ /* = {} */) {
+  if (draft_tokens.ndim() != 2) {
+    throw std::invalid_argument(
+        "[spec_decode_verify] draft_tokens must be 2D [B, K].");
+  }
+  if (target_logits.ndim() != 3) {
+    throw std::invalid_argument(
+        "[spec_decode_verify] target_logits must be 3D [B, K+1, V].");
+  }
+  if (!issubdtype(draft_tokens.dtype(), integer)) {
+    std::ostringstream msg;
+    msg << "[spec_decode_verify] draft_tokens must be integer token ids but got "
+        << draft_tokens.dtype() << ".";
+    throw std::invalid_argument(msg.str());
+  }
+  int B = draft_tokens.shape(0);
+  int K = draft_tokens.shape(1);
+  if (target_logits.shape(0) != B) {
+    throw std::invalid_argument(
+        "[spec_decode_verify] draft_tokens and target_logits batch size must match.");
+  }
+  if (target_logits.shape(1) != K + 1) {
+    throw std::invalid_argument(
+        "[spec_decode_verify] target_logits.shape[1] must equal draft_tokens.shape[1] + 1.");
+  }
+  if (target_logits.shape(2) == 0) {
+    throw std::invalid_argument(
+        "[spec_decode_verify] target_logits must have a non-empty vocab axis.");
+  }
+  auto s = to_stream(s_);
+
+  // CUDA GPU streams take the composition, which fixes B and K at trace
+  // time (arange, full, zeros): refuse a shapeless trace, not a stale graph.
+  bool fallback = SpecDecodeVerify::use_fallback(s);
+  if (fallback && detail::in_dynamic_tracing()) {
+    throw std::invalid_argument(
+        "[spec_decode_verify] Shapeless compile is not supported on this "
+        "stream; compile with shapeless=False.");
+  }
+  if (fallback && B == 0) {
+    return {zeros(Shape{0}, int32, s), zeros(Shape{0, K + 1}, int32, s)};
+  }
+
+  // Build ArgMax directly, because the argmax op rejects a zero-size input
+  // (B = 0). The fused kernel then does only the per-row prefix match.
+  auto dft = astype(draft_tokens, int32, s);
+  auto tgt = array(
+      Shape{B, K + 1, 1},
+      uint32,
+      std::make_shared<ArgReduce>(s, ArgReduce::ArgMax, 2),
+      {target_logits});
+  tgt = astype(squeeze(tgt, 2, s), int32, s); // [B, K+1]
+
+  std::vector<array> prim_inputs = {dft, tgt};
+  // Off CUDA every B and K takes the primitive, so a shapeless compile fixes
+  // neither.
+  if (fallback) {
+    return spec_decode_verify_composition(prim_inputs, s);
+  }
+  return array::make_arrays(
+      {Shape{B}, Shape{B, K + 1}},
+      {int32, int32},
+      std::make_shared<SpecDecodeVerify>(s),
+      prim_inputs);
+}
+
+SpecDecodeVerify::SpecDecodeVerify(Stream stream)
+    : Custom(stream, [stream](std::vector<array> inputs) {
+        return spec_decode_verify_composition(inputs, stream);
+      }) {}
+
+bool SpecDecodeVerify::is_equivalent(const Primitive&) const {
+  return true; // no parameters
+}
+
+std::vector<Shape> SpecDecodeVerify::output_shapes(
+    const std::vector<array>& inputs) {
+  int B = inputs[0].shape(0);
+  int K = inputs[0].shape(1);
+  return {Shape{B}, Shape{B, K + 1}};
+}
+
 } // namespace mlx::core::fast
