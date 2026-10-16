@@ -609,11 +609,8 @@ void qmv(
   compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
 }
 
-// affine qmv_wide only beats qmv on gen-15+; fp benefits on every gen.
-// affine_sym has no qmv_wide kernel. The 1-bit path has so little weight
-// traffic that unpacking into registers dominates even when several input
-// rows reuse the result. The 2-bit path breaks even after two rows and wins
-// once three or more rows share a block.
+// affine qmv_wide beats qmv only on gen-15+, and not at 1-bit or at 2-bit with
+// M < 3 (measured); fp gains on every gen. affine_sym has no qmv_wide kernel.
 inline bool
 use_qmv_wide(const std::string& mode, int bits, int M, metal::Device& d) {
   if (mode == "affine_sym") {
@@ -1296,10 +1293,8 @@ void qmm(
   std::string template_def;
   MTL::ComputePipelineState* kernel;
   const bool implied_bias = is_implied_bias(biases);
-  // The implied-bias variants spell out has_global_scale (an implied bias is a
-  // bias, so it never comes with a global scale) and the default tile sizes
-  // (BM/BK/BN = 32) so the trailing `implied_bias` template argument lands in
-  // its slot.
+  // Implied-bias variants spell out has_global_scale (false) and the default
+  // tiles (32), so the trailing `implied_bias` argument lands in its slot.
   if (transpose) {
     kernel = implied_bias ? get_quantized_kernel_wrapped(
                                 d,
@@ -2082,9 +2077,7 @@ void dispatch_qmv(
     const Stream& s,
     const std::string& mode) {
   // It is a qmv with a small inner dimension so route to qmv_quad kernel
-  // (no bias-free variant; affine_sym falls through to the plain qmv).
-  // 1-bit needs K == 128: at K == 64 a quad lane holds 16 values, less than
-  // the one 32-value uint32 pack that qmv_quad_impl and qdot<bits=1> read.
+  // (1-bit needs K == 128 for a full pack per lane; no affine_sym variant).
   if ((K == 128 || (K == 64 && bits >= 2)) && is_power_of_2(bits) &&
       !global_scale && mode != "affine_sym") {
     qmv_quad(x, w, scales, biases, out, group_size, bits, M, N, K, d, s, mode);

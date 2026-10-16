@@ -1329,11 +1329,8 @@ std::vector<array> spec_decode_verify(
     return {zeros(Shape{0}, int32, s), zeros(Shape{0, K + 1}, int32, s)};
   }
 
-  // Reuse mlx's fast argmax on-device (result stays on the GPU); the fused
-  // primitive does only the tiny per-row prefix-match. Primitive inputs are
-  // int32 token arrays, so the kernel needs no large-V reduction. The ArgMax
-  // primitive is built directly because the argmax op rejects any zero-size
-  // input, B = 0 included; V > 0 is checked above.
+  // Build ArgMax directly, because the argmax op rejects a zero-size input
+  // (B = 0). The fused kernel then does only the per-row prefix match.
   auto dft = astype(draft_tokens, int32, s);
   auto tgt = array(
       Shape{B, K + 1, 1},

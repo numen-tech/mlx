@@ -12,9 +12,8 @@ namespace mlx::core::fast {
 
 namespace {
 
-// The kernel indexes dense rows (row * K, row * (K + 1)). A row-contiguous
-// input is bound as is; a view (transposed, sliced, broadcast) is copied
-// first and the copy kept alive until the command buffer completes.
+// The kernel indexes dense rows, so copy a view and keep the copy alive until
+// the command buffer completes.
 array ensure_row_contiguous(const array& x, const Stream& s) {
   if (x.flags().row_contiguous) {
     return x;

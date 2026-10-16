@@ -226,18 +226,16 @@ struct KernelVariant {
   size_t source_hash;
 };
 
-// Shared by all copies of one kernel function. Holds at most
-// `metal_kernel_max_cached_variants` entries and is cleared when full. Callers
-// keep an owning pointer to their entry, so clearing is safe at any time.
+// One per kernel function, cleared when full. Callers own their entry, so a
+// clear is safe at any time.
 struct VariantCache {
   std::mutex mutex;
   std::unordered_map<std::string, std::shared_ptr<const KernelVariant>>
       variants;
 };
 
-// Encodes each call argument that the name and source depend on. Template
-// arguments include their kind and name: `int` 1 and `bool` true give the same
-// name but a different signature.
+// Encodes each argument that the name and source depend on. Template arguments
+// add their kind, because `int` 1 and `bool` true give the same name.
 std::string variant_key(
     const std::vector<array>& inputs,
     const std::vector<Dtype>& output_dtypes,
@@ -374,10 +372,8 @@ CustomKernelFunction metal_kernel(
         kernel_name += template_hash;
       }
 
-      // The generated source depends on the dtypes of the inputs and outputs
-      // and on how each input is passed (see `write_signature`). Include them
-      // in the kernel name so that a given name always maps to the same
-      // source.
+      // The source depends on the input and output dtypes and on how each
+      // input is passed, so the name includes them.
       for (const auto& arr : inputs) {
         kernel_name += "_";
         kernel_name += get_type_string(arr.dtype());
