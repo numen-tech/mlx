@@ -911,10 +911,14 @@ class TestQuantized(mlx_tests.MLXTestCase):
         # quad rows past N must read no scale or bias (gemma4-qat#302). N = 65
         # leaves one valid row in tile 2, N = 72 leaves eight. Explicit and
         # implied (0-d factor) biases are both covered; affine_sym never reaches
-        # qmv_quad.
+        # qmv_quad. Group size 128 runs at K = 128 only.
         key = mx.random.key(7)
         cases = [
-            (bits, gs, K) for bits in (1, 2, 4, 8) for gs in (32, 64) for K in (64, 128)
+            (bits, gs, K)
+            for bits in (1, 2, 4, 8)
+            for gs in (32, 64, 128)
+            for K in (64, 128)
+            if gs <= K
         ]
         for bits, gs, K in cases:
             if K == 64 and bits == 1:

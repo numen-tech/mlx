@@ -1465,6 +1465,23 @@ class TestFast(mlx_tests.MLXTestCase):
                     self.assertEqual(n.tolist(), [0] * B)
                     self.assertEqual(c.tolist(), [[t] for t in bonus])
 
+    def test_spec_decode_verify_transforms(self):
+        # The outputs are integer token ids, so jvp and vjp give zero
+        # (co)tangents rather than throwing on the accept-length gather.
+        draft = mx.array([[1, 2, 3]], dtype=mx.int32)
+        lg = mx.random.normal((1, 4, 8), key=mx.random.key(0))
+
+        def f(x):
+            return mx.fast.spec_decode_verify(draft, x)
+
+        _, tangents = mx.jvp(f, [lg], [mx.ones_like(lg)])
+        for t in tangents:
+            self.assertTrue(mx.all(t == 0).item())
+        cotangents = [mx.ones((1,), mx.int32), mx.ones((1, 4), mx.int32)]
+        _, (g,) = mx.vjp(f, [lg], cotangents)
+        self.assertEqual(g.shape, lg.shape)
+        self.assertTrue(mx.all(g == 0).item())
+
     def test_spec_decode_verify_empty_batch(self):
         # B = 0: empty, correctly shaped int32 results on every backend.
         for K in (3, 0):
