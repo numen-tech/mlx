@@ -1268,7 +1268,8 @@ static std::vector<array> spec_decode_verify_composition(
           /*axis=*/1,
           /*keepdims=*/false,
           s); // [B]
-  auto n_acc2 = reshape(n_acc, Shape{B, 1}, s);
+  // An index, not a value: transforms see a zero tangent instead of throwing.
+  auto n_acc2 = stop_gradient(reshape(n_acc, Shape{B, 1}, s), s);
   auto corrected = take_along_axis(t, n_acc2, /*axis=*/1, s); // [B, 1]
   auto j1 = broadcast_to(
       reshape(arange(K + 1, int32, s), Shape{1, K + 1}, s), Shape{B, K + 1}, s);
