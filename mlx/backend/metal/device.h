@@ -144,6 +144,25 @@ struct DeviceStream {
   std::unique_ptr<CommandEncoder> encoder{nullptr};
   std::shared_ptr<Fence> fence;
   std::vector<array> temporaries;
+
+  // Shared events the current command buffer was asked to signal. Metal does
+  // not signal them when the buffer fails, so the completion handler installed
+  // by commit_command_buffer signals them itself to wake any waiter. Touched by
+  // the encoding thread only, like temporaries.
+  struct PendingSignal {
+    std::shared_ptr<void> owner; // keeps the event alive until completion
+    MTL::SharedEvent* event;
+    uint64_t value;
+  };
+  std::vector<PendingSignal> pending_signals;
+
+  // First error reported by a completed command buffer on this stream. Written
+  // from Metal's completion thread, taken by the thread that waits on the
+  // stream (Event::wait, gpu::synchronize). Backport of upstream a025496c8
+  // (ml-explore/mlx#3523): throwing from the completion handler terminates
+  // the process.
+  std::mutex error_mtx;
+  std::string error;
 };
 
 class MLX_API Device {
@@ -205,12 +224,28 @@ class MLX_API Device {
   void add_temporary(array arr, int index);
   void add_temporaries(std::vector<array> arrays, int index);
 
+  // Record a shared event the current command buffer will signal, so it is
+  // still signaled if the buffer fails.
+  void add_pending_signal(
+      int index,
+      std::shared_ptr<void> owner,
+      MTL::SharedEvent* event,
+      uint64_t value);
+
+  // Latch an error from a completed command buffer; the first error wins.
+  void set_error(int index, std::string message);
+
+  // Take (and clear) the latched error for the stream, empty if none.
+  std::string take_error(int index);
+
   void set_residency_set(const MTL::ResidencySet* residency_set);
 
  private:
   DeviceStream& get_stream_(int index) {
     return stream_map_.find(index)->second;
   }
+  // Same lookup under stream_map_mtx_, for the error-latch paths.
+  DeviceStream& get_stream_locked_(int index);
   MTL::Library* get_library_cache_(const std::string& name);
 
   MTL::Library* get_library_(const std::string& name);
@@ -245,6 +280,10 @@ class MLX_API Device {
 
   MTL::Device* device_;
   std::unordered_map<int32_t, DeviceStream> stream_map_;
+  // Guards stream_map_ insertion against the error-latch lookups, which can run
+  // on a waiting thread while new_queue inserts. Only those lookups take it; the
+  // pre-existing get_stream_ callers are unchanged.
+  std::mutex stream_map_mtx_;
 
   std::shared_mutex kernel_mtx_;
   std::shared_mutex library_mtx_;

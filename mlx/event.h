@@ -48,6 +48,10 @@ class Event {
   }
 
  private:
+  // Block until the event reaches its current value without reporting a
+  // latched error; safe to run on a scheduler worker, which has no catch frame.
+  void wait_for_signal();
+
   // Default constructed stream should never be used
   // since the event is not yet valid
   Stream stream_{0, Device::cpu};

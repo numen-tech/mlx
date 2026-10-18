@@ -383,7 +383,10 @@ void Device::new_queue(int index) {
     throw std::runtime_error(
         "[metal::Device] Failed to make new command queue.");
   }
-  stream_map_.emplace(index, q);
+  {
+    std::lock_guard<std::mutex> lk(stream_map_mtx_);
+    stream_map_.emplace(index, q);
+  }
   if (residency_set_ != nullptr) {
     q->addResidencySet(residency_set_);
   }
@@ -415,6 +418,29 @@ MTL::CommandBuffer* Device::get_command_buffer(int index) {
 
 void Device::commit_command_buffer(int index) {
   auto& stream = get_stream_(index);
+  // Latch a failed buffer's error instead of throwing from a completion
+  // handler (backport of upstream a025496c8, ml-explore/mlx#3523), and signal
+  // the events Metal skips on failure so no waiter blocks forever.
+  stream.buffer->addCompletedHandler(
+      [&stream, signals = std::move(stream.pending_signals)](
+          MTL::CommandBuffer* cbuf) {
+        if (cbuf->status() != MTL::CommandBufferStatusError) {
+          return;
+        }
+        {
+          std::lock_guard<std::mutex> lk(stream.error_mtx);
+          if (stream.error.empty()) {
+            std::ostringstream msg;
+            msg << "[METAL] Command buffer execution failed: "
+                << cbuf->error()->localizedDescription()->utf8String();
+            stream.error = msg.str();
+          }
+        }
+        for (auto& signal : signals) {
+          signal.event->setSignaledValue(signal.value);
+        }
+      });
+  stream.pending_signals.clear();
   stream.buffer->commit();
   stream.buffer->release();
   stream.buffer = nullptr;
@@ -424,6 +450,34 @@ void Device::commit_command_buffer(int index) {
 
 void Device::add_temporary(array arr, int index) {
   get_stream_(index).temporaries.push_back(std::move(arr));
+}
+
+DeviceStream& Device::get_stream_locked_(int index) {
+  std::lock_guard<std::mutex> lk(stream_map_mtx_);
+  return stream_map_.find(index)->second;
+}
+
+void Device::add_pending_signal(
+    int index,
+    std::shared_ptr<void> owner,
+    MTL::SharedEvent* event,
+    uint64_t value) {
+  get_stream_locked_(index).pending_signals.push_back(
+      {std::move(owner), event, value});
+}
+
+void Device::set_error(int index, std::string message) {
+  auto& stream = get_stream_locked_(index);
+  std::lock_guard<std::mutex> lk(stream.error_mtx);
+  if (stream.error.empty()) {
+    stream.error = std::move(message);
+  }
+}
+
+std::string Device::take_error(int index) {
+  auto& stream = get_stream_locked_(index);
+  std::lock_guard<std::mutex> lk(stream.error_mtx);
+  return std::move(stream.error);
 }
 
 void Device::add_temporaries(std::vector<array> arrays, int index) {

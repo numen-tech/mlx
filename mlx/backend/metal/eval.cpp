@@ -1,5 +1,6 @@
 // Copyright © 2023-2024 Apple Inc.
 #include <memory>
+#include <sstream>
 
 #include "mlx/backend/gpu/eval.h"
 #include "mlx/backend/metal/device.h"
@@ -12,15 +13,6 @@ namespace mlx::core::gpu {
 void new_stream(Stream stream) {
   if (stream.device == mlx::core::Device::gpu) {
     metal::device(stream.device).new_queue(stream.index);
-  }
-}
-
-inline void check_error(MTL::CommandBuffer* cbuf) {
-  if (cbuf->status() == MTL::CommandBufferStatusError) {
-    std::ostringstream msg;
-    msg << "[METAL] Command buffer execution failed: "
-        << cbuf->error()->localizedDescription()->utf8String();
-    throw std::runtime_error(msg.str());
   }
 }
 
@@ -57,27 +49,25 @@ void eval(array& arr) {
   if (d.command_buffer_needs_commit(s.index)) {
     d.end_encoding(s.index);
     scheduler::notify_new_task(s);
+    // Errors are latched by the handler commit_command_buffer installs; a
+    // throw here would run on Metal's completion thread and terminate.
     command_buffer->addCompletedHandler(
-        [s, buffers = std::move(buffers)](MTL::CommandBuffer* cbuf) {
+        [s, buffers = std::move(buffers)](MTL::CommandBuffer*) {
           scheduler::notify_task_completion(s);
-          check_error(cbuf);
         });
     d.commit_command_buffer(s.index);
     d.get_command_buffer(s.index);
   } else {
     command_buffer->addCompletedHandler(
-        [buffers = std::move(buffers)](MTL::CommandBuffer* cbuf) {
-          check_error(cbuf);
-        });
+        [buffers = std::move(buffers)](MTL::CommandBuffer*) {});
   }
 }
 
 void finalize(Stream s) {
   auto pool = metal::new_scoped_memory_pool();
   auto& d = metal::device(s.device);
-  auto cb = d.get_command_buffer(s.index);
+  d.get_command_buffer(s.index);
   d.end_encoding(s.index);
-  cb->addCompletedHandler([](MTL::CommandBuffer* cbuf) { check_error(cbuf); });
   d.commit_command_buffer(s.index);
   d.get_command_buffer(s.index);
 }
@@ -90,8 +80,17 @@ void synchronize(Stream s) {
   d.end_encoding(s.index);
   d.commit_command_buffer(s.index);
   cb->waitUntilCompleted();
-  check_error(cb);
+  auto error = d.take_error(s.index);
+  if (error.empty() && cb->status() == MTL::CommandBufferStatusError) {
+    std::ostringstream msg;
+    msg << "[METAL] Command buffer execution failed: "
+        << cb->error()->localizedDescription()->utf8String();
+    error = msg.str();
+  }
   cb->release();
+  if (!error.empty()) {
+    throw std::runtime_error(error);
+  }
 }
 
 } // namespace mlx::core::gpu

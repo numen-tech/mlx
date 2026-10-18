@@ -125,6 +125,8 @@ void Fence::update(Stream stream, const array& x, bool cross_device) {
         static_cast<MTL::Event*>(f.fence), f.count);
     command_buffer->addCompletedHandler(
         [fence_ = fence_](MTL::CommandBuffer* cbuf) {});
+    d.add_pending_signal(
+        idx, fence_, static_cast<MTL::SharedEvent*>(f.fence), f.count);
     return;
   }
 

@@ -20,16 +20,28 @@ Event::Event(Stream stream) : stream_(stream) {
   }
 }
 
+void Event::wait_for_signal() {
+  static_cast<MTL::SharedEvent*>(event_.get())
+      ->waitUntilSignaledValue(value(), -1); // never times out
+}
+
 void Event::wait() {
-  if (!static_cast<MTL::SharedEvent*>(event_.get())
-           ->waitUntilSignaledValue(value(), -1)) {
-    throw std::runtime_error("[Event::wait] Timed out");
+  wait_for_signal();
+  // A failed command buffer signals the event itself and latches its error on
+  // the stream; surface it here, on the waiting thread, where it can be caught.
+  if (stream_.device == Device::gpu) {
+    auto error = metal::device(stream_.device).take_error(stream_.index);
+    if (!error.empty()) {
+      throw std::runtime_error(error);
+    }
   }
 }
 
 void Event::wait(Stream stream) {
   if (stream.device == Device::cpu) {
-    scheduler::enqueue(stream, [*this]() mutable { wait(); });
+    // Scheduler workers run tasks with no catch frame, so this must not throw;
+    // a latched error stays put for the caller's next GPU wait or synchronize.
+    scheduler::enqueue(stream, [*this]() mutable { wait_for_signal(); });
   } else {
     auto& d = metal::device(stream.device);
     d.end_encoding(stream.index);
@@ -51,6 +63,11 @@ void Event::signal(Stream stream) {
     command_buffer->encodeSignalEvent(
         static_cast<MTL::Event*>(event_.get()), value());
     command_buffer->addCompletedHandler([*this](MTL::CommandBuffer*) {});
+    d.add_pending_signal(
+        stream.index,
+        event_,
+        static_cast<MTL::SharedEvent*>(event_.get()),
+        value());
   }
 }
 
