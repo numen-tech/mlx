@@ -3,11 +3,13 @@
 #include <atomic>
 #include <cstdlib>
 #include <map>
+#include <mutex>
 #include <optional>
 #include <shared_mutex>
 #include <sstream>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 #include "mlx/allocator.h"
 #include "mlx/backend/common/compiled.h"
@@ -411,8 +413,31 @@ class CompileCache {
   std::shared_mutex mutex_;
 };
 
+// Every live thread's cache, so that erasing a function id reaches the entries
+// that other threads built for it. The registry is leaked on purpose: a
+// compiled function can be destroyed during static destruction.
+struct CompileCacheRegistry {
+  std::mutex mutex;
+  std::vector<std::weak_ptr<CompileCache>> caches;
+};
+
+CompileCacheRegistry& compile_cache_registry() {
+  static auto* registry = new CompileCacheRegistry;
+  return *registry;
+}
+
+std::shared_ptr<CompileCache> make_registered_compile_cache() {
+  auto cache = std::make_shared<CompileCache>();
+  auto& registry = compile_cache_registry();
+  std::lock_guard lock(registry.mutex);
+  // Drop the caches of exited threads.
+  std::erase_if(registry.caches, [](const auto& w) { return w.expired(); });
+  registry.caches.push_back(cache);
+  return cache;
+}
+
 std::shared_ptr<CompileCache>& compile_cache_unsafe() {
-  static thread_local auto cache = std::make_shared<CompileCache>();
+  static thread_local auto cache = make_registered_compile_cache();
   return cache;
 }
 
@@ -1216,6 +1241,27 @@ CompileCacheWeakPtr compile_cache() {
 }
 
 void compile_erase(const CompileCacheWeakPtr& cache, std::uintptr_t fun_id) {
+  // A thread that called a compiled function holds its own entry for |fun_id|
+  // in its own cache, and a function id can be reused once its function is
+  // freed (the heap address of a wrapper), so erase it from every live thread's
+  // cache, not only |cache|. The caches are collected under the registry lock
+  // and erased outside it.
+  std::vector<std::shared_ptr<CompileCache>> live;
+  {
+    auto& registry = compile_cache_registry();
+    std::lock_guard lock(registry.mutex);
+    std::erase_if(registry.caches, [&live](const auto& w) {
+      auto p = w.lock();
+      if (!p) {
+        return true;
+      }
+      live.push_back(std::move(p));
+      return false;
+    });
+  }
+  for (auto& p : live) {
+    p->erase(fun_id);
+  }
   if (auto p = cache.lock()) {
     p->erase(fun_id);
   }

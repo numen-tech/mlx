@@ -6,8 +6,13 @@
 #include "doctest/doctest.h"
 
 #include <cmath>
+#include <condition_variable>
+#include <functional>
 #include <limits>
+#include <mutex>
+#include <thread>
 
+#include "mlx/compile_impl.h"
 #include "mlx/mlx.h"
 #include "mlx/primitives.h"
 
@@ -874,4 +879,113 @@ TEST_CASE("test compile throwing first trace does not poison cache") {
   auto out = cfun({});
   REQUIRE_EQ(out.size(), 1);
   CHECK_EQ(out[0].item<float>(), 3.0f);
+}
+
+namespace {
+
+// A thread that stays alive between jobs, so that its thread-local compile
+// cache keeps the entries built by earlier jobs.
+class CompileWorker {
+ public:
+  CompileWorker() : thread_([this] { loop(); }) {}
+  ~CompileWorker() {
+    {
+      std::lock_guard lock(mutex_);
+      done_ = true;
+    }
+    cv_.notify_all();
+    thread_.join();
+  }
+
+  // Runs |job| on the worker thread and waits for it.
+  void run(std::function<void()> job) {
+    std::unique_lock lock(mutex_);
+    job_ = std::move(job);
+    cv_.notify_all();
+    cv_.wait(lock, [this] { return !job_; });
+  }
+
+ private:
+  void loop() {
+    std::unique_lock lock(mutex_);
+    while (true) {
+      cv_.wait(lock, [this] { return done_ || job_; });
+      if (done_) {
+        return;
+      }
+      auto job = std::move(job_);
+      job_ = nullptr;
+      lock.unlock();
+      job();
+      lock.lock();
+      cv_.notify_all();
+    }
+  }
+
+  std::mutex mutex_;
+  std::condition_variable cv_;
+  std::function<void()> job_;
+  bool done_{false};
+  std::thread thread_;
+};
+
+float call_on(
+    CompileWorker& worker,
+    const std::function<std::vector<array>(const std::vector<array>&)>& fun) {
+  float result = 0.0f;
+  worker.run([&] { result = fun({array(0.0f)})[0].item<float>(); });
+  return result;
+}
+
+} // namespace
+
+TEST_CASE("test compile erase reaches the caches of other threads") {
+  // A function id that is reused after its function died must not hit the
+  // entry another thread built for the dead function.
+  constexpr std::uintptr_t fun_id = 0x355;
+  CompileWorker worker;
+  // A cache entry records the thread's default stream, which a thread only
+  // has once it has run an op, so run one before the entries that matter.
+  worker.run([] { (array(1.0f) + array(1.0f)).item<float>(); });
+
+  auto compiled1 = detail::compile(
+      [](const std::vector<array>& in) {
+        return std::vector<array>{in[0] + array(1.0f)};
+      },
+      fun_id);
+  CHECK_EQ(call_on(worker, compiled1), 1.0f);
+
+  // Erased from this thread; the entry lives in the worker's cache.
+  detail::compile_erase(detail::compile_cache(), fun_id);
+
+  auto compiled2 = detail::compile(
+      [](const std::vector<array>& in) {
+        return std::vector<array>{in[0] + array(2.0f)};
+      },
+      fun_id);
+  CHECK_EQ(call_on(worker, compiled2), 2.0f);
+
+  // Erasing is also safe for ids no cache holds and for exited threads.
+  detail::compile_erase(detail::compile_cache(), fun_id + 1);
+  float exited = 0.0f;
+  std::thread([&] {
+    exited = compiled2({array(0.0f)})[0].item<float>();
+  }).join();
+  CHECK_EQ(exited, 2.0f);
+  detail::compile_erase(detail::compile_cache(), fun_id);
+}
+
+TEST_CASE("test compile of a non-addressable function erases other threads") {
+  // A closure's cache key is the heap address of its wrapper, which the
+  // allocator hands out again once the closure is destroyed. A closure that
+  // reuses the address must not replay the graph of one that died.
+  CompileWorker worker;
+  for (int i = 1; i <= 64; ++i) {
+    float k = static_cast<float>(i);
+    auto compiled = compile([k](const std::vector<array>& in) {
+      return std::vector<array>{in[0] + array(k)};
+    });
+    // Built on the worker's thread-local cache; destroyed on this thread.
+    CHECK_EQ(call_on(worker, compiled), k);
+  }
 }
