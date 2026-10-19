@@ -394,13 +394,28 @@ class CompileCache {
   }
 
   void erase(std::uintptr_t fun_id) {
-    std::unique_lock lock(mutex_);
-    cache_.erase(fun_id);
+    // Destroy the entries after the lock is released: they can hold the last
+    // reference to another compiled function, whose deleter calls
+    // compile_erase and takes the lock of every cache, this one included.
+    std::shared_ptr<std::vector<CacheEntry>> erased;
+    {
+      std::unique_lock lock(mutex_);
+      auto it = cache_.find(fun_id);
+      if (it == cache_.end()) {
+        return;
+      }
+      erased = std::move(it->second);
+      cache_.erase(it);
+    }
   }
 
   void clear() {
-    std::unique_lock lock(mutex_);
-    cache_.clear();
+    // Destroyed after the lock is released, see erase().
+    decltype(cache_) cleared;
+    {
+      std::unique_lock lock(mutex_);
+      cleared.swap(cache_);
+    }
   }
 
  private:
@@ -416,6 +431,17 @@ class CompileCache {
 // Every live thread's cache, so that erasing a function id reaches the entries
 // that other threads built for it. The registry is leaked on purpose: a
 // compiled function can be destroyed during static destruction.
+//
+// Lock order: no code holds the registry mutex and a cache mutex together, nor
+// runs a destructor under either. Entries can own anything (a Python function
+// that takes the GIL on destruction, a Swift closure that takes a lock), and
+// destroying a compiled function calls compile_erase, which locks every cache,
+// so a destructor under a cache mutex could deadlock against another thread
+// doing the same. CompileCache::erase and clear move the entries out under the
+// lock and destroy them after releasing it; compile_erase copies the live
+// caches out of the registry and locks them one at a time after releasing the
+// registry mutex; the last reference to an exited thread's cache is dropped
+// outside both.
 struct CompileCacheRegistry {
   std::mutex mutex;
   std::vector<std::weak_ptr<CompileCache>> caches;

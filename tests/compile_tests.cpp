@@ -5,6 +5,7 @@
 
 #include "doctest/doctest.h"
 
+#include <atomic>
 #include <cmath>
 #include <condition_variable>
 #include <functional>
@@ -897,12 +898,13 @@ class CompileWorker {
     thread_.join();
   }
 
-  // Runs |job| on the worker thread and waits for it.
+  // Runs |job| on the worker thread and waits for it to finish.
   void run(std::function<void()> job) {
     std::unique_lock lock(mutex_);
     job_ = std::move(job);
+    auto target = ++submitted_;
     cv_.notify_all();
-    cv_.wait(lock, [this] { return !job_; });
+    cv_.wait(lock, [&] { return finished_ == target; });
   }
 
  private:
@@ -918,6 +920,7 @@ class CompileWorker {
       lock.unlock();
       job();
       lock.lock();
+      ++finished_;
       cv_.notify_all();
     }
   }
@@ -925,6 +928,8 @@ class CompileWorker {
   std::mutex mutex_;
   std::condition_variable cv_;
   std::function<void()> job_;
+  size_t submitted_{0};
+  size_t finished_{0};
   bool done_{false};
   std::thread thread_;
 };
@@ -987,5 +992,92 @@ TEST_CASE("test compile of a non-addressable function erases other threads") {
     });
     // Built on the worker's thread-local cache; destroyed on this thread.
     CHECK_EQ(call_on(worker, compiled), k);
+  }
+}
+
+TEST_CASE(
+    "test compile erase of an entry that owns another compiled function") {
+  // Destroying a cache entry can release the last reference to another
+  // compiled function, whose deleter erases from every cache. That must not
+  // wait on a lock the outer erase holds. The entry's extra keeps the inner
+  // compiled function alive for as long as the entry lives.
+  constexpr std::uintptr_t fun_id = 0x356;
+  auto outer = detail::compile(
+      detail::ArrayFnWithExtra([](const std::vector<array>& in) {
+        // Captures, so that it is not addressable and has a deleter.
+        float one = 1.0f;
+        auto inner = std::make_shared<
+            std::function<std::vector<array>(const std::vector<array>&)>>(
+            compile([one](const std::vector<array>& x) {
+              return std::vector<array>{x[0] + array(one)};
+            }));
+        return detail::ArraysAndExtra{(*inner)(in), inner};
+      }),
+      fun_id,
+      false,
+      {});
+  CHECK_EQ(outer({array(0.0f)}).first[0].item<float>(), 1.0f);
+  // Hangs on a lock held across the entry's destruction.
+  detail::compile_erase(detail::compile_cache(), fun_id);
+  CHECK_EQ(outer({array(0.0f)}).first[0].item<float>(), 1.0f);
+  detail::compile_clear_cache(detail::compile_cache());
+}
+
+TEST_CASE("test compile erase does not hold a cache lock while destroying") {
+  // An entry's destructor can wait on a lock another thread holds while it
+  // erases from every cache (a Python function waits for the GIL like this).
+  // The thread blocked in the destructor must not hold its cache's lock, or
+  // the erasing thread waits for it and neither makes progress.
+  struct Sentinel {
+    Sentinel(std::mutex& external, std::atomic<bool>& entered)
+        : external(external), entered(entered) {}
+    ~Sentinel() {
+      entered = true;
+      std::lock_guard lock(external);
+    }
+    std::mutex& external;
+    std::atomic<bool>& entered;
+  };
+
+  constexpr std::uintptr_t fun_id = 0x357;
+  for (bool use_clear : {true, false}) {
+    std::mutex external;
+    std::atomic<bool> entered{false};
+    CompileWorker worker;
+
+    // The worker's cache gets an entry that owns a Sentinel.
+    detail::CompileCacheWeakPtr worker_cache;
+    auto compiled = detail::compile(
+        detail::ArrayFnWithExtra([&](const std::vector<array>& in) {
+          return detail::ArraysAndExtra{
+              {in[0] + array(1.0f)},
+              std::make_shared<Sentinel>(external, entered)};
+        }),
+        fun_id,
+        false,
+        {});
+    worker.run([&] {
+      worker_cache = detail::compile_cache();
+      compiled({array(0.0f)}).first[0].item<float>();
+    });
+
+    // Another thread destroys that entry and blocks in the destructor.
+    std::unique_lock hold(external);
+    std::thread destroyer([&] {
+      if (use_clear) {
+        detail::compile_clear_cache(worker_cache);
+      } else {
+        detail::compile_erase(detail::compile_cache(), fun_id);
+      }
+    });
+    while (!entered) {
+      std::this_thread::yield();
+    }
+
+    // While the destroyer waits in the destructor, this thread, which holds the
+    // lock the destructor waits for, erases from every cache.
+    detail::compile_erase(detail::compile_cache(), fun_id + 1);
+    hold.unlock();
+    destroyer.join();
   }
 }
