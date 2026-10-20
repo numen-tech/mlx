@@ -1180,6 +1180,110 @@ METAL_FUNC void qmv_impl(
   }
 }
 
+// Row-reuse form of qmv_wide for 2/4/8-bit weights (8 values = bits bytes per
+// lane slice). All 32 lanes split K in 8-value slices, so each lane loads its x
+// slice once per step and reuses it across the simdgroup's `rows` output rows,
+// and each decoded weight slice is reused across the vecs_per_tg vectors. Same
+// grid as qmv_wide_impl. The host requires K % 256 == 0 (gemma4-qat#313).
+template <
+    typename T,
+    int group_size,
+    int bits,
+    int vecs_per_tg,
+    int rows,
+    bool implied_bias = false>
+METAL_FUNC void qmv_wide_rr_impl(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x,
+    device T* y,
+    const constant int& in_vec_size,
+    const constant int& out_vec_size,
+    const constant int& M,
+    uint3 tid,
+    uint simd_gid,
+    uint simd_lid) {
+  constexpr int num_simdgroups = 2;
+  constexpr int vpt = 8;
+  constexpr int step = vpt * SIMD_SIZE;
+
+  typedef float U;
+
+  const int row0 = tid.y * (rows * num_simdgroups) + rows * simd_gid;
+  const int vec0 = tid.x * vecs_per_tg;
+  const int in_vec_size_w = in_vec_size * bits / 8;
+  const int in_vec_size_g = in_vec_size / group_size;
+  const T f = implied_bias ? biases[0] : T(0);
+
+  U result[rows][vecs_per_tg];
+#pragma unroll
+  for (int r = 0; r < rows; r++) {
+#pragma unroll
+    for (int v = 0; v < vecs_per_tg; v++) {
+      result[r][v] = 0;
+    }
+  }
+
+  for (int k = simd_lid * vpt; k < in_vec_size; k += step) {
+    U xr[vecs_per_tg][vpt];
+#pragma unroll
+    for (int v = 0; v < vecs_per_tg; v++) {
+      const device T* xc = x + min(vec0 + v, M - 1) * in_vec_size + k;
+#pragma unroll
+      for (int i = 0; i < vpt; i++) {
+        xr[v][i] = static_cast<U>(xc[i]);
+      }
+    }
+    const int g = k / group_size;
+#pragma unroll
+    for (int r = 0; r < rows; r++) {
+      const int rr = min(row0 + r, out_vec_size - 1);
+      const device uint8_t* wc =
+          (const device uint8_t*)w + rr * in_vec_size_w + k * bits / 8;
+      const device T* srow = scales + rr * in_vec_size_g;
+      const device T* brow = biases + rr * in_vec_size_g;
+      U scale = srow[g];
+      U bias = affine_bias<U, T, bits, false, implied_bias>(
+          scale, f, srow[g], brow + g);
+      U w_dq[vpt];
+      dequantize<U, vpt, bits>(wc, scale, bias, w_dq);
+#pragma unroll
+      for (int v = 0; v < vecs_per_tg; v++) {
+        U acc = 0;
+#pragma unroll
+        for (int i = 0; i < vpt; i++) {
+          acc += xr[v][i] * w_dq[i];
+        }
+        result[r][v] += acc;
+      }
+    }
+  }
+
+#pragma unroll
+  for (int r = 0; r < rows; r++) {
+#pragma unroll
+    for (int v = 0; v < vecs_per_tg; v++) {
+      result[r][v] = simd_sum(result[r][v]);
+    }
+  }
+
+  if (simd_lid == 0) {
+#pragma unroll
+    for (int r = 0; r < rows; r++) {
+      if (row0 + r < out_vec_size) {
+#pragma unroll
+        for (int v = 0; v < vecs_per_tg; v++) {
+          if (vec0 + v < M) {
+            y[(vec0 + v) * out_vec_size + row0 + r] =
+                static_cast<T>(result[r][v]);
+          }
+        }
+      }
+    }
+  }
+}
+
 // Affine analog of fp_qmv_wide. Weights carry a scale and bias per group, so
 // each group is decoded in 8-value sub-chunks (scale * q + bias, registers
 // bounded for any group_size) and reused across the vecs_per_tg vectors.
@@ -2123,6 +2227,74 @@ template <
         tid);
   }
   qmv_wide_impl<T, group_size, bits, vecs_per_tg, k_lanes, implied_bias>(
+      w,
+      scales,
+      biases,
+      x,
+      y,
+      in_vec_size,
+      out_vec_size,
+      M,
+      tid,
+      simd_gid,
+      simd_lid);
+}
+
+// Row-reuse affine qmv_wide (gemma4-qat#313): 2/4/8-bit, K % 256 == 0. Same
+// buffers and grid as affine_qmv_wide with k_lanes = 8: SIMD_SIZE / 8 = 4 rows
+// per simdgroup, 8 output rows per threadgroup.
+template <
+    typename T,
+    int group_size,
+    int bits,
+    int vecs_per_tg,
+    bool batched,
+    bool implied_bias = false>
+[[kernel]] void affine_qmv_wide_rr(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x,
+    device T* y,
+    const constant int& in_vec_size,
+    const constant int& out_vec_size,
+    const constant int& M,
+    const constant int& x_batch_ndims,
+    const constant int* x_shape,
+    const constant int64_t* x_strides,
+    const constant int& w_batch_ndims,
+    const constant int* w_shape,
+    const constant int64_t* w_strides,
+    const constant int64_t* s_strides,
+    const constant int64_t* b_strides,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  if (batched) {
+    adjust_matrix_offsets<T>(
+        x,
+        w,
+        scales,
+        biases,
+        y,
+        out_vec_size * M,
+        x_batch_ndims,
+        x_shape,
+        x_strides,
+        w_batch_ndims,
+        w_shape,
+        w_strides,
+        s_strides,
+        b_strides,
+        tid);
+  }
+  qmv_wide_rr_impl<
+      T,
+      group_size,
+      bits,
+      vecs_per_tg,
+      SIMD_SIZE / 8,
+      implied_bias>(
       w,
       scales,
       biases,

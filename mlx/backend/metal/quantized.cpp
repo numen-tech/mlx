@@ -625,6 +625,42 @@ use_qmv_wide(const std::string& mode, int bits, int M, metal::Device& d) {
   return d.get_architecture_gen() >= 15;
 }
 
+// Row-reuse qmv_wide (gemma4-qat#313): affine_qmv_wide_rr splits K over all 32
+// lanes in 8-value slices and reuses each lane's x slice across 4 output rows,
+// on the same grid as affine_qmv_wide. A sub-choice inside qmv_wide() (after
+// use_qmv_wide) for affine 2/4/8-bit with K % 256 == 0 on gens at or above the
+// measured per-bits floor. MLX_DISABLE_QMV_WIDE_RR=1 forces affine_qmv_wide;
+// it is read on every call (no caching) so one process can A/B both routes.
+inline bool qmv_wide_rr_disabled() {
+  const char* v = std::getenv("MLX_DISABLE_QMV_WIDE_RR");
+  return v != nullptr && std::string(v) == "1";
+}
+
+// Minimum architecture gen per bits, indexed 2-bit, 4-bit, 8-bit. 99 = off.
+// Measured on an M3 Max (gen 15), gemma4-qat#313 qmv-wide-rr-313.md: 2-bit and
+// 8-bit win (rr/wide 0.75-0.85 at M = 4 and 8 on the larger shapes, 0.86-0.93
+// at M = 3); 4-bit is off because the lm_head shape (K 1536, N 32768) loses
+// 3-4% at M = 4 and 5 (rr/wide 1.037, 1.030 at 9 repeats) while its wins are
+// small (12B 4-bit M = 3: 0.88).
+constexpr int kQmvWideRRMinGen[3] = {15, 99, 15};
+
+// The rr route always tiles M at <= 5 vectors (see qmv_wide()), so the choice
+// does not depend on M.
+inline bool use_qmv_wide_rr(
+    const std::string& mode,
+    int bits,
+    int group_size,
+    int K,
+    metal::Device& d) {
+  if (mode != "affine" || !(bits == 2 || bits == 4 || bits == 8) ||
+      group_size % 8 != 0 || K % 256 != 0) {
+    return false;
+  }
+  const int bits_index = bits == 2 ? 0 : (bits == 4 ? 1 : 2);
+  return d.get_architecture_gen() >= kQmvWideRRMinGen[bits_index] &&
+      !qmv_wide_rr_disabled();
+}
+
 // Dispatches qmv_wide (fp modes -> fp_qmv_wide, affine -> affine_qmv_wide):
 // vecs_per_tg input vectors streamed and reused per weight group.
 void qmv_wide(
@@ -646,9 +682,14 @@ void qmv_wide(
   // them.
   int n_tiles = (M + 4) / 5; // ceil(M / 5); tile size caps at 5
   int vecs_per_tg = (M + n_tiles - 1) / n_tiles;
-  // affine runs M <= 7 as one tile. The result does not depend on the tile.
+  const bool rr = use_qmv_wide_rr(mode, bits, group_size, K, d);
+  // affine_qmv_wide runs M <= 7 as one tile. The row-reuse kernel keeps the
+  // <= 5 tiles (M = 6 as 3 + 3, M = 7 as 4 + 3): a single rr tile of 6 or 7
+  // vectors measured 1.1-3.0x slower than affine_qmv_wide (gemma4-qat#313).
+  // On both routes a row's result does not depend on its tile, so one call is
+  // bitwise equal to the same rows split into calls of the tile sizes.
   constexpr int max_affine_single_tile = 7;
-  if (mode == "affine" && M <= max_affine_single_tile) {
+  if (mode == "affine" && !rr && M <= max_affine_single_tile) {
     vecs_per_tg = M;
   }
 
@@ -671,43 +712,83 @@ void qmv_wide(
   std::string kname;
   kname.reserve(64);
   std::string type_string = get_type_string(x.dtype());
-  concatenate(
-      kname,
-      mode + "_qmv_wide_",
-      type_string,
-      "_gs_",
-      group_size,
-      "_b_",
-      bits,
-      "_nv_",
-      vecs_per_tg,
-      "_kl_",
-      k_lanes,
-      batched ? "_batch_1" : "_batch_0",
-      is_implied_bias(biases) ? "_ib" : "");
-  auto kernel = is_implied_bias(biases) ? get_quantized_kernel_wrapped(
-                                              d,
-                                              kname,
-                                              "qmv_wide",
-                                              mode,
-                                              type_string,
-                                              group_size,
-                                              bits,
-                                              vecs_per_tg,
-                                              k_lanes,
-                                              batched,
-                                              true)
-                                        : get_quantized_kernel_wrapped(
-                                              d,
-                                              kname,
-                                              "qmv_wide",
-                                              mode,
-                                              type_string,
-                                              group_size,
-                                              bits,
-                                              vecs_per_tg,
-                                              k_lanes,
-                                              batched);
+  const bool implied = is_implied_bias(biases);
+  MTL::ComputePipelineState* kernel;
+  if (rr) {
+    // affine_qmv_wide_rr: fixed 8 rows per threadgroup (== k_lanes 8), so the
+    // grid above applies unchanged; its name carries no _kl_ tag.
+    concatenate(
+        kname,
+        "affine_qmv_wide_rr_",
+        type_string,
+        "_gs_",
+        group_size,
+        "_b_",
+        bits,
+        "_nv_",
+        vecs_per_tg,
+        batched ? "_batch_1" : "_batch_0",
+        implied ? "_ib" : "");
+    kernel = implied ? get_quantized_kernel_wrapped(
+                           d,
+                           kname,
+                           "qmv_wide_rr",
+                           mode,
+                           type_string,
+                           group_size,
+                           bits,
+                           vecs_per_tg,
+                           batched,
+                           true)
+                     : get_quantized_kernel_wrapped(
+                           d,
+                           kname,
+                           "qmv_wide_rr",
+                           mode,
+                           type_string,
+                           group_size,
+                           bits,
+                           vecs_per_tg,
+                           batched);
+  } else {
+    concatenate(
+        kname,
+        mode + "_qmv_wide_",
+        type_string,
+        "_gs_",
+        group_size,
+        "_b_",
+        bits,
+        "_nv_",
+        vecs_per_tg,
+        "_kl_",
+        k_lanes,
+        batched ? "_batch_1" : "_batch_0",
+        implied ? "_ib" : "");
+    kernel = implied ? get_quantized_kernel_wrapped(
+                           d,
+                           kname,
+                           "qmv_wide",
+                           mode,
+                           type_string,
+                           group_size,
+                           bits,
+                           vecs_per_tg,
+                           k_lanes,
+                           batched,
+                           true)
+                     : get_quantized_kernel_wrapped(
+                           d,
+                           kname,
+                           "qmv_wide",
+                           mode,
+                           type_string,
+                           group_size,
+                           bits,
+                           vecs_per_tg,
+                           k_lanes,
+                           batched);
+  }
 
   auto& compute_encoder = metal::get_command_encoder(s);
   compute_encoder.set_compute_pipeline_state(kernel);
