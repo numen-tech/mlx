@@ -636,16 +636,27 @@ inline bool qmv_wide_rr_disabled() {
   return v != nullptr && std::string(v) == "1";
 }
 
-// Minimum architecture gen per bits, indexed 2-bit, 4-bit, 8-bit.
-constexpr int kQmvWideRRMinGen[3] = {15, 15, 15};
+// Minimum architecture gen per bits, indexed 2-bit, 4-bit, 8-bit. 99 = off.
+// Measured on an M3 Max (gen 15), gemma4-qat#313 qmv-wide-rr-313.md: 2-bit and
+// 8-bit win (up to 0.75-0.85x at M = 3, 4, 8 on the larger shapes); 4-bit is off
+// because the lm_head shape (K 1536, N 32768) loses 3-4% at M = 4 and 5 (rr/wide
+// 1.037, 1.030 at 9 repeats) while its wins are small (12B 4-bit M = 3: 0.88).
+constexpr int kQmvWideRRMinGen[3] = {15, 99, 15};
+
+// A single tile of 6 or 7 vectors (xr[7][8] + result[4][7] registers) spills and
+// runs 1.4-3.0x slower than qmv_wide on every width measured, so the row-reuse
+// kernel serves only tiles of at most this many vectors (M 2..5 and M = 8 as 4 + 4).
+constexpr int kQmvWideRRMaxVecsPerTg = 5;
 
 inline bool use_qmv_wide_rr(
     const std::string& mode,
     int bits,
     int group_size,
     int K,
+    int vecs_per_tg,
     metal::Device& d) {
-  if (mode != "affine" || !(bits == 2 || bits == 4 || bits == 8) ||
+  if (mode != "affine" || vecs_per_tg > kQmvWideRRMaxVecsPerTg ||
+      !(bits == 2 || bits == 4 || bits == 8) ||
       group_size % 8 != 0 || K % 256 != 0) {
     return false;
   }
@@ -701,7 +712,7 @@ void qmv_wide(
   kname.reserve(64);
   std::string type_string = get_type_string(x.dtype());
   const bool implied = is_implied_bias(biases);
-  const bool rr = use_qmv_wide_rr(mode, bits, group_size, K, d);
+  const bool rr = use_qmv_wide_rr(mode, bits, group_size, K, vecs_per_tg, d);
   MTL::ComputePipelineState* kernel;
   if (rr) {
     // affine_qmv_wide_rr: fixed 8 rows per threadgroup (== k_lanes 8), so the
