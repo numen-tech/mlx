@@ -147,6 +147,39 @@
   instantiate_quantized_wide_wrap(affine_qmv_wide, type, group_size, bits, 6, 8) \
   instantiate_quantized_wide_wrap(affine_qmv_wide, type, group_size, bits, 7, 8)
 
+// Row-reuse affine qmv_wide (gemma4-qat#313): 2/4/8-bit only, vecs_per_tg
+// 2..7, no k_lanes tag (fixed 8 rows per threadgroup). Defaulted template args
+// are spelled out on the "_ib" twin.
+#define instantiate_quantized_wide_rr(type, group_size, bits, vecs_per_tg, batched) \
+  instantiate_kernel(                                                            \
+      "affine_qmv_wide_rr_" #type "_gs_" #group_size "_b_" #bits "_nv_" #vecs_per_tg "_batch_" #batched, \
+      affine_qmv_wide_rr, type, group_size, bits, vecs_per_tg, batched)          \
+  instantiate_kernel(                                                            \
+      "affine_qmv_wide_rr_" #type "_gs_" #group_size "_b_" #bits "_nv_" #vecs_per_tg "_batch_" #batched "_ib", \
+      affine_qmv_wide_rr, type, group_size, bits, vecs_per_tg, batched, true)
+
+#define instantiate_quantized_wide_rr_wrap(type, group_size, bits, vecs_per_tg) \
+  instantiate_quantized_wide_rr(type, group_size, bits, vecs_per_tg, 0)         \
+  instantiate_quantized_wide_rr(type, group_size, bits, vecs_per_tg, 1)
+
+#define instantiate_quantized_all_wide_rr(type, group_size, bits) \
+  instantiate_quantized_wide_rr_wrap(type, group_size, bits, 2)   \
+  instantiate_quantized_wide_rr_wrap(type, group_size, bits, 3)   \
+  instantiate_quantized_wide_rr_wrap(type, group_size, bits, 4)   \
+  instantiate_quantized_wide_rr_wrap(type, group_size, bits, 5)   \
+  instantiate_quantized_wide_rr_wrap(type, group_size, bits, 6)   \
+  instantiate_quantized_wide_rr_wrap(type, group_size, bits, 7)
+
+#define instantiate_quantized_wide_rr_types(group_size, bits)       \
+  instantiate_quantized_all_wide_rr(float, group_size, bits)        \
+  instantiate_quantized_all_wide_rr(float16_t, group_size, bits)    \
+  instantiate_quantized_all_wide_rr(bfloat16_t, group_size, bits)
+
+#define instantiate_quantized_wide_rr_groups(bits) \
+  instantiate_quantized_wide_rr_types(128, bits)   \
+  instantiate_quantized_wide_rr_types(64, bits)    \
+  instantiate_quantized_wide_rr_types(32, bits)
+
 #define instantiate_quantized_all_splitk(type, group_size, bits)   \
   instantiate_quantized_split_k(affine_qvm_split_k, type, group_size, bits, 8)   \
   instantiate_quantized_split_k(affine_qvm_split_k, type, group_size, bits, 32)  \
@@ -301,11 +334,14 @@
 #define instantiate_quantized_all() \
   instantiate_quantized_groups(1) \
   instantiate_quantized_groups(2) \
+  instantiate_quantized_wide_rr_groups(2) \
   instantiate_quantized_groups(3) \
   instantiate_quantized_groups(4) \
+  instantiate_quantized_wide_rr_groups(4) \
   instantiate_quantized_groups(5) \
   instantiate_quantized_groups(6) \
   instantiate_quantized_groups(8) \
+  instantiate_quantized_wide_rr_groups(8) \
   instantiate_quantized_sym_groups(1) \
   instantiate_quantized_sym_groups(2) \
   instantiate_quantized_ib_groups(1) \

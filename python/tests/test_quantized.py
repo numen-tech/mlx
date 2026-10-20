@@ -1232,6 +1232,125 @@ class TestQuantized(mlx_tests.MLXTestCase):
                         r += c
                     self.assert_bitwise_equal(qmm(x), mx.concatenate(parts, axis=-2))
 
+    def _rr_env(self, disabled):
+        # MLX_DISABLE_QMV_WIDE_RR is read on every qmv_wide() call (gemma4-qat#313).
+        if disabled:
+            os.environ["MLX_DISABLE_QMV_WIDE_RR"] = "1"
+        else:
+            os.environ.pop("MLX_DISABLE_QMV_WIDE_RR", None)
+
+    @unittest.skipUnless(mx.metal.is_available(), "qmv_wide_rr is a Metal kernel")
+    def test_qmv_wide_rr(self):
+        # Row-reuse qmv_wide (gemma4-qat#313): affine 2/4/8-bit, K % 256 == 0, M in
+        # [2, vector_limit). These (M, N, B) route to affine_qmv_wide_rr on gen >= 15
+        # (2-bit M = 2 stays on qmv); the reference is dequantize-then-matmul, tol as
+        # test_qmv_wide. N = 67 is a ragged 8-row tile, M = 9 a token tail (5 + 4),
+        # B = 3 the batched variant.
+        key = mx.random.key(313)
+        k1, k2 = mx.random.split(key)
+        for group_size, bits, K in product([32, 64, 128], [2, 4, 8], [256, 1536]):
+            for M, N, B, dtype in product(
+                [2, 3, 5, 7, 8, 9],
+                [256, 67],
+                [1, 3],
+                [mx.float16, mx.bfloat16, mx.float32],
+            ):
+                with self.subTest(
+                    M=M, N=N, K=K, B=B, group_size=group_size, bits=bits, dtype=dtype
+                ):
+                    x_shape = (M, K) if B == 1 else (B, M, K)
+                    w_shape = (N, K) if B == 1 else (B, N, K)
+                    x = mx.random.normal(shape=x_shape, key=k1).astype(dtype)
+                    w = mx.random.normal(shape=w_shape, key=k2)
+                    w_q, scales, biases = mx.quantize(w, group_size, bits)
+                    scales, biases = scales.astype(dtype), biases.astype(dtype)
+                    w_hat = mx.dequantize(w_q, scales, biases, group_size, bits)
+                    w_hat = w_hat.astype(mx.float32)
+                    y_q = mx.quantized_matmul(
+                        x, w_q, scales, biases, True, group_size, bits
+                    )
+                    y_hat = x.astype(mx.float32) @ mx.swapaxes(w_hat, -1, -2)
+                    rel = {mx.float16: 2e-2, mx.bfloat16: 5e-2, mx.float32: 1e-3}
+                    tol = rel[dtype] * mx.abs(y_hat).max().item() + 1e-3
+                    self.assertEqual(y_q.shape, y_hat.shape)
+                    err = (y_q.astype(mx.float32) - y_hat).abs().max().item()
+                    self.assertLess(err, tol)
+
+    @unittest.skipUnless(mx.metal.is_available(), "qmv_wide_rr is a Metal kernel")
+    def test_qmv_wide_rr_no_worse_than_wide(self):
+        # #178 no-worse rule: on the same weights, rr's error against the fp32
+        # reference is at most qmv_wide's plus one ulp of the largest reference
+        # value. Same process, two routes.
+        self.addCleanup(self._rr_env, False)
+        key = mx.random.key(3131)
+        k1, k2 = mx.random.split(key)
+        for bits, group_size, K, N, M, implied in product(
+            [2, 4, 8],
+            [32, 64, 128],
+            [256, 1536],
+            [256, 67],
+            [2, 4, 7, 8],
+            [False, True],
+        ):
+            with self.subTest(
+                bits=bits, group_size=group_size, K=K, N=N, M=M, implied=implied
+            ):
+                x = mx.random.normal(shape=(M, K), key=k1).astype(mx.float16)
+                w_q, s, b = mx.quantize(
+                    mx.random.normal(shape=(N, K), key=k2), group_size, bits
+                )
+                s = s.astype(mx.float16)
+                if implied:
+                    f = mx.array(-(2.0 ** (bits - 1)), mx.float16)
+                    b_ref = s * f
+                    b = f
+                else:
+                    b = b.astype(mx.float16)
+                    b_ref = b
+                w_ref = mx.dequantize(
+                    w_q,
+                    s.astype(mx.float32),
+                    b_ref.astype(mx.float32),
+                    group_size,
+                    bits,
+                )
+                ref = x.astype(mx.float32) @ w_ref.T
+                ulp = mx.abs(ref).max().item() * 2.0**-10
+                self._rr_env(disabled=True)
+                y_wide = mx.quantized_matmul(x, w_q, s, b, True, group_size, bits)
+                mx.eval(y_wide)
+                self._rr_env(disabled=False)
+                y_rr = mx.quantized_matmul(x, w_q, s, b, True, group_size, bits)
+                mx.eval(y_rr)
+                err_wide = (y_wide.astype(mx.float32) - ref).abs().max().item()
+                err_rr = (y_rr.astype(mx.float32) - ref).abs().max().item()
+                self.assertLessEqual(err_rr, err_wide + ulp)
+
+    @unittest.skipUnless(mx.metal.is_available(), "qmv_wide_rr is a Metal kernel")
+    def test_qmv_wide_rr_implied_bias_matches_materialized(self):
+        # The 0-d factor must be applied as affine_bias does (f * scale in T), so
+        # rr on the implied form is bitwise equal to rr on the materialized biases,
+        # including the subnormal-scale fp16 case from
+        # test_implied_bias_dtype_promotion.
+        for bits, group_size in product([2, 4, 8], [32, 64, 128]):
+            for scale_value in (0.05, 2.0**-24):
+                with self.subTest(bits=bits, group_size=group_size, scale=scale_value):
+                    K, N, M = 512, 72, 5
+                    x = mx.random.normal(shape=(M, K), key=mx.random.key(1))
+                    x = x.astype(mx.float16)
+                    w_q = mx.random.randint(
+                        0, 2**bits, (N, K * bits // 32), dtype=mx.uint32
+                    )
+                    s = mx.full((N, K // group_size), scale_value, mx.float16)
+                    f = mx.array(-(2.0 ** (bits - 1)), mx.float16)
+                    y_implied = mx.quantized_matmul(
+                        x, w_q, s, f, True, group_size, bits
+                    )
+                    y_full = mx.quantized_matmul(
+                        x, w_q, s, s * f, True, group_size, bits
+                    )
+                    self.assert_bitwise_equal(y_implied, y_full)
+
     @unittest.skipUnless(mx.metal.is_available(), "Bias-free affine is Metal-only")
     def test_qmv_affine_sym(self):
         def assert_sym_matches_biased(y_sym, y_biased):
