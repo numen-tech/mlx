@@ -643,20 +643,15 @@ inline bool qmv_wide_rr_disabled() {
 // 1.037, 1.030 at 9 repeats) while its wins are small (12B 4-bit M = 3: 0.88).
 constexpr int kQmvWideRRMinGen[3] = {15, 99, 15};
 
-// A single tile of 6 or 7 vectors (xr[7][8] + result[4][7] registers) spills and
-// runs 1.4-3.0x slower than qmv_wide on every width measured, so the row-reuse
-// kernel serves only tiles of at most this many vectors (M 2..5 and M = 8 as 4 + 4).
-constexpr int kQmvWideRRMaxVecsPerTg = 5;
-
+// The rr route always tiles M at <= 5 vectors (see qmv_wide()), so the choice
+// does not depend on M.
 inline bool use_qmv_wide_rr(
     const std::string& mode,
     int bits,
     int group_size,
     int K,
-    int vecs_per_tg,
     metal::Device& d) {
-  if (mode != "affine" || vecs_per_tg > kQmvWideRRMaxVecsPerTg ||
-      !(bits == 2 || bits == 4 || bits == 8) ||
+  if (mode != "affine" || !(bits == 2 || bits == 4 || bits == 8) ||
       group_size % 8 != 0 || K % 256 != 0) {
     return false;
   }
@@ -686,9 +681,14 @@ void qmv_wide(
   // them.
   int n_tiles = (M + 4) / 5; // ceil(M / 5); tile size caps at 5
   int vecs_per_tg = (M + n_tiles - 1) / n_tiles;
-  // affine runs M <= 7 as one tile. The result does not depend on the tile.
+  const bool rr = use_qmv_wide_rr(mode, bits, group_size, K, d);
+  // affine_qmv_wide runs M <= 7 as one tile. The row-reuse kernel keeps the
+  // <= 5 tiles (M = 6 as 3 + 3, M = 7 as 4 + 3): a single rr tile of 6 or 7
+  // vectors measured 1.1-3.0x slower than affine_qmv_wide (gemma4-qat#313).
+  // On both routes a row's result does not depend on its tile, so one call is
+  // bitwise equal to the same rows split into calls of the tile sizes.
   constexpr int max_affine_single_tile = 7;
-  if (mode == "affine" && M <= max_affine_single_tile) {
+  if (mode == "affine" && !rr && M <= max_affine_single_tile) {
     vecs_per_tg = M;
   }
 
@@ -712,7 +712,6 @@ void qmv_wide(
   kname.reserve(64);
   std::string type_string = get_type_string(x.dtype());
   const bool implied = is_implied_bias(biases);
-  const bool rr = use_qmv_wide_rr(mode, bits, group_size, K, vecs_per_tg, d);
   MTL::ComputePipelineState* kernel;
   if (rr) {
     // affine_qmv_wide_rr: fixed 8 rows per threadgroup (== k_lanes 8), so the

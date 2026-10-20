@@ -148,8 +148,8 @@
   instantiate_quantized_wide_wrap(affine_qmv_wide, type, group_size, bits, 7, 8)
 
 // Row-reuse affine qmv_wide (gemma4-qat#313): 2/4/8-bit only, vecs_per_tg
-// 2..7, no k_lanes tag (fixed 8 rows per threadgroup). Defaulted template args
-// are spelled out on the "_ib" twin.
+// 2..5 (the host tiles rr at <= 5 vectors), no k_lanes tag (fixed 8 rows per
+// threadgroup). Defaulted template args are spelled out on the "_ib" twin.
 #define instantiate_quantized_wide_rr(type, group_size, bits, vecs_per_tg, batched) \
   instantiate_kernel(                                                            \
       "affine_qmv_wide_rr_" #type "_gs_" #group_size "_b_" #bits "_nv_" #vecs_per_tg "_batch_" #batched, \
@@ -166,9 +166,7 @@
   instantiate_quantized_wide_rr_wrap(type, group_size, bits, 2)   \
   instantiate_quantized_wide_rr_wrap(type, group_size, bits, 3)   \
   instantiate_quantized_wide_rr_wrap(type, group_size, bits, 4)   \
-  instantiate_quantized_wide_rr_wrap(type, group_size, bits, 5)   \
-  instantiate_quantized_wide_rr_wrap(type, group_size, bits, 6)   \
-  instantiate_quantized_wide_rr_wrap(type, group_size, bits, 7)
+  instantiate_quantized_wide_rr_wrap(type, group_size, bits, 5)
 
 #define instantiate_quantized_wide_rr_types(group_size, bits)       \
   instantiate_quantized_all_wide_rr(float, group_size, bits)        \
