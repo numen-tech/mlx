@@ -638,9 +638,10 @@ inline bool qmv_wide_rr_disabled() {
 
 // Minimum architecture gen per bits, indexed 2-bit, 4-bit, 8-bit. 99 = off.
 // Measured on an M3 Max (gen 15), gemma4-qat#313 qmv-wide-rr-313.md: 2-bit and
-// 8-bit win (up to 0.75-0.85x at M = 3, 4, 8 on the larger shapes); 4-bit is off
-// because the lm_head shape (K 1536, N 32768) loses 3-4% at M = 4 and 5 (rr/wide
-// 1.037, 1.030 at 9 repeats) while its wins are small (12B 4-bit M = 3: 0.88).
+// 8-bit win (rr/wide 0.75-0.85 at M = 4 and 8 on the larger shapes, 0.86-0.93
+// at M = 3); 4-bit is off because the lm_head shape (K 1536, N 32768) loses
+// 3-4% at M = 4 and 5 (rr/wide 1.037, 1.030 at 9 repeats) while its wins are
+// small (12B 4-bit M = 3: 0.88).
 constexpr int kQmvWideRRMinGen[3] = {15, 99, 15};
 
 // The rr route always tiles M at <= 5 vectors (see qmv_wide()), so the choice
