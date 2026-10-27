@@ -18,6 +18,11 @@ endif()
 if(MLX_BUILD_METAL)
   list(APPEND GPU_TEST_SOURCES residency_tests.cpp metal_counters_tests.cpp
        metal_kernel_tests.cpp)
+  # Calls the jit_kernels.cpp entry points, whose header needs fmt.
+  if(MLX_METAL_JIT)
+    list(APPEND GPU_TEST_SOURCES metal_jit_tests.cpp)
+    target_link_libraries(tests PRIVATE fmt::fmt-header-only)
+  endif()
 endif()
 
 include(${doctest_SOURCE_DIR}/scripts/cmake/doctest.cmake)
