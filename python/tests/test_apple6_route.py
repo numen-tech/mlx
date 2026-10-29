@@ -220,8 +220,50 @@ def _other_cases():
     return cases
 
 
+def _minicpm_cases():
+    """MiniCPM5 1B (llama, bfloat16, 4-bit group 64, hidden 1536, MLP 4608, 16 query / 2 KV
+    heads of 128, so GQA 8): sdpa_vector takes at most 4 query rows (4 * 8 = 32)."""
+    cases = []
+
+    def qmm(K, N, M):
+        def run():
+            r = _rng(K + N + M)
+            w = mx.array(r.standard_normal((N, K)).astype(np.float32) * 0.05).astype(mx.bfloat16)
+            wq, scales, biases = mx.quantize(w, group_size=64, bits=4)
+            x = mx.array(r.standard_normal((1, M, K)).astype(np.float32)).astype(mx.bfloat16)
+            return mx.quantized_matmul(
+                x, wq, scales, biases, transpose=True, group_size=64, bits=4
+            )
+
+        cases.append((f"minicpm_qmm_K{K}_N{N}_M{M}", run))
+
+    for K, N in ((1536, 2048), (1536, 256), (2048, 1536), (1536, 4608), (4608, 1536), (1536, 130560)):
+        for M in (1, 4, 8):
+            qmm(K, N, M)
+
+    def sdpa(qL, kL, mask_kind):
+        def run():
+            r = _rng(qL * 77 + kL)
+            q = mx.array(r.standard_normal((1, 16, qL, 128)).astype(np.float32)).astype(mx.bfloat16)
+            k = mx.array(r.standard_normal((1, 2, kL, 128)).astype(np.float32)).astype(mx.bfloat16)
+            v = mx.array(r.standard_normal((1, 2, kL, 128)).astype(np.float32)).astype(mx.bfloat16)
+            if mask_kind == "array":
+                i = np.arange(qL)[:, None] + (kL - qL)
+                mask = mx.array(np.arange(kL)[None, :] <= i)
+            else:
+                mask = "causal"
+            return mx.fast.scaled_dot_product_attention(q, k, v, scale=128**-0.5, mask=mask)
+
+        cases.append((f"minicpm_sdpa_q{qL}_k{kL}_{mask_kind}", run))
+
+    for qL in (1, 2, 4):
+        sdpa(qL, 64, "causal")
+        sdpa(qL, 300, "array")
+    return cases
+
+
 def all_cases():
-    return _quantized_cases() + _sdpa_cases() + _other_cases()
+    return _quantized_cases() + _sdpa_cases() + _other_cases() + _minicpm_cases()
 
 
 def _error_cases():
@@ -255,6 +297,28 @@ def _error_cases():
         mx.eval(mx.fast.scaled_dot_product_attention(q, k, k, scale=1.0, mask="causal"))
 
     cases.append(("sdpa_16_queries", sdpa_long))
+
+    def minicpm_sdpa_five_queries():
+        # GQA 8 * 5 query rows = 40 > 32: past sdpa_vector's limit, so the steel path would be needed.
+        r = _rng(2)
+        q = mx.array(r.standard_normal((1, 16, 5, 128)).astype(np.float32)).astype(mx.bfloat16)
+        k = mx.array(r.standard_normal((1, 2, 64, 128)).astype(np.float32)).astype(mx.bfloat16)
+        mx.eval(mx.fast.scaled_dot_product_attention(q, k, k, scale=128**-0.5, mask="causal"))
+
+    cases.append(("minicpm_sdpa_gqa8_5_queries", minicpm_sdpa_five_queries))
+
+    def minicpm_quantized_kv_scores():
+        # Quantized-KV attention is a quantized matmul over gqa * queryLength rows: 16 for two queries.
+        r = _rng(3)
+        kq, ks, kb = mx.quantize(
+            mx.array(r.standard_normal((1, 2, 300, 128)).astype(np.float32)).astype(mx.bfloat16),
+            group_size=64,
+            bits=8,
+        )
+        q = mx.array(r.standard_normal((1, 2, 16, 128)).astype(np.float32)).astype(mx.bfloat16)
+        mx.eval(mx.quantized_matmul(q, kq, ks, kb, transpose=True, group_size=64, bits=8))
+
+    cases.append(("minicpm_quantized_kv_two_queries", minicpm_quantized_kv_scores))
 
     def dense_big():
         a = mx.ones((64, 256), dtype=mx.float16)
@@ -329,7 +393,9 @@ class TestApple6Route(mlx_tests.MLXTestCase):
                     self.assertEqual(got.shape, expect.shape)
                     scale = max(float(np.abs(expect).max()), 1e-6)
                     err = float(np.abs(got - expect).max()) / scale
-                    self.assertLess(err, 4e-3, f"{name}: max abs error / max |expect| = {err}")
+                    # bfloat16 (MiniCPM5) carries 8 mantissa bits: its two kernels differ by a few ulps.
+                    tol = 2e-2 if name.startswith("minicpm_") else 4e-3
+                    self.assertLess(err, tol, f"{name}: max abs error / max |expect| = {err}")
 
     def test_forced_route_raises_typed_error_for_mma_paths(self):
         with tempfile.TemporaryDirectory() as d:
