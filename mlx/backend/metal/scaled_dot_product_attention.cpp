@@ -1025,7 +1025,9 @@ std::tuple<bool, std::string> has_fused_kernel(
     // Head dim 512 uses the generic vector kernel, reading K/V is its main
     // cost. By default, use it only for one query, GQA factor 8, no array mask
     // and GPU generation 17+; setting MLX_SDPA_D512_MIN_KL lifts the gen gate.
-    if (query_head_dim == 512) {
+    // These are speed heuristics against the unfused path, which Apple6 cannot
+    // run (steel GEMMs), so they do not apply there (gemma4-qat#991).
+    if (query_head_dim == 512 && !apple6) {
       int env_min_key_sequence_length =
           env::get_var("MLX_SDPA_D512_MIN_KL", -1);
       bool use_default = (env_min_key_sequence_length < 0);
