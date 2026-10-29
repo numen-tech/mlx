@@ -325,6 +325,7 @@ void implicit_gemm_conv_2D_gpu(
     const array& wt,
     array& out,
     const MLXConvParams<2>& conv_params) {
+  d.require_mma("convolution (implicit GEMM)");
   const int groups = conv_params.groups;
   const int C_per_group = conv_params.C / conv_params.groups;
   const int O_per_group = conv_params.O / conv_params.groups;
@@ -469,6 +470,7 @@ void implicit_gemm_conv_2D_general_gpu(
     const array& wt,
     array& out,
     const MLXConvParams<2>& conv_params) {
+  d.require_mma("convolution (general implicit GEMM)");
   // Deduce implicit gemm size
   int implicit_M = safe_cast(
       static_cast<int64_t>(conv_params.N) * conv_params.oS[0] *
@@ -651,6 +653,7 @@ void implicit_gemm_conv_3D_gpu(
     const array& wt,
     array& out,
     const MLXConvParams<3>& conv_params) {
+  d.require_mma("convolution (3D implicit GEMM)");
   const int groups = conv_params.groups;
   const int C_per_group = conv_params.C / conv_params.groups;
   const int O_per_group = conv_params.O / conv_params.groups;
@@ -1088,6 +1091,7 @@ void winograd_conv_2D_gpu(
     const MLXConvParams<2>& conv_params,
     std::vector<array>& copies_w,
     int n_step) {
+  d.require_mma("convolution (Winograd)");
   int O_c = conv_params.O;
   int C_c = conv_params.C;
   auto [padded_h, padded_w] = winograd_padded_size(conv_params);

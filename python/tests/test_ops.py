@@ -3137,6 +3137,28 @@ class TestOps(mlx_tests.MLXTestCase):
                 mx.eval(out)
                 self.assertEqual(out.shape, a.shape)
 
+    def test_sort_block_sizes(self):
+        # A size either side of every switch in the sort kernels (the block size
+        # grows 32 -> 512 threads at 4 elements per thread, then the multi-block
+        # path takes over), so the threadgroup load loop runs every trip count
+        # from 1 to 4+ (gemma4-qat#935: it was miscompiled on Apple GPU family 7).
+        np.random.seed(11)
+        sizes = [1, 2, 3, 31, 32, 33, 127, 128, 129, 130, 255, 257, 511, 512, 513]
+        sizes += [1023, 1025, 2047, 2048, 2049, 4097, 8193, 20000]
+        for n in sizes:
+            for dtype in (np.float32, np.int32, np.float16):
+                if dtype == np.float16 and n > 2048:
+                    continue  # integers above 2048 are not all representable
+                with self.subTest(n=n, dtype=dtype):
+                    # distinct values: the expected argsort is unique
+                    a_np = np.stack([np.random.permutation(n) for _ in range(3)])
+                    a_np = a_np.astype(dtype)
+                    a_mx = mx.array(a_np)
+                    self.assertTrue(np.array_equal(np.sort(a_np, axis=-1), mx.sort(a_mx)))
+                    self.assertTrue(
+                        np.array_equal(np.argsort(a_np, axis=-1), mx.argsort(a_mx))
+                    )
+
     def test_partition(self):
         shape = (3, 4, 5)
         for dtype in ("int32", "float32"):

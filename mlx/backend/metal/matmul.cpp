@@ -382,6 +382,7 @@ void steel_matmul_regular_axpby(
     int64_t C_batch_stride /* = 0*/,
     float alpha /* = 1.0f */,
     float beta /* = 0.0f */) {
+  d.require_mma("matmul (steel GEMM)");
   using namespace mlx::steel;
 
   // Determine dispatch kernel
@@ -535,6 +536,7 @@ void steel_gemm_splitk_axpby(
     std::vector<array>& copies,
     float alpha = 1.0f,
     float beta = 0.0f) {
+  d.require_mma("matmul (split-K steel GEMM)");
   using namespace mlx::steel;
 
   int _tm = (M + 32 - 1) / 32;
@@ -1413,7 +1415,13 @@ inline std::optional<GemvWideConfig> gemv_wide_config(
   // Pre-M3 generations are limited by load issue rate rather than
   // bandwidth and do not profit from the amortized stream; they keep the
   // existing kernels.
-  if (d.get_architecture_gen() < 15) {
+  // Apple6 (A13) is the exception: it has no matrix-matrix kernel at all
+  // (gpu_family.h), so up to 8 vectors always take this MMA-free route.
+  if (d.is_apple6()) {
+    if (M > 8) {
+      return std::nullopt;
+    }
+  } else if (d.get_architecture_gen() < 15) {
     return std::nullopt;
   }
 
@@ -2150,6 +2158,8 @@ void BlockMaskedMM::eval_gpu(const std::vector<array>& inputs, array& out) {
         << "aligned"
         << "_K_" << (k_aligned ? "t" : "n") << "aligned";
 
+  d.require_mma("block_masked_mm (steel GEMM)");
+
   // Encode and dispatch kernel
   auto kernel = get_steel_gemm_masked_kernel(
       d,
@@ -2273,6 +2283,7 @@ void gather_mm_rhs(
     array& out,
     metal::Device& d,
     const Stream& s) {
+  d.require_mma("gather_mm (sorted rhs)");
   array indices = ensure_row_contiguous(indices_, d, s);
   auto [transpose_b, ldb, b] = ensure_batch_contiguous(b_, d, s);
 
@@ -2805,6 +2816,7 @@ void gather_mm(
     int K,
     metal::Device& d,
     const Stream& s) {
+  d.require_mma("gather_mm");
   auto& compute_encoder = metal::get_command_encoder(s);
 
   // Copy if needed
@@ -2998,6 +3010,7 @@ void segmented_mm(
     int K,
     metal::Device& d,
     const Stream& s) {
+  d.require_mma("segmented_mm");
   auto& compute_encoder = metal::get_command_encoder(s);
 
   auto check_segments_layout = [&](const array& x) {

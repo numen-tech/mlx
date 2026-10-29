@@ -11,6 +11,7 @@
 
 #include "mlx/array.h"
 #include "mlx/backend/common/metal_kernel.h"
+#include "mlx/backend/metal/gpu_family.h"
 #include "mlx/backend/metal/resident.h"
 #include "mlx/device.h"
 
@@ -166,6 +167,15 @@ class MLX_API Device {
   int get_architecture_gen() const {
     return arch_gen_;
   }
+  // True on an Apple6 (A13 / G12) GPU, which cannot build kernels holding a
+  // SIMD-group matrix multiply-accumulate (see gpu_family.h), or when
+  // MLX_FORCE_GPU_FAMILY=apple6 selects that route on any GPU. Fixed at init.
+  bool is_apple6() const {
+    return apple6_;
+  }
+  // Throws UnsupportedGPUFamilyError on an Apple6 GPU. Called by every
+  // dispatch that is about to build an MMA kernel; `what` names the operation.
+  void require_mma(const std::string& what) const;
   std::tuple<int, int> get_max_ops_mb_per_buffer() const {
     return std::make_tuple(max_ops_per_buffer_, max_mb_per_buffer_);
   }
@@ -249,6 +259,8 @@ class MLX_API Device {
       library_kernels_;
   std::string arch_;
   int arch_gen_;
+  bool apple6_{false};
+  bool log_kernel_load_{false};
   int max_ops_per_buffer_;
   int max_mb_per_buffer_;
 };

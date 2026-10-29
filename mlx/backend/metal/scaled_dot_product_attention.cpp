@@ -1595,6 +1595,11 @@ void ScaledDotProductAttention::eval_gpu(
 
   // Full attention mode
   else {
+    // The full-attention kernels are steel (MMA) kernels; an Apple6 GPU takes
+    // queries of up to 8 rows through sdpa_vector above and nothing longer.
+    d.require_mma(
+        "scaled_dot_product_attention with a query length of " +
+        std::to_string(q_pre.shape(2)) + " (more than 8)");
     const auto& q = copy_unless(is_matrix_contiguous, q_pre);
     const auto& k = copy_unless(is_matrix_contiguous, k_pre);
     const auto& v = copy_unless(is_matrix_contiguous, v_pre);

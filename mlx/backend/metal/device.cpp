@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <cstdlib>
+#include <iostream>
 #include <sstream>
 
 #include <fmt/format.h>
@@ -636,9 +637,21 @@ MTL::ComputeCommandEncoder* CommandEncoder::get_command_encoder() {
 Device::Device() : device_(load_device()), residency_sets_(device_.get()) {
   auto pool = new_scoped_memory_pool();
   default_library_ = NS::TransferPtr(load_default_library(device_.get()));
+  // Apple6 (A13 / G12): SIMD-group matrix MMA is an Apple7+ feature the G12
+  // backend compiler cannot lower. MLX_FORCE_GPU_FAMILY=apple6 selects the
+  // route on any GPU, for tests, and also adopts the A13's architecture string
+  // (applegpu_g12p, unless MLX_METAL_GPU_ARCH names another) so every
+  // generation-keyed tuning choice is the one an A13 makes.
+  const std::string& forced = env::force_gpu_family();
+  if (!forced.empty() && forced != "apple6") {
+    std::cerr << "[metal::Device] ignoring MLX_FORCE_GPU_FAMILY='" << forced
+              << "' (only 'apple6' is recognized)" << std::endl;
+  }
   arch_ = env::metal_gpu_arch();
   if (arch_.empty()) {
-    arch_ = std::string(device_->architecture()->name()->utf8String());
+    arch_ = forced == "apple6"
+        ? std::string("applegpu_g12p")
+        : std::string(device_->architecture()->name()->utf8String());
   }
   int ag_tens = 0;
   int ag_ones = 0;
@@ -649,6 +662,10 @@ Device::Device() : device_(load_device()), residency_sets_(device_.get()) {
     ag_ones = (ag_ones < 10 && ag_ones >= 0) ? ag_ones : 0;
   }
   arch_gen_ = ag_tens * 10 + ag_ones;
+  apple6_ = forced == "apple6" ||
+      (device_->supportsFamily(MTL::GPUFamilyApple6) &&
+       !device_->supportsFamily(MTL::GPUFamilyApple7));
+  log_kernel_load_ = env::get_var("MLX_LOG_KERNEL_LOAD", 0) != 0;
   auto arch = arch_.back();
   switch (arch) {
     case 'p': // phone
@@ -677,6 +694,16 @@ Device::Device() : device_(load_device()), residency_sets_(device_.get()) {
 }
 
 Device::~Device() = default;
+
+void Device::require_mma(const std::string& what) const {
+  if (apple6_) {
+    throw UnsupportedGPUFamilyError(
+        what +
+        " needs SIMD-group matrix multiply-accumulate, which this GPU (" +
+        arch_ +
+        ", Apple6 / A13) cannot build; Apple7 (A14) or later is required.");
+  }
+}
 
 MTL::Library* Device::get_library(
     const std::string& name,
@@ -801,6 +828,11 @@ NS::SharedPtr<MTL::ComputePipelineState> Device::get_kernel_(
     if (error) {
       msg << error->localizedDescription()->utf8String() << "\n";
     }
+    // On an Apple6 GPU a failed pipeline is almost always the backend compiler
+    // refusing an MMA instruction; report it as the typed error.
+    if (apple6_) {
+      throw UnsupportedGPUFamilyError(msg.str());
+    }
     throw std::runtime_error(msg.str());
   }
 
@@ -840,6 +872,9 @@ NS::SharedPtr<MTL::ComputePipelineState> Device::get_kernel_(
     msg << "[metal::Device] Unable to load kernel " << name << "\n";
     if (error) {
       msg << error->localizedDescription()->utf8String() << "\n";
+    }
+    if (apple6_) {
+      throw UnsupportedGPUFamilyError(msg.str());
     }
     throw std::runtime_error(msg.str());
   }
@@ -903,6 +938,17 @@ MTL::ComputePipelineState* Device::get_kernel_(
   auto& kernel_map_ = library_kernels_[mtl_lib];
   if (auto it = kernel_map_.find(hash_name); it != kernel_map_.end()) {
     return it->second.get();
+  }
+
+  if (log_kernel_load_) {
+    std::cerr << "[mlx:kernel-load] " << hash_name
+              << (is_mma_kernel_name(base_name) ? " mma=1" : " mma=0")
+              << std::endl;
+  }
+  // The dispatch code routes around MMA kernels on Apple6; this is the
+  // backstop that keeps one it missed away from the backend compiler.
+  if (apple6_ && is_mma_kernel_name(base_name)) {
+    require_mma("Metal kernel " + hash_name);
   }
 
   auto pool = new_scoped_memory_pool();

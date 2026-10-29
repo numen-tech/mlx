@@ -104,7 +104,8 @@ void GatedDeltaUpdate::eval_gpu(
   int Hv = v.shape(2);
   int Dv = v.shape(3);
 
-  int C = gated_delta_chunk_size(T);
+  // Apple6 (A13) has no MMA: always the sequential kernel (gpu_family.h).
+  int C = d.is_apple6() ? 1 : gated_delta_chunk_size(T);
   const int ckpt = gated_delta_ckpt(C);
 
   std::string suffix = get_type_string(q.dtype()) + "_" + std::to_string(Dk) +
