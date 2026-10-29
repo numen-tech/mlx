@@ -283,10 +283,10 @@ struct KernelMergeSort {
     inp += tid.y * in_stride_segment_axis;
     out += tid.y * out_stride_segment_axis;
 
-    // Copy into threadgroup memory. `int`, not `short`: on Apple GPU family 7
-    // (A14, iOS 26) this loop with a 16-bit induction variable loses its
-    // threadgroup stores at most trip counts (gemma4-qat#935).
-    for (int i = lid.x; i < N_PER_BLOCK; i += BLOCK_THREADS) {
+    // Copy into threadgroup memory. `ushort`, not `short`: on Apple GPU
+    // family 7 (A14, iOS 26) this loop with a signed 16-bit induction variable
+    // loses its threadgroup stores at most trip counts (gemma4-qat#935).
+    for (ushort i = lid.x; i < N_PER_BLOCK; i += BLOCK_THREADS) {
       tgp_vals[i] = i < size_sorted_axis ? inp[i * in_stride_sorted_axis]
                                          : ValT(CompareOp::init);
       if (ARG_SORT) {
@@ -461,10 +461,10 @@ struct KernelMultiBlockMergeSort {
     // tid.y tells us the segment index
     int base_idx = tid.x * N_PER_BLOCK;
 
-    // Copy into threadgroup memory. `int`, not `short`: on Apple GPU family 7
-    // (A14, iOS 26) this loop with a 16-bit induction variable loses its
-    // threadgroup stores at most trip counts (gemma4-qat#935).
-    for (int i = lid.x; i < N_PER_BLOCK; i += BLOCK_THREADS) {
+    // Copy into threadgroup memory. `ushort`, not `short`: on Apple GPU
+    // family 7 (A14, iOS 26) this loop with a signed 16-bit induction variable
+    // loses its threadgroup stores at most trip counts (gemma4-qat#935).
+    for (ushort i = lid.x; i < N_PER_BLOCK; i += BLOCK_THREADS) {
       int idx = base_idx + i;
       tgp_vals[i] = idx < size_sorted_axis ? inp[idx * stride_sorted_axis]
                                            : ValT(CompareOp::init);

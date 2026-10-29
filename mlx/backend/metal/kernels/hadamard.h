@@ -47,10 +47,7 @@ template <typename T, int N, int max_radix, int read_width, int stride = 1>
   constexpr short final_radix = 1 << (logFinal);
 
   int batch_idx = elem.y * N * stride + elem.z;
-  // `int` for i, index, h, k and j: with 16-bit (`short`) indices into the
-  // threadgroup buffer the kernel returns garbage on Apple GPU family 7 (A14,
-  // iOS 26).
-  int i = elem.x;
+  short i = elem.x;
 
   threadgroup T buf[N];
 
@@ -58,7 +55,11 @@ template <typename T, int N, int max_radix, int read_width, int stride = 1>
   if (stride == 1) {
     STEEL_PRAGMA_UNROLL
     for (short j = 0; j < max_radix / read_width; j++) {
-      int index = j * read_width * num_threads + i * read_width;
+      // `ushort`, not `short`, for this index and for `j` below and the write
+      // index at the end: with a signed 16-bit index into the threadgroup
+      // buffer the kernel returns garbage on Apple GPU family 7 (A14, iOS 26)
+      // (gemma4-qat#935).
+      ushort index = j * read_width * num_threads + i * read_width;
       STEEL_PRAGMA_UNROLL
       for (short r = 0; r < read_width; r++) {
         buf[index + r] = in[batch_idx + index + r];
@@ -74,12 +75,12 @@ template <typename T, int N, int max_radix, int read_width, int stride = 1>
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
   float x[max_radix];
-  int h = 1;
+  short h = 1;
 
   STEEL_PRAGMA_UNROLL
   for (short s = 0; s < num_steps; s++) {
-    int k = i & (h - 1);
-    int j = ((i - k) << logR) + k;
+    short k = i & (h - 1);
+    ushort j = ((i - k) << logR) + k;
 
     STEEL_PRAGMA_UNROLL
     for (short r = 0; r < max_radix; r++) {
@@ -104,9 +105,9 @@ template <typename T, int N, int max_radix, int read_width, int stride = 1>
     // Each thread does multiple butterflies
     STEEL_PRAGMA_UNROLL
     for (int t = 0; t < max_radix / final_radix; t++) {
-      int index = i + t * num_threads;
-      int k = index & (h - 1);
-      int j = ((index - k) << logFinal) + k;
+      short index = i + t * num_threads;
+      short k = index & (h - 1);
+      short j = ((index - k) << logFinal) + k;
       STEEL_PRAGMA_UNROLL
       for (short r = 0; r < final_radix; r++) {
         x[r] = buf[j + h * r];
@@ -126,7 +127,7 @@ template <typename T, int N, int max_radix, int read_width, int stride = 1>
   if (stride == 1) {
     STEEL_PRAGMA_UNROLL
     for (short j = 0; j < max_radix / read_width; j++) {
-      int index = j * read_width * num_threads + i * read_width;
+      ushort index = j * read_width * num_threads + i * read_width;
       STEEL_PRAGMA_UNROLL
       for (short r = 0; r < read_width; r++) {
         out[batch_idx + index + r] = T(buf[index + r] * scale);
@@ -155,7 +156,7 @@ template <typename T, int N, int M, int read_width>
   // of a Hadamard transform of size M*N where N = 2^k.
 
   int index = elem.x * grid.y + elem.y;
-  int i = index % (N / read_width);
+  short i = index % (N / read_width);
   int batch_idx = index / (N / read_width) * M * N;
 
   float x[read_width][M];
