@@ -13,8 +13,10 @@ child process with the route forced, and compare:
 * results agree within fp16 / 2-bit tolerance for the Ternary Bonsai 2 2B
   shapes (hidden 2048, MLP 6144, 8 query / 2 KV heads of 256, depthwise
   conv1d of width 4 over 6144 channels, 128-wide gated-delta heads);
-* inputs that would need an MMA kernel (more than 8 rows) raise
-  RuntimeError starting with "[mlx:unsupported-gpu-family]";
+* inputs that would still need an MMA kernel (route version 2, gemma4-qat#991:
+  quantized matmuls past 8 rows that the SIMT GEMM does not take, dense
+  matmuls past 64 rows, attention without a vector kernel for its head dim)
+  raise RuntimeError starting with "[mlx:unsupported-gpu-family]";
 * with MLX_LOG_KERNEL_LOAD=1 every kernel the forced route builds is reported
   with mma=0.
 """
@@ -82,9 +84,15 @@ def _quantized_cases():
     for K, N in BONSAI_2B_SHAPES:
         for M in (1, 2, 3, 5, 8):
             qmm_case(K, N, 2, M, False)
+    # Route version 2 (gemma4-qat#991): more than 8 rows go through the SIMT GEMM
+    # (affine_qgemm_simt: BM 8 / 16 / 32 tiles, M tiled in the grid, ragged M and N).
+    for K, N in BONSAI_2B_SHAPES[:5]:
+        for M in (9, 16, 17, 32, 33, 64):
+            qmm_case(K, N, 2, M, False)
+    qmm_case(2048, 6144, 2, 100, False)
     # Other widths on one shape, and the bias-free 2-bit path the Hadamard packs use.
     for bits in (4, 8):
-        for M in (2, 8):
+        for M in (2, 8, 9, 32, 33):
             qmm_case(2048, 6144, bits, M, False)
     for M in (1, 4, 8):
         qmm_case(2048, 2048, 2, M, True)
@@ -121,17 +129,20 @@ def _sdpa_cases():
 
         cases.append((f"sdpa_q{qL}_k{kL}_{mask_kind}", run))
 
-    for qL in (1, 2, 5, 8):
+    for qL in (1, 2, 5, 8, 9, 16, 32, 33):
         for kL, mask_kind in ((64, "causal"), (300, "array"), (8, "causal")):
             if qL <= kL:
                 sdpa_case(qL, kL, mask_kind)
+    # Keys long enough for the 2-pass kernel on the normal route (GQA 4, >= 4096).
+    sdpa_case(1, 4200, "none")
+    sdpa_case(32, 4200, "causal")
     return cases
 
 
 def _other_cases():
     cases = []
 
-    for M in (2, 5, 8):
+    for M in (2, 5, 8, 9, 16, 32, 33, 64):
         # GDN in_proj_a / in_proj_b: a dense fp16 [16, 2048] Linear over the chunk.
         def dense(M=M):
             r = _rng(M)
@@ -145,7 +156,7 @@ def _other_cases():
 
         cases.append((f"dense_matmul_M{M}_N16", dense))
 
-    for L in (1, 4, 8):
+    for L in (1, 4, 8, 32, 33):
         # GDN depthwise causal conv1d: state(3) + chunk, width 4, 6144 channels.
         def conv(L=L):
             r = _rng(L + 99)
@@ -159,7 +170,7 @@ def _other_cases():
 
         cases.append((f"depthwise_conv1d_L{L}", conv))
 
-    for T in (1, 8, 24):
+    for T in (1, 8, 24, 32, 33):
         # GDN recurrence through the fork's fused op (forced route is always sequential).
         def gdn(T=T):
             r = _rng(T + 5)
@@ -238,7 +249,7 @@ def _minicpm_cases():
         cases.append((f"minicpm_qmm_K{K}_N{N}_M{M}", run))
 
     for K, N in ((1536, 2048), (1536, 256), (2048, 1536), (1536, 4608), (4608, 1536), (1536, 130560)):
-        for M in (1, 4, 8):
+        for M in (1, 4, 8, 9, 16, 32, 33):
             qmm(K, N, M)
 
     def sdpa(qL, kL, mask_kind):
@@ -256,7 +267,7 @@ def _minicpm_cases():
 
         cases.append((f"minicpm_sdpa_q{qL}_k{kL}_{mask_kind}", run))
 
-    for qL in (1, 2, 4):
+    for qL in (1, 2, 4, 5, 16, 32):
         sdpa(qL, 64, "causal")
         sdpa(qL, 300, "array")
     return cases
@@ -286,29 +297,23 @@ def _error_cases():
 
         return run
 
-    cases.append(("qmm_9_rows", qmm_rows(9)))
-    cases.append(("qmm_64_rows", qmm_rows(64)))
-    cases.append(("qmm_4bit_33_rows", qmm_rows(33, bits=4)))
+    # Not eligible for the SIMT GEMM (affine 2/4/8-bit, transposed, non-batched,
+    # K and group_size multiples of 32): 3-bit weights past 8 rows are still refused.
+    cases.append(("qmm_3bit_9_rows", qmm_rows(9, bits=3)))
+    cases.append(("qmm_3bit_64_rows", qmm_rows(64, bits=3)))
 
-    def sdpa_long():
-        r = _rng(1)
-        q = mx.array(r.standard_normal((1, 8, 16, 256)).astype(np.float32)).astype(mx.float16)
-        k = mx.array(r.standard_normal((1, 2, 64, 256)).astype(np.float32)).astype(mx.float16)
-        mx.eval(mx.fast.scaled_dot_product_attention(q, k, k, scale=1.0, mask="causal"))
+    def qmm_not_transposed():
+        r = _rng(5)
+        w = mx.array(r.standard_normal((2048, 512)).astype(np.float32) * 0.05).astype(mx.float16)
+        wq, scales, biases = mx.quantize(w, group_size=128, bits=4)
+        x = mx.array(r.standard_normal((16, 2048)).astype(np.float32)).astype(mx.float16)
+        mx.eval(mx.quantized_matmul(x, wq, scales, biases, transpose=False, group_size=128, bits=4))
 
-    cases.append(("sdpa_16_queries", sdpa_long))
-
-    def minicpm_sdpa_five_queries():
-        # GQA 8 * 5 query rows = 40 > 32: past sdpa_vector's limit, so the steel path would be needed.
-        r = _rng(2)
-        q = mx.array(r.standard_normal((1, 16, 5, 128)).astype(np.float32)).astype(mx.bfloat16)
-        k = mx.array(r.standard_normal((1, 2, 64, 128)).astype(np.float32)).astype(mx.bfloat16)
-        mx.eval(mx.fast.scaled_dot_product_attention(q, k, k, scale=128**-0.5, mask="causal"))
-
-    cases.append(("minicpm_sdpa_gqa8_5_queries", minicpm_sdpa_five_queries))
+    cases.append(("qmm_not_transposed_16_rows", qmm_not_transposed))
 
     def minicpm_quantized_kv_scores():
-        # Quantized-KV attention is a quantized matmul over gqa * queryLength rows: 16 for two queries.
+        # Quantized-KV attention is a batched quantized matmul (gqa * queryLength rows): batched
+        # weights are not eligible for the SIMT GEMM.
         r = _rng(3)
         kq, ks, kb = mx.quantize(
             mx.array(r.standard_normal((1, 2, 300, 128)).astype(np.float32)).astype(mx.bfloat16),
@@ -321,18 +326,28 @@ def _error_cases():
     cases.append(("minicpm_quantized_kv_two_queries", minicpm_quantized_kv_scores))
 
     def dense_big():
-        a = mx.ones((64, 256), dtype=mx.float16)
+        # Past kApple6GemvWideMaxRows (64).
+        a = mx.ones((65, 256), dtype=mx.float16)
         b = mx.ones((256, 256), dtype=mx.float16)
         mx.eval(a @ b)
 
-    cases.append(("dense_matmul_64_rows", dense_big))
+    cases.append(("dense_matmul_65_rows", dense_big))
 
-    def dense_nine():
+    def dense_vocab_wide():
         a = mx.ones((9, 2048), dtype=mx.float16)
-        b = mx.ones((16, 2048), dtype=mx.float16)
+        b = mx.ones((65536, 2048), dtype=mx.float16)
         mx.eval(a @ b.T)
 
-    cases.append(("dense_matmul_9_rows", dense_nine))
+    cases.append(("dense_matmul_9_rows_vocab_wide", dense_vocab_wide))
+
+    def sdpa_head_dim_without_a_vector_kernel():
+        # Head dim 80 has a steel kernel but no vector kernel: the unfused path would need steel GEMMs.
+        r = _rng(7)
+        q = mx.array(r.standard_normal((1, 8, 16, 80)).astype(np.float32)).astype(mx.float16)
+        k = mx.array(r.standard_normal((1, 2, 64, 80)).astype(np.float32)).astype(mx.float16)
+        mx.eval(mx.fast.scaled_dot_product_attention(q, k, k, scale=1.0, mask="causal"))
+
+    cases.append(("sdpa_head_dim_80", sdpa_head_dim_without_a_vector_kernel))
 
     def conv2d():
         x = mx.ones((1, 32, 32, 16), dtype=mx.float16)

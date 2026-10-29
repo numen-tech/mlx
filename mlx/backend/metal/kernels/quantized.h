@@ -2240,6 +2240,201 @@ template <
       simd_lid);
 }
 
+// SIMT quantized GEMM for the Apple6 (A13) MMA-free route (gemma4-qat#991).
+//
+// y[M, N] = x[M, K] . dequant(w)[N, K]^T without simdgroup matrices. A
+// threadgroup of 128 threads owns a BM x BN output tile. For every BK slice of
+// K it (1) stages the x tile (BM x BK) and (2) dequantizes the weight tile
+// (BN x BK) ONCE into threadgroup memory, then every thread multiplies a TM x
+// TN register block out of those two tiles. The weights are decoded once per
+// BM rows (qmv_wide decodes them once per 4-7 rows) and each threadgroup read
+// feeds (TM * TN) / (TM + TN) FMAs, where qmv_wide issues one device load per
+// FMA. Host requirements (qgemm_simt_ok): non-batched, K % BK == 0,
+// group_size % BK == 0, bits in {2, 4, 8}, TN == 4, TM in {2, 4}.
+//
+// Every induction variable is `uint` (never a signed `short`: the A14 compiler
+// miscompiles those in threadgroup-store loops, gemma4-qat#935).
+template <
+    typename T,
+    int group_size,
+    int bits,
+    int BM,
+    int BN,
+    int BK,
+    int TM,
+    int TN,
+    bool implied_bias = false>
+METAL_FUNC void qgemm_simt_impl(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x,
+    device T* y,
+    const constant int& K_,
+    const constant int& N_,
+    const constant int& M_,
+    threadgroup float* As,
+    threadgroup float* Ws,
+    uint3 tid,
+    uint lid) {
+  constexpr uint NT = 128;
+  static_assert((BM / TM) * (BN / TN) == NT, "tile does not match 128 threads");
+  static_assert(
+      TN == 4 && (TM == 4 || TM == 2), "register block is 4x4 or 2x4");
+  static_assert(NT % BM == 0 && BK % (NT / BM) == 0, "x tile split");
+  static_assert(NT % BN == 0 && BK % (NT / BN) == 0, "w tile split");
+  static_assert(bits == 2 || bits == 4 || bits == 8, "2/4/8-bit only");
+  static_assert(group_size % BK == 0, "a K slice must lie inside one group");
+
+  typedef float U;
+
+  const uint K = uint(K_);
+  const uint N = uint(N_);
+  const uint M = uint(M_);
+  const uint m0 = tid.y * uint(BM);
+  const uint n0 = tid.x * uint(BN);
+
+  // Compute coordinates: thread (tm, tn) owns output rows m0 + tm * TM + i and
+  // columns n0 + tn * TN + j.
+  constexpr uint TNC = uint(BN / TN);
+  const uint tn = lid % TNC;
+  const uint tm = lid / TNC;
+
+  // x tile: thread (xm, xs) stages row xm, columns [xs * XKP, (xs + 1) * XKP)
+  // of the slice, written transposed (As[k][m]) so lanes of a simdgroup hit
+  // consecutive addresses.
+  constexpr uint XSEG = NT / uint(BM);
+  constexpr uint XKP = uint(BK) / XSEG;
+  const uint xm = lid % uint(BM);
+  const uint xs = lid / uint(BM);
+  const device T* xrow = x + min(m0 + xm, M - 1) * K + xs * XKP;
+
+  // w tile: thread (wn, ws) decodes row wn, columns [ws * WKP, (ws + 1) * WKP)
+  // of the slice into Ws[k][n].
+  constexpr uint WSEG = NT / uint(BN);
+  constexpr uint WKP = uint(BK) / WSEG;
+  const uint wn = lid % uint(BN);
+  const uint ws = lid / uint(BN);
+  const uint wrow_n = min(n0 + wn, N - 1);
+  const uint groups = K / uint(group_size);
+  const device uint8_t* wrow = (const device uint8_t*)w +
+      wrow_n * (K * uint(bits) / 8) + (ws * WKP) * uint(bits) / 8;
+  const device T* srow = scales + wrow_n * groups;
+  const device T* brow = biases + wrow_n * groups;
+  const T f = implied_bias ? biases[0] : T(0);
+
+  U acc[TM][TN];
+#pragma unroll
+  for (uint i = 0; i < uint(TM); i++) {
+#pragma unroll
+    for (uint j = 0; j < uint(TN); j++) {
+      acc[i][j] = 0;
+    }
+  }
+
+  for (uint k0 = 0; k0 < K; k0 += uint(BK)) {
+#pragma unroll
+    for (uint i = 0; i < XKP; i++) {
+      As[(xs * XKP + i) * uint(BM) + xm] = static_cast<U>(xrow[k0 + i]);
+    }
+    {
+      const uint g = (k0 + ws * WKP) / uint(group_size);
+      const U scale = srow[g];
+      const U bias = affine_bias<U, T, bits, false, implied_bias>(
+          scale, f, srow[g], brow + g);
+      U wl[WKP];
+      dequantize<U, int(WKP), bits>(
+          wrow + k0 * uint(bits) / 8, scale, bias, wl);
+#pragma unroll
+      for (uint i = 0; i < WKP; i++) {
+        Ws[(ws * WKP + i) * uint(BN) + wn] = wl[i];
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+#pragma unroll
+    for (uint kk = 0; kk < uint(BK); kk++) {
+      U a[TM];
+      if constexpr (TM == 4) {
+        const float4 av =
+            *(const threadgroup float4*)(As + kk * uint(BM) + tm * 4);
+        a[0] = av.x;
+        a[1] = av.y;
+        a[2] = av.z;
+        a[3] = av.w;
+      } else {
+        const float2 av =
+            *(const threadgroup float2*)(As + kk * uint(BM) + tm * 2);
+        a[0] = av.x;
+        a[1] = av.y;
+      }
+      const float4 bv =
+          *(const threadgroup float4*)(Ws + kk * uint(BN) + tn * 4);
+#pragma unroll
+      for (uint i = 0; i < uint(TM); i++) {
+        acc[i][0] = fma(a[i], bv.x, acc[i][0]);
+        acc[i][1] = fma(a[i], bv.y, acc[i][1]);
+        acc[i][2] = fma(a[i], bv.z, acc[i][2]);
+        acc[i][3] = fma(a[i], bv.w, acc[i][3]);
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+
+#pragma unroll
+  for (uint i = 0; i < uint(TM); i++) {
+    const uint m = m0 + tm * uint(TM) + i;
+    if (m < M) {
+#pragma unroll
+      for (uint j = 0; j < uint(TN); j++) {
+        const uint n = n0 + tn * uint(TN) + j;
+        if (n < N) {
+          y[m * N + n] = static_cast<T>(acc[i][j]);
+        }
+      }
+    }
+  }
+}
+
+template <
+    typename T,
+    int group_size,
+    int bits,
+    int BM,
+    int BN,
+    int BK,
+    int TM,
+    int TN,
+    bool implied_bias = false>
+[[kernel]] void affine_qgemm_simt(
+    const device uint32_t* w [[buffer(0)]],
+    const device T* scales [[buffer(1)]],
+    const device T* biases [[buffer(2)]],
+    const device T* x [[buffer(3)]],
+    device T* y [[buffer(4)]],
+    const constant int& K [[buffer(5)]],
+    const constant int& N [[buffer(6)]],
+    const constant int& M [[buffer(7)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint lid [[thread_index_in_threadgroup]]) {
+  // float4 storage keeps both tiles 16-byte aligned for the vector reads.
+  threadgroup float4 as4[BK * BM / 4];
+  threadgroup float4 ws4[BK * BN / 4];
+  qgemm_simt_impl<T, group_size, bits, BM, BN, BK, TM, TN, implied_bias>(
+      w,
+      scales,
+      biases,
+      x,
+      y,
+      K,
+      N,
+      M,
+      (threadgroup float*)as4,
+      (threadgroup float*)ws4,
+      tid,
+      lid);
+}
+
 // Row-reuse affine qmv_wide (gemma4-qat#313): 2/4/8-bit, K % 256 == 0. Same
 // buffers and grid as affine_qmv_wide with k_lanes = 8: SIMD_SIZE / 8 = 4 rows
 // per simdgroup, 8 output rows per threadgroup.

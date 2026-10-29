@@ -178,6 +178,32 @@
   instantiate_quantized_wide_rr_types(64, bits)    \
   instantiate_quantized_wide_rr_types(32, bits)
 
+// SIMT quantized GEMM for the Apple6 route (gemma4-qat#991): three tiles by the
+// number of rows M (BM 8 / 16 / 32, 128 threads each), 2/4/8-bit. The "_ib"
+// twin takes an implied bias.
+#define instantiate_qgemm_simt_cfg(type, group_size, bits, BM, BN, TM) \
+  instantiate_kernel(                                                  \
+      "affine_qgemm_simt_" #type "_gs_" #group_size "_b_" #bits "_bm_" #BM, \
+      affine_qgemm_simt, type, group_size, bits, BM, BN, 32, TM, 4)    \
+  instantiate_kernel(                                                  \
+      "affine_qgemm_simt_" #type "_gs_" #group_size "_b_" #bits "_bm_" #BM "_ib", \
+      affine_qgemm_simt, type, group_size, bits, BM, BN, 32, TM, 4, true)
+
+#define instantiate_qgemm_simt_bits(type, group_size, bits)       \
+  instantiate_qgemm_simt_cfg(type, group_size, bits, 8, 128, 2)   \
+  instantiate_qgemm_simt_cfg(type, group_size, bits, 16, 128, 4)  \
+  instantiate_qgemm_simt_cfg(type, group_size, bits, 32, 64, 4)
+
+#define instantiate_qgemm_simt_types(group_size, bits)            \
+  instantiate_qgemm_simt_bits(float, group_size, bits)            \
+  instantiate_qgemm_simt_bits(float16_t, group_size, bits)        \
+  instantiate_qgemm_simt_bits(bfloat16_t, group_size, bits)
+
+#define instantiate_qgemm_simt_groups(bits) \
+  instantiate_qgemm_simt_types(128, bits)   \
+  instantiate_qgemm_simt_types(64, bits)    \
+  instantiate_qgemm_simt_types(32, bits)
+
 #define instantiate_quantized_all_splitk(type, group_size, bits)   \
   instantiate_quantized_split_k(affine_qvm_split_k, type, group_size, bits, 8)   \
   instantiate_quantized_split_k(affine_qvm_split_k, type, group_size, bits, 32)  \
@@ -340,6 +366,9 @@
   instantiate_quantized_groups(6) \
   instantiate_quantized_groups(8) \
   instantiate_quantized_wide_rr_groups(8) \
+  instantiate_qgemm_simt_groups(2) \
+  instantiate_qgemm_simt_groups(4) \
+  instantiate_qgemm_simt_groups(8) \
   instantiate_quantized_sym_groups(1) \
   instantiate_quantized_sym_groups(2) \
   instantiate_quantized_ib_groups(1) \

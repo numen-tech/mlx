@@ -59,6 +59,8 @@ TEST_CASE("test apple6 MMA-free kernel names are allowed") {
       "affine_qmv_wide_float16_t_gs_128_b_2_nv_5_kl_8_batch_0",
       "affine_qmv_wide_float16_t_gs_128_b_2_nv_5_kl_8_batch_0_ib",
       "affine_qmv_wide_rr_float16_t_gs_128_b_2_nv_5_batch_0",
+      "affine_qgemm_simt_float16_t_gs_128_b_2_bm_32",
+      "affine_qgemm_simt_bfloat16_t_gs_64_b_4_bm_8_ib",
       "affine_qmv_quad_float16_t_gs_128_b_2_d_128_batch_0",
       "affine_sym_qmv_fast_float16_t_gs_128_b_2_batch_0_pr_0_hgs_0_r_4",
       "affine_qvm_float16_t_gs_128_b_4",
@@ -101,6 +103,7 @@ TEST_CASE("test apple6 typed error carries the prefix") {
 }
 
 TEST_CASE("test apple6 route version is published") {
-  // Downstream packages gate their A13 allowlist on this being >= 1.
-  CHECK(kApple6RouteVersion >= 1);
+  // Downstream packages gate their A13 allowlist on this being >= 1, and the
+  // wider prefill window (SIMT GEMM, any-length sdpa_vector) on >= 2.
+  CHECK(kApple6RouteVersion >= 2);
 }
