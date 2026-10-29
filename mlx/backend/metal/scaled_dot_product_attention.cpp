@@ -959,8 +959,14 @@ std::tuple<bool, std::string> has_fused_kernel(
   const int num_kv_heads = k.shape(1);
   const int gqa_factor = num_query_heads / num_kv_heads;
 
+  // Apple6 (A13) has no steel (MMA) attention: sdpa_vector takes every
+  // query length there, one threadgroup per (head, query row), and the
+  // query length times GQA <= 32 limit of the 2-pass kernel does not apply
+  // because the 2-pass kernel is never used (gemma4-qat#991).
+  const bool apple6 = metal::device(s.device).is_apple6();
+
   std::ostringstream msg;
-  if (query_sequence_length > 8) {
+  if (query_sequence_length > 8 && !apple6) {
     const bool supports_d512 = metal::is_nax_available() &&
         (env::enable_tf32() || q.dtype() != float32);
     const bool asymmetric = query_head_dim == 96 && value_head_dim == 64;
@@ -1010,7 +1016,7 @@ std::tuple<bool, std::string> has_fused_kernel(
           << ".";
       return {false, msg.str()};
     }
-    if (query_sequence_length * gqa_factor > 32) {
+    if (!apple6 && query_sequence_length * gqa_factor > 32) {
       msg << "the vector attention kernel requires the query length times "
           << "the GQA factor to be at most 32; got query length "
           << query_sequence_length << " and GQA factor " << gqa_factor << ".";
@@ -1422,6 +1428,10 @@ bool ScaledDotProductAttention::use_fallback(
     }
     return false;
   }
+  if (s.device == Device::gpu && metal::device(s.device).is_apple6()) {
+    // The unfused path is matmul + softmax, i.e. steel GEMMs (gemma4-qat#991).
+    return !has_fused;
+  }
   if (use_blocked_d512(
           q, k, v, has_arr_mask, do_causal, has_sinks, output_logsumexp, s)) {
     return false;
@@ -1515,8 +1525,9 @@ void ScaledDotProductAttention::eval_gpu(
   }
   bool has_arr_mask = inputs.size() > (3 + has_sinks_);
 
-  // We are in vector mode ie single query
-  if (q_pre.shape(2) <= 8) {
+  // We are in vector mode ie single query (Apple6: every query length,
+  // gemma4-qat#991)
+  if (q_pre.shape(2) <= 8 || d.is_apple6()) {
     if (outputs.size() > 1) {
       throw std::runtime_error(
           "[scaled_dot_product_attention] the vector kernels do not produce a "
@@ -1585,8 +1596,9 @@ void ScaledDotProductAttention::eval_gpu(
     // - The sequence length is even longer and we have gqa
     bool do_causal = do_causal_ && q.shape(2) > 1;
     char devc = d.get_architecture().back();
-    if (((devc == 'd' || devc == 's') && k.shape(2) >= 1024) ||
-        (k.shape(1) < q.shape(1) && k.shape(2) >= 4096)) {
+    if (!d.is_apple6() &&
+        (((devc == 'd' || devc == 's') && k.shape(2) >= 1024) ||
+         (k.shape(1) < q.shape(1) && k.shape(2) >= 4096))) {
       sdpa_vector_2pass(s, d, q, k, v, o, scale_, do_causal, mask, sinks);
     } else {
       sdpa_vector(s, d, q, k, v, o, scale_, do_causal, mask, sinks);

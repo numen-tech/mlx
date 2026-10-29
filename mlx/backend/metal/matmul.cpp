@@ -1416,9 +1416,13 @@ inline std::optional<GemvWideConfig> gemv_wide_config(
   // bandwidth and do not profit from the amortized stream; they keep the
   // existing kernels.
   // Apple6 (A13) is the exception: it has no matrix-matrix kernel at all
-  // (gpu_family.h), so up to 8 vectors always take this MMA-free route.
+  // (gpu_family.h), so up to kApple6GemvWideMaxRows vectors always take this
+  // MMA-free route, in passes of at most 5 with no pass limit (gemma4-qat#991;
+  // 8 before it). A vocab-wide N keeps the 8-row limit: its single grid column
+  // holds one pass.
+  constexpr int kApple6GemvWideMaxRows = 64;
   if (d.is_apple6()) {
-    if (M > 8) {
+    if (M > kApple6GemvWideMaxRows || (M > 8 && N >= 65536)) {
       return std::nullopt;
     }
   } else if (d.get_architecture_gen() < 15) {
@@ -1447,7 +1451,7 @@ inline std::optional<GemvWideConfig> gemv_wide_config(
   // M balances across passes that each re-stream the matrix, and a fourth
   // pass no longer pays.
   int passes = (M + 4) / 5;
-  if (passes > 3) {
+  if (passes > 3 && !d.is_apple6()) {
     return std::nullopt;
   }
 

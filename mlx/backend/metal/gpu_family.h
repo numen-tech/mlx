@@ -14,10 +14,15 @@
 // instruction for G12`). Every steel GEMM, qmm, steel attention and implicit
 // GEMM convolution kernel holds one, so on an Apple6 GPU MLX
 //
-//   * routes quantized matmuls with M <= 8 to the MMA-free qmv / qmv_wide
-//     kernels and full attention with a query length <= 8 to sdpa_vector, and
+//   * routes affine 2/4/8-bit quantized matmuls of 5 or more rows to the SIMT
+//     GEMM (affine_qgemm_simt, numen-tech/gemma4-qat#991) and the rest of at
+//     most 8 rows to the MMA-free qmv / qmv_wide kernels, dense matmuls of at
+//     most 64 rows to gemv / gemv_wide, and full attention of any query length
+//     to sdpa_vector (see kApple6RouteVersion for the shapes per version), and
 //   * throws UnsupportedGPUFamilyError, before the compiler is reached, from
-//     every dispatch that would still need an MMA kernel.
+//     every dispatch that would still need an MMA kernel (other quantization
+//     modes and widths past 8 rows, dense matmuls past 64 rows, attention
+//     without a vector kernel for its head dim).
 //
 // The route is selected at runtime by the GPU family only
 // (Device::is_apple6()); every other GPU takes the code paths it always took.
@@ -31,7 +36,14 @@ namespace mlx::core::metal {
 // gemma4-qat) only opens its A13 allowlist when it is >= 1, so a build whose
 // mlx core predates the route keeps refusing on Apple6 instead of reaching the
 // GPU compiler. Bump it when the set of shapes the route accepts changes.
-inline constexpr int kApple6RouteVersion = 1;
+//
+//   1: quantized matmul, dense matmul and full attention of at most 8 rows
+//      (numen-tech/gemma4-qat#703).
+//   2: affine 2/4/8-bit quantized matmul of any row count through the SIMT
+//      GEMM (affine_qgemm_simt), full attention of any query length through
+//      sdpa_vector (never the 2-pass kernel), dense matmul of up to 64 rows
+//      (numen-tech/gemma4-qat#991).
+inline constexpr int kApple6RouteVersion = 2;
 
 // The exception message starts with this prefix, so a caller that only sees the
 // message (mlx-c hands the Swift/Python side a string) can still recognize it.

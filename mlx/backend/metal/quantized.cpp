@@ -96,9 +96,9 @@ inline array ensure_row_contiguous_matrix(
   return x_copy;
 }
 
-// The most rows (input vectors) an Apple6 GPU takes in one quantized matmul or
-// one attention call: the vector kernels' range, and the prefill chunk the app
-// feeds an A13 (gemma4-qat#703).
+// The most rows (input vectors) an Apple6 GPU takes in one quantized matmul
+// through the vector kernels (gemma4-qat#703). Matmuls the SIMT GEMM takes
+// (qgemm_simt_ok, gemma4-qat#991) have no row limit.
 constexpr int kApple6MaxRows = 8;
 
 inline int get_qmv_batch_limit(int D, int O, metal::Device& d) {
@@ -2154,6 +2154,122 @@ void gather_qmm_rhs(
   compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
 }
 
+// SIMT quantized GEMM (affine_qgemm_simt, gemma4-qat#991): the Apple6 route's
+// matrix-matrix product without simdgroup matrices. It decodes each weight tile
+// once into threadgroup memory per BM rows and runs a register-blocked FMA loop
+// over it; qmv_wide decodes the weights once per 4-7 rows and loads x from the
+// device per FMA. Apple6 only (the route's vector kernels stay the default
+// everywhere else), for affine 2/4/8-bit transposed weights.
+// MLX_APPLE6_QGEMM=0 disables it (same binary A/B); MLX_APPLE6_QGEMM_MIN_M
+// (default 5) is the smallest M that uses it. Both are read on every call.
+constexpr int kQgemmSimtBK = 32;
+
+inline bool qgemm_simt_disabled() {
+  const char* v = std::getenv("MLX_APPLE6_QGEMM");
+  return v != nullptr && std::string(v) == "0";
+}
+
+inline int qgemm_simt_min_m() {
+  const char* v = std::getenv("MLX_APPLE6_QGEMM_MIN_M");
+  if (v == nullptr) {
+    return 5;
+  }
+  int m = std::atoi(v);
+  return m < 2 ? 2 : m;
+}
+
+// Whether the shape/format has an affine_qgemm_simt kernel.
+inline bool qgemm_simt_ok(
+    const std::string& mode,
+    bool transpose,
+    bool non_batched,
+    bool has_biases,
+    int bits,
+    int group_size,
+    int K) {
+  return mode == "affine" && transpose && non_batched && has_biases &&
+      (bits == 2 || bits == 4 || bits == 8) && group_size % kQgemmSimtBK == 0 &&
+      K % kQgemmSimtBK == 0;
+}
+
+void qgemm_simt(
+    const array& x,
+    const array& w,
+    const array& scales,
+    const std::optional<array>& biases,
+    array& out,
+    int group_size,
+    int bits,
+    int M,
+    int N,
+    int K,
+    metal::Device& d,
+    const Stream& s) {
+  // Output rows per threadgroup: the smallest tile that holds M, else 32 (the
+  // grid then tiles M).
+  int bm = M <= 8 ? 8 : (M <= 16 ? 16 : 32);
+  int bn = bm == 32 ? 64 : 128;
+
+  std::string kname;
+  kname.reserve(64);
+  std::string type_string = get_type_string(x.dtype());
+  const bool implied = is_implied_bias(biases);
+  concatenate(
+      kname,
+      "affine_qgemm_simt_",
+      type_string,
+      "_gs_",
+      group_size,
+      "_b_",
+      bits,
+      "_bm_",
+      bm,
+      implied ? "_ib" : "");
+  const int tm = bm == 8 ? 2 : 4;
+  auto kernel = implied ? get_quantized_kernel_wrapped(
+                              d,
+                              kname,
+                              "qgemm_simt",
+                              "affine",
+                              type_string,
+                              group_size,
+                              bits,
+                              bm,
+                              bn,
+                              kQgemmSimtBK,
+                              tm,
+                              4,
+                              true)
+                        : get_quantized_kernel_wrapped(
+                              d,
+                              kname,
+                              "qgemm_simt",
+                              "affine",
+                              type_string,
+                              group_size,
+                              bits,
+                              bm,
+                              bn,
+                              kQgemmSimtBK,
+                              tm,
+                              4);
+
+  auto& compute_encoder = metal::get_command_encoder(s);
+  compute_encoder.set_compute_pipeline_state(kernel);
+  compute_encoder.set_input_array(w, 0);
+  compute_encoder.set_input_array(scales, 1);
+  compute_encoder.set_input_array(*biases, 2);
+  compute_encoder.set_input_array(x, 3);
+  compute_encoder.set_output_array(out, 4);
+  compute_encoder.set_bytes(K, 5);
+  compute_encoder.set_bytes(N, 6);
+  compute_encoder.set_bytes(M, 7);
+
+  MTL::Size group_dims(128, 1, 1);
+  MTL::Size grid_dims((N + bn - 1) / bn, (M + bm - 1) / bm, 1);
+  compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
+}
+
 void dispatch_qmv(
     const array& x,
     const array& w,
@@ -2233,10 +2349,23 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
     }
     mode = "affine_sym";
   }
-  // Apple6 (A13) cannot build the qmm kernels (gpu_family.h): up to
-  // kApple6MaxRows rows go through the vector kernels below whatever the
+  // Apple6 (A13) cannot build the qmm kernels (gpu_family.h): the SIMT GEMM
+  // takes what it supports from qgemm_simt_min_m() rows on, the rest of up to
+  // kApple6MaxRows rows goes through the vector kernels below whatever the
   // device's usual limit says, and more rows are the typed error.
   if (d.is_apple6()) {
+    if (M >= qgemm_simt_min_m() && !qgemm_simt_disabled() &&
+        qgemm_simt_ok(
+            mode,
+            transpose_,
+            non_batched,
+            biases.has_value(),
+            bits_,
+            group_size_,
+            K)) {
+      qgemm_simt(x, w, scales, biases, out, group_size_, bits_, M, N, K, d, s);
+      return;
+    }
     if (M > kApple6MaxRows) {
       d.require_mma(
           "quantized_matmul with " + std::to_string(M) + " rows (more than " +
