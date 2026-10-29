@@ -99,3 +99,8 @@ TEST_CASE("test apple6 typed error carries the prefix") {
     CHECK(msg.find("quantized_matmul with 9 rows") != std::string::npos);
   }
 }
+
+TEST_CASE("test apple6 route version is published") {
+  // Downstream packages gate their A13 allowlist on this being >= 1.
+  CHECK(kApple6RouteVersion >= 1);
+}

@@ -26,6 +26,13 @@
 
 namespace mlx::core::metal {
 
+// The version of the Apple6 route this build carries. A downstream package
+// that reads it (mlx-swift's `mlx_apple6_route_version()` shim, numen-tech/
+// gemma4-qat) only opens its A13 allowlist when it is >= 1, so a build whose
+// mlx core predates the route keeps refusing on Apple6 instead of reaching the
+// GPU compiler. Bump it when the set of shapes the route accepts changes.
+inline constexpr int kApple6RouteVersion = 1;
+
 // The exception message starts with this prefix, so a caller that only sees the
 // message (mlx-c hands the Swift/Python side a string) can still recognize it.
 inline constexpr std::string_view kUnsupportedGPUFamilyPrefix =
