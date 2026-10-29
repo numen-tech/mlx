@@ -232,6 +232,13 @@ inline int nccl_timeout(int default_value) {
   return nccl_timeout;
 }
 
+// "apple6" selects the Apple6 (A13 / G12) route on any Metal GPU, for tests
+// (backend/metal/gpu_family.h). Read once, at device init.
+inline const std::string& force_gpu_family() {
+  static std::string force_gpu_family_ = get_var("MLX_FORCE_GPU_FAMILY", "");
+  return force_gpu_family_;
+}
+
 inline const std::string& metal_gpu_arch() {
   static std::string gpu_arch_ = get_var("MLX_METAL_GPU_ARCH", "");
   return gpu_arch_;

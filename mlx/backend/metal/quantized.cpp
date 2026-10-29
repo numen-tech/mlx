@@ -96,6 +96,11 @@ inline array ensure_row_contiguous_matrix(
   return x_copy;
 }
 
+// The most rows (input vectors) an Apple6 GPU takes in one quantized matmul or
+// one attention call: the vector kernels' range, and the prefill chunk the app
+// feeds an A13 (gemma4-qat#703).
+constexpr int kApple6MaxRows = 8;
+
 inline int get_qmv_batch_limit(int D, int O, metal::Device& d) {
   auto arch_size = d.get_architecture().back();
   auto arch_gen = d.get_architecture_gen();
@@ -622,7 +627,10 @@ use_qmv_wide(const std::string& mode, int bits, int M, metal::Device& d) {
   if (bits == 1 || (bits == 2 && M < 3)) {
     return false;
   }
-  return d.get_architecture_gen() >= 15;
+  // Apple6 (A13) has no matrix-matrix route at all (gpu_family.h), so its
+  // small-M products always go through the vector kernels: qmv_wide streams
+  // each weight group once per tile of input vectors instead of once per row.
+  return d.get_architecture_gen() >= 15 || d.is_apple6();
 }
 
 // Row-reuse qmv_wide (gemma4-qat#313): affine_qmv_wide_rr splits K over all 32
@@ -1318,6 +1326,7 @@ void qmm(
     metal::Device& d,
     const Stream& s,
     const std::string& mode) {
+  d.require_mma("quantized_matmul (qmm)");
   assert(
       (!global_scale || (transpose && !biases)) &&
       "qmm global scale requires transposed weights without biases");
@@ -1460,6 +1469,7 @@ void qmm_splitk(
     metal::Device& d,
     const Stream& s,
     const std::string& mode) {
+  d.require_mma("quantized_matmul (split-K qmm)");
   // Choose split_k to target ~512 threadgroups
   int bm = 32, bn = 32;
   int n_tiles = (N + bn - 1) / bn;
@@ -1600,6 +1610,7 @@ void gather_qmm(
     metal::Device& d,
     const Stream& s,
     const std::string& mode) {
+  d.require_mma("gather_qmm");
   if (metal::is_nax_available() && transpose && (K % 64 == 0) &&
       (env::enable_tf32() || x.dtype() != float32)) {
     return gather_qmm_nax(
@@ -1995,6 +2006,7 @@ void gather_qmm_rhs(
     metal::Device& d,
     const Stream& s,
     const std::string mode) {
+  d.require_mma("gather_qmm (sorted rhs)");
   if (metal::is_nax_available() &&
       (env::enable_tf32() || x_.dtype() != float32)) {
     return gather_qmm_rhs_nax(
@@ -2220,6 +2232,17 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
           "decode path (transpose=true, small M) only.");
     }
     mode = "affine_sym";
+  }
+  // Apple6 (A13) cannot build the qmm kernels (gpu_family.h): up to
+  // kApple6MaxRows rows go through the vector kernels below whatever the
+  // device's usual limit says, and more rows are the typed error.
+  if (d.is_apple6()) {
+    if (M > kApple6MaxRows) {
+      d.require_mma(
+          "quantized_matmul with " + std::to_string(M) + " rows (more than " +
+          std::to_string(kApple6MaxRows) + ")");
+    }
+    vector_limit = kApple6MaxRows + 1;
   }
   // It is a matrix matrix product.
   if (M >= vector_limit) {
