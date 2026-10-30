@@ -85,7 +85,7 @@ def _quantized_cases():
         for M in (1, 2, 3, 5, 8):
             qmm_case(K, N, 2, M, False)
     # Route version 2 (gemma4-qat#991): more than 8 rows go through the SIMT GEMM
-    # (affine_qgemm_simt: BM 8 / 16 / 32 tiles, M tiled in the grid, ragged M and N).
+    # (affine_qgemm_simt: BM 8 / 16 / 32 tiles, M tiled in the grid, ragged M).
     for K, N in BONSAI_2B_SHAPES[:5]:
         for M in (9, 16, 17, 32, 33, 64):
             qmm_case(K, N, 2, M, False)
@@ -96,6 +96,48 @@ def _quantized_cases():
             qmm_case(2048, 6144, bits, M, False)
     for M in (1, 4, 8):
         qmm_case(2048, 2048, 2, M, True)
+
+    def qmm_variant(K, N, bits, M, gs, dtype, implied=False, x_lead=(), x_transposed=False):
+        # The SIMT GEMM's other instantiations: N ragged against the BN 128 / 64
+        # tiles, group sizes 32 / 64, float32 and bfloat16, the implied-bias
+        # (0-d factor) twin, a 3-D x folded into M and a transposed x.
+        def run():
+            r = _rng(K * 7 + N * 3 + M + bits + gs)
+            w = mx.array(r.standard_normal((N, K)).astype(np.float32) * 0.05).astype(dtype)
+            wq, scales, biases = mx.quantize(w, group_size=gs, bits=bits)
+            if implied:
+                biases = mx.array(-(2.0 ** (bits - 1)), dtype)
+            if x_transposed:
+                x = mx.array(r.standard_normal((K, M)).astype(np.float32)).astype(dtype).T
+            else:
+                x = mx.array(r.standard_normal(x_lead + (M, K)).astype(np.float32)).astype(
+                    dtype
+                )
+            return mx.quantized_matmul(
+                x, wq, scales, biases, transpose=True, group_size=gs, bits=bits
+            )
+
+        tag = {mx.float16: "f16", mx.bfloat16: "bf16", mx.float32: "f32"}[dtype]
+        name = f"qmm_simt_{tag}_b{bits}_gs{gs}_K{K}_N{N}_M{M}"
+        name += "_ib" if implied else ""
+        name += f"_lead{'x'.join(map(str, x_lead))}" if x_lead else ""
+        name += "_xT" if x_transposed else ""
+        cases.append((name, run))
+
+    for N in (72, 200, 1000):
+        for M in (9, 20, 40):
+            qmm_variant(512, N, 4, M, 64, mx.float16)
+    for gs in (32, 64):
+        for bits in (2, 4, 8):
+            qmm_variant(1024, 384, bits, 17, gs, mx.float16)
+    for dtype in (mx.float32, mx.bfloat16):
+        for M in (5, 16, 33):
+            qmm_variant(1024, 520, 4, M, 64, dtype)
+    for bits in (2, 4, 8):
+        for M in (6, 16, 33):
+            qmm_variant(2048, 712, bits, M, 128, mx.float16, implied=True)
+    qmm_variant(1024, 384, 4, 12, 64, mx.float16, x_lead=(3,))
+    qmm_variant(1024, 384, 4, 24, 64, mx.float16, x_transposed=True)
     return cases
 
 
@@ -136,6 +178,31 @@ def _sdpa_cases():
     # Keys long enough for the 2-pass kernel on the normal route (GQA 4, >= 4096).
     sdpa_case(1, 4200, "none")
     sdpa_case(32, 4200, "causal")
+
+    def sdpa_d512_case(qL, kL, gqa):
+        # Head dim 512: the vector kernel's speed gates (one query, GQA 8, 1024+
+        # keys, GPU gen 17+) send the normal route to the unfused path, which
+        # Apple6 cannot run; there the vector kernel takes every shape.
+        def run():
+            r = _rng(qL * 13 + kL + gqa)
+            q = mx.array(r.standard_normal((1, 8, qL, 512)).astype(np.float32)).astype(
+                mx.float16
+            )
+            k = mx.array(r.standard_normal((1, 8 // gqa, kL, 512)).astype(np.float32)).astype(
+                mx.float16
+            )
+            v = mx.array(r.standard_normal((1, 8 // gqa, kL, 512)).astype(np.float32)).astype(
+                mx.float16
+            )
+            return mx.fast.scaled_dot_product_attention(
+                q, k, v, scale=512**-0.5, mask="causal"
+            )
+
+        cases.append((f"sdpa_d512_q{qL}_k{kL}_gqa{gqa}", run))
+
+    sdpa_d512_case(16, 1024, 8)
+    sdpa_d512_case(1, 300, 4)
+    sdpa_d512_case(9, 300, 2)
     return cases
 
 
@@ -409,7 +476,7 @@ class TestApple6Route(mlx_tests.MLXTestCase):
                     scale = max(float(np.abs(expect).max()), 1e-6)
                     err = float(np.abs(got - expect).max()) / scale
                     # bfloat16 (MiniCPM5) carries 8 mantissa bits: its two kernels differ by a few ulps.
-                    tol = 2e-2 if name.startswith("minicpm_") else 4e-3
+                    tol = 2e-2 if name.startswith("minicpm_") or "_bf16_" in name else 4e-3
                     self.assertLess(err, tol, f"{name}: max abs error / max |expect| = {err}")
 
     def test_forced_route_raises_typed_error_for_mma_paths(self):
