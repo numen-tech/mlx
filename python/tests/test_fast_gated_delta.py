@@ -173,6 +173,29 @@ class TestGatedDelta(mlx_tests.MLXTestCase):
                 mx.allclose(hf_ref, hf, atol=1e-4, rtol=1e-4), msg="State " + msg
             )
 
+    def test_gated_delta_half_precision_decay_near_one(self):
+        # A decay just below 1 must not round to 1.0 when q, k, v are 16-bit:
+        # g and beta stay float32 inside the op. With beta = 0 the state only
+        # decays, so the final state is exactly h0 * g^T.
+        B, Hk, Hv, T, Dk, Dv = 1, 4, 4, 64, 128, 128
+        g_value = 0.999
+        for dtype in (mx.bfloat16, mx.float16):
+            q = mx.random.normal(shape=(B, T, Hk, Dk)).astype(dtype)
+            k = mx.random.normal(shape=(B, T, Hk, Dk)).astype(dtype)
+            v = mx.random.normal(shape=(B, T, Hv, Dv)).astype(dtype)
+            g = mx.full((B, T, Hv), g_value, dtype=mx.float32)
+            beta = mx.zeros((B, T, Hv), dtype=mx.float32)
+            h0 = mx.random.normal((B, Hv, Dv, Dk), dtype=mx.float32)
+            for stream in (mx.gpu, mx.cpu):
+                _, hf = mx.fast.gated_delta_update(
+                    q, k, v, g, beta, initial_state=h0, stream=stream
+                )
+                expected = h0 * (g_value**T)
+                self.assertTrue(
+                    mx.allclose(hf, expected, atol=1e-4, rtol=1e-3),
+                    msg=f"{dtype} {stream}",
+                )
+
     def test_gated_delta_fallback_masked(self):
         for dims in self.fallback_dims:
             B, Hk, Hv, T, Dk, Dv = dims
