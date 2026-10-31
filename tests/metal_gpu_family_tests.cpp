@@ -5,7 +5,9 @@
 
 #include "doctest/doctest.h"
 
+#include "mlx/backend/metal/device.h"
 #include "mlx/backend/metal/gpu_family.h"
+#include "mlx/utils.h"
 
 using namespace mlx::core::metal;
 
@@ -106,4 +108,25 @@ TEST_CASE("test apple6 route version is published") {
   // Downstream packages gate their A13 allowlist on this being >= 1, and the
   // wider prefill window (SIMT GEMM, any-length sdpa_vector) on >= 2.
   CHECK(kApple6RouteVersion >= 2);
+}
+
+// MLX_DISABLE_NAX (numen-tech/gemma4-qat#1085): the kill switch for a GPU
+// generation the NAX kernels are not verified on.
+TEST_CASE("test nax gate honours the OS, the generation and MLX_DISABLE_NAX") {
+  CHECK(nax_gate(true, 18, false));
+  CHECK(nax_gate(true, 19, false));
+  CHECK_FALSE(nax_gate(true, 19, true));
+  CHECK_FALSE(nax_gate(true, 18, true));
+  CHECK_FALSE(nax_gate(true, 17, false));
+  CHECK_FALSE(nax_gate(false, 19, false));
+}
+
+TEST_CASE("test is_nax_available is off under MLX_DISABLE_NAX") {
+  // On a gen < 18 GPU NAX is off either way; on gen >= 18 this run checks that
+  // the environment variable reaches the cached decision.
+  if (mlx::core::env::disable_nax()) {
+    CHECK_FALSE(is_nax_available());
+  } else {
+    MESSAGE("MLX_DISABLE_NAX not set; run with MLX_DISABLE_NAX=1 to check it");
+  }
 }

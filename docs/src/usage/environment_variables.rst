@@ -138,6 +138,16 @@ users. Their behavior may change as the implementation evolves.
    the capabilities of the physical GPU. Forcing an architecture that does not
    match the GPU can select incompatible kernels and produce incorrect results.
 
+.. envvar:: MLX_DISABLE_NAX
+
+   Turn off the NAX (neural accelerator) kernels on Metal GPUs of
+   architecture generation 18 and later, so those GPUs take the same matmul,
+   quantized-matmul, attention and gated-delta kernels as earlier
+   generations. The default is ``0``. Read once, on the first GPU operation
+   that checks for NAX; set it before the process runs any GPU work. A kill
+   switch for a GPU generation the NAX kernels are not verified on
+   (numen-tech/gemma4-qat#1085).
+
 .. envvar:: MLX_SDPA_BLOCKS
 
    Override the number of reduction blocks used by the Metal scaled

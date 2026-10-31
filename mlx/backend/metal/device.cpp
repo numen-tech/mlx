@@ -1045,22 +1045,26 @@ NS::SharedPtr<NS::AutoreleasePool> new_scoped_memory_pool() {
   return NS::TransferPtr(NS::AutoreleasePool::alloc()->init());
 }
 
+bool nax_gate(bool os_supports_nax, int architecture_gen, bool disabled) {
+  // NAX GEMM and qmm_t kernels give wrong results on gen 17 (M5-class).
+  return os_supports_nax && architecture_gen >= 18 && !disabled;
+}
+
 bool is_nax_available() {
 #ifdef MLX_METAL_NO_NAX
   return false;
 #else
   auto _check_nax = []() {
-    bool can_use_nax = false;
+    bool os_supports_nax = false;
     if (__builtin_available(
             macOS 26.2, iOS 26.2, tvOS 26.2, visionOS 26.2, *)) {
-      can_use_nax = true;
+      os_supports_nax = true;
     }
     auto& d = metal::device(mlx::core::Device::gpu);
-    auto gen = d.get_architecture_gen();
-    // NAX GEMM and qmm_t kernels give wrong results on gen 17 (M5-class).
-    // All NAX dispatch sites use this function.
-    can_use_nax &= gen >= 18;
-    return can_use_nax;
+    // All NAX dispatch sites use this function, so MLX_DISABLE_NAX=1 turns
+    // every NAX route off at once (numen-tech/gemma4-qat#1085).
+    return nax_gate(
+        os_supports_nax, d.get_architecture_gen(), env::disable_nax());
   };
   static bool is_nax_available_ = _check_nax();
   return is_nax_available_;

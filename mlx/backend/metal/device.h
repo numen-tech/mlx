@@ -274,6 +274,16 @@ NS::SharedPtr<NS::AutoreleasePool> new_scoped_memory_pool();
 
 bool is_nax_available();
 
+// The NAX decision is_nax_available() caches: macOS/iOS 26.2+, architecture
+// gen >= 18, and not disabled by MLX_DISABLE_NAX (numen-tech/gemma4-qat#1085).
+// Pure, for tests.
+bool nax_gate(bool os_supports_nax, int architecture_gen, bool disabled);
+
+// Bumped when the NAX kill switch changes; 1: MLX_DISABLE_NAX=1 turns every
+// NAX route off (numen-tech/gemma4-qat#1085). A binding reads it to tell a
+// core with the switch from one without.
+constexpr int kNaxDisableEnvVersion = 1;
+
 // Call before each host wait on GPU work.
 void count_host_wait();
 
