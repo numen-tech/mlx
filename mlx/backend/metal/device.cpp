@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <sstream>
+#include <utility>
 
 #include <fmt/format.h>
 
@@ -40,6 +41,11 @@ std::atomic<uint64_t> dispatch_count{0};
 std::atomic<uint64_t> commit_count{0};
 std::atomic<uint64_t> sync_count{0};
 std::atomic<uint64_t> wait_count{0};
+
+// kernel_trace_start() / kernel_trace_stop().
+std::atomic<bool> kernel_trace_on{false};
+std::mutex kernel_trace_mtx;
+std::vector<std::string> kernel_trace_names;
 
 constexpr const char* default_mtllib_path = METAL_PATH;
 
@@ -974,6 +980,10 @@ MTL::ComputePipelineState* Device::get_kernel(
     const MTLFCList& func_consts /* = {} */,
     const std::vector<MTL::Function*>& linked_functions /* = {} */) {
   const auto& kname = hash_name.empty() ? base_name : hash_name;
+  if (kernel_trace_on.load(std::memory_order_relaxed)) {
+    std::lock_guard<std::mutex> lock(kernel_trace_mtx);
+    kernel_trace_names.push_back(kname);
+  }
   {
     // Multiple readers allowed
     std::shared_lock lock(kernel_mtx_);
@@ -1045,9 +1055,30 @@ NS::SharedPtr<NS::AutoreleasePool> new_scoped_memory_pool() {
   return NS::TransferPtr(NS::AutoreleasePool::alloc()->init());
 }
 
-bool nax_gate(bool os_supports_nax, int architecture_gen, bool disabled) {
-  // NAX GEMM and qmm_t kernels give wrong results on gen 17 (M5-class).
-  return os_supports_nax && architecture_gen >= 18 && !disabled;
+bool nax_gate(
+    bool os_supports_nax,
+    int architecture_gen,
+    bool disabled,
+    int forced /* = -1 */) {
+  if (!os_supports_nax || disabled || forced == 0) {
+    return false;
+  }
+  // NAX GEMM and qmm_t kernels gave wrong results on gen 17 (M5-class) in July,
+  // so a gen 17 part needs an explicit MLX_METAL_NAX=1, which the caller gives
+  // only to a part it has verified. Nothing below gen 17 has the hardware.
+  return architecture_gen >= (forced == 1 ? 17 : 18);
+}
+
+void kernel_trace_start() {
+  std::lock_guard<std::mutex> lock(kernel_trace_mtx);
+  kernel_trace_names.clear();
+  kernel_trace_on.store(true, std::memory_order_relaxed);
+}
+
+std::vector<std::string> kernel_trace_stop() {
+  std::lock_guard<std::mutex> lock(kernel_trace_mtx);
+  kernel_trace_on.store(false, std::memory_order_relaxed);
+  return std::exchange(kernel_trace_names, {});
 }
 
 bool is_nax_available() {
@@ -1061,10 +1092,14 @@ bool is_nax_available() {
       os_supports_nax = true;
     }
     auto& d = metal::device(mlx::core::Device::gpu);
-    // All NAX dispatch sites use this function, so MLX_DISABLE_NAX=1 turns
-    // every NAX route off at once (numen-tech/gemma4-qat#1085).
+    // All NAX dispatch sites use this function, so MLX_DISABLE_NAX=1 and
+    // MLX_METAL_NAX move every NAX route at once (numen-tech/gemma4-qat#1085,
+    // #312).
     return nax_gate(
-        os_supports_nax, d.get_architecture_gen(), env::disable_nax());
+        os_supports_nax,
+        d.get_architecture_gen(),
+        env::disable_nax(),
+        env::metal_nax());
   };
   static bool is_nax_available_ = _check_nax();
   return is_nax_available_;
