@@ -2,6 +2,7 @@
 
 #pragma once
 
+#include <cstdlib>
 #include <exception>
 #include <limits>
 #include <sstream>
@@ -247,6 +248,26 @@ inline const std::string& force_gpu_family() {
 inline bool disable_nax() {
   static bool disable_nax_ = get_var("MLX_DISABLE_NAX", 0);
   return disable_nax_;
+}
+
+// The whole string decides, not get_var's atoi: "1garbage" must not force NAX on
+// a part nobody verified, nor "garbage" turn it off. Pure, for tests.
+inline int parse_metal_nax(const char* value) {
+  if (value == nullptr) {
+    return -1;
+  }
+  const std::string_view text(value);
+  return text == "1" ? 1 : text == "0" ? 0 : -1;
+}
+
+// MLX_METAL_NAX overrides the compiled NAX rule: 1 forces NAX on (still only on
+// macOS/iOS 26.2+ and architecture gen >= 17), 0 forces it off, unset or any
+// other value (-1 here) keeps the rule (gen >= 18). MLX_DISABLE_NAX=1 wins over
+// it. Read once, on the first metal::is_nax_available() call; set it before the
+// first GPU op (numen-tech/gemma4-qat#312).
+inline int metal_nax() {
+  static int metal_nax_ = parse_metal_nax(std::getenv("MLX_METAL_NAX"));
+  return metal_nax_;
 }
 
 inline const std::string& metal_gpu_arch() {

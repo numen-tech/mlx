@@ -274,15 +274,32 @@ NS::SharedPtr<NS::AutoreleasePool> new_scoped_memory_pool();
 
 bool is_nax_available();
 
-// The NAX decision is_nax_available() caches: macOS/iOS 26.2+, architecture
-// gen >= 18, and not disabled by MLX_DISABLE_NAX (numen-tech/gemma4-qat#1085).
-// Pure, for tests.
-bool nax_gate(bool os_supports_nax, int architecture_gen, bool disabled);
+// The NAX decision is_nax_available() caches: macOS/iOS 26.2+, not disabled by
+// MLX_DISABLE_NAX (numen-tech/gemma4-qat#1085), and MLX_METAL_NAX's answer:
+// forced 0 is off, forced 1 is architecture gen >= 17, anything else is
+// architecture gen >= 18 (numen-tech/gemma4-qat#312). No value reaches a GPU
+// below gen 17 or an OS without NAX. Pure, for tests.
+bool nax_gate(
+    bool os_supports_nax,
+    int architecture_gen,
+    bool disabled,
+    int forced = -1);
 
-// Bumped when the NAX kill switch changes; 1: MLX_DISABLE_NAX=1 turns every
-// NAX route off (numen-tech/gemma4-qat#1085). A binding reads it to tell a
-// core with the switch from one without.
-constexpr int kNaxDisableEnvVersion = 1;
+// Bumped when the NAX switches change. A binding reads it to tell which ones a
+// core carries.
+// 1: MLX_DISABLE_NAX=1 turns every NAX route off (numen-tech/gemma4-qat#1085).
+// 2: also MLX_METAL_NAX=0|1 (nax_gate) and the kernel trace below
+//    (numen-tech/gemma4-qat#312).
+constexpr int kNaxDisableEnvVersion = 2;
+
+// Records the name of every kernel looked up, cached or not, from
+// kernel_trace_start() to kernel_trace_stop(), in order with repeats. A harness
+// that compares two routes uses it to prove which kernel served an op, since a
+// fallback gives a plausible answer too. Process-wide: only one trace at a
+// time, and eval() the op inside it. Off, it costs one relaxed atomic load per
+// kernel lookup.
+MLX_API void kernel_trace_start();
+MLX_API std::vector<std::string> kernel_trace_stop();
 
 // Call before each host wait on GPU work.
 void count_host_wait();

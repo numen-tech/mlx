@@ -148,6 +148,16 @@ users. Their behavior may change as the implementation evolves.
    switch for a GPU generation the NAX kernels are not verified on
    (numen-tech/gemma4-qat#1085).
 
+.. envvar:: MLX_METAL_NAX
+
+   Override the rule that enables the NAX kernels on architecture generation
+   18 and later. ``1`` also enables them on generation 17, ``0`` turns them off.
+   Unset, or any other value, keeps the rule. No value enables them below
+   generation 17 or on an OS older than macOS/iOS 26.2, and
+   :envvar:`MLX_DISABLE_NAX` wins over it. Read once, on the first GPU operation
+   that checks for NAX; set it before the process runs any GPU work
+   (numen-tech/gemma4-qat#312).
+
 .. envvar:: MLX_SDPA_BLOCKS
 
    Override the number of reduction blocks used by the Metal scaled

@@ -7,6 +7,7 @@
 
 #include "mlx/backend/metal/device.h"
 #include "mlx/backend/metal/gpu_family.h"
+#include "mlx/mlx.h"
 #include "mlx/utils.h"
 
 using namespace mlx::core::metal;
@@ -119,6 +120,70 @@ TEST_CASE("test nax gate honours the OS, the generation and MLX_DISABLE_NAX") {
   CHECK_FALSE(nax_gate(true, 18, true));
   CHECK_FALSE(nax_gate(true, 17, false));
   CHECK_FALSE(nax_gate(false, 19, false));
+}
+
+// MLX_METAL_NAX (numen-tech/gemma4-qat#312): a gen 17 part needs the force, and
+// no value reaches an unsupported OS, a GPU below gen 17, or past the kill
+// switch.
+TEST_CASE("test nax gate honours MLX_METAL_NAX") {
+  // Forced on.
+  CHECK(nax_gate(true, 17, false, 1));
+  CHECK(nax_gate(true, 18, false, 1));
+  CHECK(nax_gate(true, 19, false, 1));
+  CHECK_FALSE(nax_gate(true, 16, false, 1));
+  CHECK_FALSE(nax_gate(true, 15, false, 1));
+  CHECK_FALSE(nax_gate(false, 17, false, 1));
+  CHECK_FALSE(nax_gate(false, 19, false, 1));
+  // The kill switch wins.
+  CHECK_FALSE(nax_gate(true, 17, true, 1));
+  CHECK_FALSE(nax_gate(true, 19, true, 1));
+  // Forced off.
+  CHECK_FALSE(nax_gate(true, 19, false, 0));
+  CHECK_FALSE(nax_gate(true, 18, false, 0));
+  CHECK_FALSE(nax_gate(true, 17, false, 0));
+  // Unset keeps the compiled rule.
+  CHECK(nax_gate(true, 18, false, -1));
+  CHECK_FALSE(nax_gate(true, 17, false, -1));
+}
+
+TEST_CASE("test MLX_METAL_NAX reads the whole string") {
+  CHECK(mlx::core::env::parse_metal_nax("1") == 1);
+  CHECK(mlx::core::env::parse_metal_nax("0") == 0);
+  CHECK(mlx::core::env::parse_metal_nax(nullptr) == -1);
+  for (auto value : {"", "1garbage", "garbage", "2", "-1", "00", "01", "true"}) {
+    CAPTURE(value);
+    CHECK(mlx::core::env::parse_metal_nax(value) == -1);
+  }
+}
+
+TEST_CASE("test the switch version says MLX_METAL_NAX is there") {
+  // Downstream packages gate their force-on on this being >= 2.
+  CHECK(kNaxDisableEnvVersion >= 2);
+}
+
+TEST_CASE("test kernel trace records every lookup while on, and only then") {
+  using namespace mlx::core;
+  auto dev = mlx::core::Device::gpu;
+  auto a = ones({8, 8}, float32, dev);
+  auto b = ones({8, 8}, float32, dev);
+  eval(a, b);
+
+  // A first lookup and a cached one must both show.
+  for (int run = 0; run < 2; ++run) {
+    kernel_trace_start();
+    auto c = add(a, b, dev);
+    eval(c);
+    auto names = kernel_trace_stop();
+    CAPTURE(run);
+    CHECK_FALSE(names.empty());
+  }
+
+  // Off: nothing accumulates into the next trace.
+  auto d = subtract(a, b, dev);
+  eval(d);
+  kernel_trace_start();
+  auto names = kernel_trace_stop();
+  CHECK(names.empty());
 }
 
 TEST_CASE("test is_nax_available is off under MLX_DISABLE_NAX") {
