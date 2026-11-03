@@ -4975,13 +4975,13 @@ array quantized_matmul(
   Dtype dtype = float32;
   QuantizationMode qmode;
   if (mode == "affine" && !biases) {
-    // Bias-free (symmetric) affine: 1/2-bit formats where the bias is a fixed
-    // function of the scale and is derived in-kernel.
+    // Symmetric affine (no biases): 1/2-bit formats where the bias is a fixed
+    // multiple of the scale, so it is the implied-bias factor below.
     qmode = QuantizationMode::Affine;
     dtype = scales.dtype();
     if (!issubdtype(dtype, floating)) {
       throw std::invalid_argument(
-          "[quantized_matmul] Bias-free affine requires floating scales.");
+          "[quantized_matmul] Symmetric affine requires floating scales.");
     }
   } else {
     std::tie(dtype, qmode) = validate_mode_with_type(
@@ -4990,13 +4990,20 @@ array quantized_matmul(
 
   auto [group_size, bits] =
       quantization_params_from_mode(qmode, group_size_, bits_);
-  if (qmode == QuantizationMode::Affine && !biases && bits != 1 && bits != 2) {
-    throw std::invalid_argument(
-        "[quantized_matmul] Bias-free affine supports bits in {1, 2} only.");
+  std::optional<array> implied_factor;
+  if (qmode == QuantizationMode::Affine && !biases) {
+    if (bits != 1 && bits != 2) {
+      throw std::invalid_argument(
+          "[quantized_matmul] Symmetric affine supports bits in {1, 2} only.");
+    }
+    // bias = -scale / 2 at 1 bit, -scale at 2 bits.
+    implied_factor = array(bits == 1 ? -0.5f : -1.0f, scales.dtype());
   }
+  const std::optional<array>& bias_arg =
+      implied_factor ? implied_factor : biases;
   // Check and extract the quantized matrix shape against x
   auto [w_inner_dims, w_outer_dims] = extract_quantized_matmul_dims(
-      "quantized_matmul", x, w, scales, biases, transpose, group_size, bits);
+      "quantized_matmul", x, w, scales, bias_arg, transpose, group_size, bits);
 
   if (qmode == QuantizationMode::Affine) {
     dtype = promote_types(x.dtype(), dtype);
@@ -5012,13 +5019,18 @@ array quantized_matmul(
   }
   std::vector<array> inputs;
   if (qmode == QuantizationMode::Affine) {
-    inputs = {astype(x, dtype), w, astype(scales, dtype)};
-    if (biases) {
-      // Materialize a factor that the implied-bias kernels cannot honor.
-      auto b = (is_implied_bias(*biases) &&
-                !implied_bias_kernels_exact(scales, dtype, bits, to_stream(s)))
-          ? materialize_implied_bias(scales, *biases, s)
-          : *biases;
+    auto scales_k = astype(scales, dtype);
+    inputs = {astype(x, dtype), w, scales_k};
+    if (bias_arg) {
+      // Materialize a factor that the implied-bias kernels cannot honor. The
+      // symmetric (nil biases) factor is applied to the scales already widened
+      // to the kernel dtype, as the removed bias-free kernels did, so it never
+      // needs materializing for that reason.
+      const array& scales_f = implied_factor ? scales_k : scales;
+      auto b = (is_implied_bias(*bias_arg) &&
+                !implied_bias_kernels_exact(scales_f, dtype, bits, to_stream(s)))
+          ? materialize_implied_bias(scales_f, *bias_arg, s)
+          : *bias_arg;
       inputs.push_back(astype(b, dtype, s));
     }
   } else {

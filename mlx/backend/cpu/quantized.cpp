@@ -945,9 +945,8 @@ void QuantizedMatmul::eval_cpu(const std::vector<array>& inputs, array& out) {
   if (mode_ == QuantizationMode::Affine) {
     if (inputs.size() < 4) {
       throw std::runtime_error(
-          "[QuantizedMatmul::eval_cpu] Bias-free affine is Metal-only for "
-          "now; on CPU pass biases as the 0-d implied-bias factor (-0.5 for "
-          "1-bit, -1 for 2-bit).");
+          "[QuantizedMatmul::eval_cpu] Affine mode needs biases (a 0-d "
+          "implied-bias factor or per-group biases).");
     }
     auto biases = ensure_row_contiguous(inputs[3], encoder, stream());
     encoder.set_input_array(biases);

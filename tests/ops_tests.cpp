@@ -3678,9 +3678,10 @@ TEST_CASE("test affine quantized_matmul qmv_fast tail block") {
   }
 }
 
-// Bias-free affine decode on Metal: the affine_sym_qmv[_fast] kernels load in
-// both the metallib and JIT builds and match the derived-bias reference.
-TEST_CASE("test bias-free affine quantized_matmul decode") {
+// Symmetric affine decode on Metal (nil biases = the implied factor -0.5 at
+// 1 bit, -1 at 2 bits): the _ib qmv[_fast] kernels load in both the metallib
+// and JIT builds and match the derived-bias reference.
+TEST_CASE("test symmetric affine quantized_matmul decode") {
   if (!metal::is_available()) {
     return;
   }
@@ -3701,7 +3702,7 @@ TEST_CASE("test bias-free affine quantized_matmul decode") {
       {1, 1536, 64, 128}, // fast path + tail, several row groups
       {1, 512, 8, 64}, // fast path + tail, group 64
       {2, 1536, 64, 64}, // 2-bit fast path, group 64, several row groups
-      {1, 544, 8, 32}, // K % 512 != 0: generic affine_sym_qmv
+      {1, 544, 8, 32}, // K % 512 != 0: generic qmv
       {2, 544, 8, 32}, // ditto, 2-bit
   };
 

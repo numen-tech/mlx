@@ -3601,18 +3601,12 @@ std::vector<array> QuantizedMatmul::vjp(
     const std::vector<array>&) {
   std::vector<array> vjps;
 
-  // Bias-free affine derives the bias from the scale: -scale/2 for 1-bit,
-  // -scale for 2-bit. The reverse products run on the biased kernels.
-  bool sym = mode_ == QuantizationMode::Affine && primals.size() == 3;
-  float sym_c = (bits_ == 1) ? -0.5f : -1.0f;
   // Implied bias: primals[3] is a 0-d factor f and bias = f * scale.
   bool implied = mode_ == QuantizationMode::Affine && primals.size() == 4 &&
       is_implied_bias(primals[3]);
   std::optional<array> biases = std::nullopt;
   if (mode_ == QuantizationMode::Affine) {
-    biases = sym
-        ? multiply(primals[2], array(sym_c, primals[2].dtype()), stream())
-        : primals[3];
+    biases = primals[3];
   }
 
   // We rely on the fact that w is always 2D so transpose is simple
@@ -3659,14 +3653,14 @@ std::vector<array> QuantizedMatmul::vjp(
         // biases
         vjps.push_back(sum(*dsb, -1, false, stream()));
       } else {
-        // scales: d(w_hat)/d(scale) is q, or q + c for a derived/implied bias
-        // The factor is a constant, so keep it out of higher-order grads.
-        array bias_c = sym ? array(sym_c, primals[2].dtype())
-            : implied      ? astype(
-                            stop_gradient(primals[3], stream()),
-                            primals[2].dtype(),
-                            stream())
-                      : array(0.0f, primals[2].dtype());
+        // scales: d(w_hat)/d(scale) is q, or q + f for an implied bias. The
+        // factor is a constant, so keep it out of higher-order grads.
+        array bias_c = implied
+            ? astype(
+                  stop_gradient(primals[3], stream()),
+                  primals[2].dtype(),
+                  stream())
+            : array(0.0f, primals[2].dtype());
         auto wq = dequantize(
             primals[1],
             ones_like(primals[2], stream()),

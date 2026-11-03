@@ -911,8 +911,8 @@ class TestQuantized(mlx_tests.MLXTestCase):
         # ceil(N / 64) tiles with no N % 64 restriction. On a ragged last tile,
         # quad rows past N must read no scale or bias (gemma4-qat#302). N = 65
         # leaves one valid row in tile 2, N = 72 leaves eight. Explicit and
-        # implied (0-d factor) biases are both covered; affine_sym never reaches
-        # qmv_quad. Group size 128 runs at K = 128 only.
+        # implied (0-d factor) biases are both covered. Group size 128 runs at
+        # K = 128 only.
         key = mx.random.key(7)
         cases = [
             (bits, gs, K)
@@ -1440,7 +1440,7 @@ class TestQuantized(mlx_tests.MLXTestCase):
                         self.assert_bitwise_equal(y_implied, y_full)
                         self._assert_rr_route(bits, group_size, M, implied=True)
 
-    @unittest.skipUnless(mx.metal.is_available(), "Bias-free affine is Metal-only")
+    @unittest.skipUnless(mx.metal.is_available(), "Symmetric affine decode test is Metal-only")
     def test_qmv_affine_sym(self):
         def assert_sym_matches_biased(y_sym, y_biased):
             # The biased reference may run a different kernel, so allow a few
@@ -1449,8 +1449,9 @@ class TestQuantized(mlx_tests.MLXTestCase):
             diff = (y_sym.astype(mx.float32) - y_biased.astype(mx.float32)).abs()
             self.assertLessEqual(diff.max().item(), tol.item())
 
-        # Bias-free affine (biases=None) must match the biased kernels fed the
-        # derived biases and a dequantized reference, on both qmv variants.
+        # Symmetric affine (biases=None) is the implied bias -0.5 (1-bit) or -1
+        # (2-bit): it must match the biased kernels fed the derived biases and
+        # a dequantized reference, on both qmv variants.
         key = mx.random.key(0)
         k1, k2 = mx.random.split(key)
         Ms = [1, 2, 3, 8]
@@ -1481,7 +1482,7 @@ class TestQuantized(mlx_tests.MLXTestCase):
                     self.assertLess((y_sym - y_hat).abs().max(), 1e-3)
 
         # Half-precision activations: the kernels are templated on the
-        # activation type and derive the bias in fp32 from the fp16/bf16 scale.
+        # activation type and derive the bias from the fp16/bf16 scale.
         for dtype, bits, K in product([mx.float16, mx.bfloat16], [1, 2], [512, 2048]):
             for M in [1, 3]:
                 with self.subTest(dtype=dtype, M=M, K=K, bits=bits):
@@ -1496,12 +1497,11 @@ class TestQuantized(mlx_tests.MLXTestCase):
                     self.assertEqual(y_sym.dtype, dtype)
                     assert_sym_matches_biased(y_sym, y_biased)
 
-    @unittest.skipUnless(mx.metal.is_available(), "Bias-free affine is Metal-only")
-    def test_qmv_affine_sym_throws(self):
+    def test_affine_sym_args(self):
         x = mx.random.normal(shape=(1, 512))
         w = mx.random.normal(shape=(64, 512))
 
-        # Bias-free affine is defined for 1- and 2-bit only.
+        # Symmetric affine (biases=None) is defined for 1- and 2-bit only.
         for bits in [3, 4, 8]:
             w_q, scales, _ = mx.quantize(w, 64, bits)
             with self.assertRaises(ValueError):
@@ -1511,36 +1511,64 @@ class TestQuantized(mlx_tests.MLXTestCase):
             with self.assertRaises(ValueError):
                 mx.quantized_matmul(x, w_q, scales, None, True, 64, bits)
 
-        w_q, scales, _ = mx.quantize(w, 64, 2)
-        x_qvm = mx.random.normal(shape=(1, 64))
-        # M = 33 is the smallest M above the qmv batch limit on every GPU.
-        x_qmm_edge = mx.random.normal(shape=(33, 512))
-        x_qmm = mx.random.normal(shape=(512, 512))
-        # Evaluate the inputs up front: the checks below throw inside eval, and
-        # an input left inside a failed eval would block the CPU stream.
-        mx.eval(x, w_q, scales, x_qvm, x_qmm_edge, x_qmm)
+    @unittest.skipUnless(mx.metal.is_available(), "Symmetric affine mixed-dtype test is Metal-only")
+    def test_affine_sym_mixed_dtype(self):
+        # fp32 activations with fp16 scales: the bias is derived from the scales
+        # widened to fp32, so a scale at the fp16 subnormal edge keeps the
+        # -scale/2 it had before the symmetric mode became an implied factor,
+        # and the scale gradient stays finite.
+        for bits, scale_value in [(1, 2.0**-24), (2, 2.0**-24), (2, 1.0)]:
+            with self.subTest(bits=bits, scale=scale_value):
+                K, N, gs = 512, 8, 128
+                w_q = mx.zeros((N, K * bits // 32), dtype=mx.uint32)
+                scales = mx.full((N, K // gs), scale_value, mx.float16)
+                x = mx.ones((1, K))
+                sym = -0.5 if bits == 1 else -1.0
+                biases = mx.full(scales.shape, sym * scale_value, mx.float32)
+                w_hat = mx.dequantize(w_q, scales.astype(mx.float32), biases, gs, bits)
+                expected = x @ w_hat.T
+                y = mx.quantized_matmul(x, w_q, scales, None, True, gs, bits)
+                self.assertEqual(y.dtype, mx.float32)
+                self.assertTrue(mx.array_equal(y, expected))
 
-        # Non-transposed (qvm) path has no bias-free kernel.
-        with self.assertRaises(RuntimeError):
-            mx.eval(mx.quantized_matmul(x_qvm, w_q, scales, None, False, 64, 2))
-        # Matrix regime (M >= the device's qmv batch limit) is qmm-only: the
-        # bias-free path says so instead of silently taking the qmm route.
-        for x_big in [x_qmm_edge, x_qmm]:
-            with self.subTest(M=x_big.shape[0]):
-                with self.assertRaisesRegex(RuntimeError, "Bias-free affine"):
-                    mx.eval(mx.quantized_matmul(x_big, w_q, scales, None, True, 64, 2))
-        # CPU has no bias-free kernel either.
-        with self.assertRaises(RuntimeError):
-            mx.eval(
-                mx.quantized_matmul(x, w_q, scales, None, True, 64, 2, stream=mx.cpu)
-            )
-        # Sanity: the very same call on the GPU mat-vec path works.
-        mx.eval(mx.quantized_matmul(x, w_q, scales, None, True, 64, 2))
+        # Every code is 1 at 2 bits, so q + f = 0 and the scale gradient is 0.
+        w_q = mx.full((8, 32), 0x55555555, dtype=mx.uint32)
+        scales = mx.ones((8, 8), mx.float16)
+        x = mx.full((1, 512), 2048.0)
+        _, (dscales,) = mx.vjp(
+            lambda s: mx.quantized_matmul(x, w_q, s, None, True, 64, 2),
+            [scales],
+            [mx.ones((1, 8))],
+        )
+        self.assertFalse(mx.any(mx.isnan(dscales)).item())
+        self.assertTrue(mx.array_equal(dscales, mx.zeros_like(dscales)))
 
-    @unittest.skipUnless(mx.metal.is_available(), "Bias-free affine is Metal-only")
+    @unittest.skipUnless(mx.metal.is_available(), "1-bit fixtures need Metal")
+    def test_affine_sym_shapes(self):
+        # Biases=None is the implied bias, so it runs wherever the implied-bias
+        # path does: non-transposed (qvm), the matrix regime (qmm) and the CPU,
+        # which the old bias-free kernels refused.
+        devices = [mx.cpu, mx.gpu]
+        for bits in [1, 2]:
+            w_q, scales, _ = mx.quantize(mx.random.normal(shape=(512, 512)), 64, bits)
+            sym_biases = -0.5 * scales if bits == 1 else -scales
+            w_hat = mx.dequantize(w_q, scales, sym_biases, 64, bits)
+            # M = 33 is the smallest M above the qmv batch limit on every GPU.
+            for M, transpose in [(1, True), (1, False), (33, True), (512, True)]:
+                with self.subTest(bits=bits, M=M, transpose=transpose):
+                    x = mx.random.normal(shape=(M, 512))
+                    expected = x @ (w_hat.T if transpose else w_hat)
+                    for stream in devices:
+                        y = mx.quantized_matmul(
+                            x, w_q, scales, None, transpose, 64, bits, stream=stream
+                        )
+                        self.assertEqual(y.shape, expected.shape)
+                        self.assertLess((y - expected).abs().max().item(), 5e-2)
+
+    @unittest.skipUnless(mx.metal.is_available(), "Symmetric affine grad test is Metal-only")
     def test_qmv_affine_sym_grad(self):
-        # The reverse products use the biased kernels with the derived bias, so
-        # the gradients match the explicitly biased call.
+        # The reverse products use the implied-bias kernels, so the gradients
+        # match the explicitly biased call.
         key = mx.random.key(1)
         k1, k2, k3 = mx.random.split(key, 3)
         for bits, K in product([1, 2], [512, 1024]):

@@ -61,7 +61,7 @@ def _quantized_cases():
                 mx.float16
             )
             if sym:
-                # Ternary weights with the symmetric (bias-free) affine path.
+                # Ternary weights with the symmetric (nil biases) affine path.
                 w = mx.array(r.integers(-1, 2, size=(N, K)).astype(np.float32) * 0.03).astype(
                     mx.float16
                 )
@@ -90,7 +90,7 @@ def _quantized_cases():
         for M in (9, 16, 17, 32, 33, 64):
             qmm_case(K, N, 2, M, False)
     qmm_case(2048, 6144, 2, 100, False)
-    # Other widths on one shape, and the bias-free 2-bit path the Hadamard packs use.
+    # Other widths on one shape, and the symmetric 2-bit path (nil biases) the Hadamard packs use.
     for bits in (4, 8):
         for M in (2, 8, 9, 32, 33):
             qmm_case(2048, 6144, bits, M, False)

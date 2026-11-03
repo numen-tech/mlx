@@ -29,10 +29,8 @@ auto get_quantized_kernel_wrapped(
     int bits,
     Args... args) {
   std::string template_def;
-  // "affine" -> affine_<func>; "affine_sym" (bias-free) -> affine_sym_<func>;
-  // other modes use the fp kernels.
-  std::string fname =
-      (mode.rfind("affine", 0) == 0) ? (mode + "_" + func) : ("fp_" + func);
+  // "affine" -> affine_<func>; other modes use the fp kernels.
+  std::string fname = (mode == "affine") ? ("affine_" + func) : ("fp_" + func);
   template_def = get_template_definition(
       name, fname, type, group_size, bits, std::forward<Args>(args)...);
   return get_quantized_kernel(d, name, template_def, mode);
@@ -165,8 +163,7 @@ inline int get_qmv_batch_limit(int D, int O, metal::Device& d) {
 // 1/4-bit takes half a block (measured), the rest a whole block.
 inline int qmv_fast_k_alignment(int bits, const std::string& mode) {
   int block = get_pack_factor(bits, 32) * (bits <= 2 ? 1 : 2) * 32;
-  bool affine = mode == "affine" || mode == "affine_sym";
-  return (affine && (bits == 1 || bits == 4)) ? block / 2 : block;
+  return (mode == "affine" && (bits == 1 || bits == 4)) ? block / 2 : block;
 }
 
 inline int add_strides_and_shapes(
@@ -615,12 +612,9 @@ void qmv(
 }
 
 // affine qmv_wide beats qmv only on gen-15+, and not at 1-bit or at 2-bit with
-// M < 3 (measured); fp gains on every gen. affine_sym has no qmv_wide kernel.
+// M < 3 (measured); fp gains on every gen.
 inline bool
 use_qmv_wide(const std::string& mode, int bits, int M, metal::Device& d) {
-  if (mode == "affine_sym") {
-    return false;
-  }
   if (mode != "affine") {
     return true;
   }
@@ -2286,9 +2280,9 @@ void dispatch_qmv(
     const Stream& s,
     const std::string& mode) {
   // It is a qmv with a small inner dimension so route to qmv_quad kernel
-  // (1-bit needs K == 128 for a full pack per lane; no affine_sym variant).
+  // (1-bit needs K == 128 for a full pack per lane).
   if ((K == 128 || (K == 64 && bits >= 2)) && is_power_of_2(bits) &&
-      !global_scale && mode != "affine_sym") {
+      !global_scale) {
     qmv_quad(x, w, scales, biases, out, group_size, bits, M, N, K, d, s, mode);
     return;
   }
@@ -2339,16 +2333,6 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
 
   int vector_limit = transpose_ ? get_qmv_batch_limit(K, N, d) : 4;
   auto mode = quantization_mode_to_string(mode_);
-  if (mode_ == QuantizationMode::Affine && !biases) {
-    // Bias-free (symmetric) affine: scales-only checkpoints; the bias is
-    // derived in-kernel. Decode path (1/2-bit qmv, transpose) only for now.
-    if (bits_ > 2 || !transpose_ || M >= vector_limit) {
-      throw std::runtime_error(
-          "[QuantizedMatmul] Bias-free affine currently supports the 1/2-bit "
-          "decode path (transpose=true, small M) only.");
-    }
-    mode = "affine_sym";
-  }
   // Apple6 (A13) cannot build the qmm kernels (gpu_family.h): the SIMT GEMM
   // takes what it supports from qgemm_simt_min_m() rows on, the rest of up to
   // kApple6MaxRows rows goes through the vector kernels below whatever the
