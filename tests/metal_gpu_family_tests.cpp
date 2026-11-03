@@ -160,6 +160,56 @@ TEST_CASE("test the switch version says MLX_METAL_NAX is there") {
   CHECK(kNaxDisableEnvVersion >= 2);
 }
 
+// Nil biases stay on the qmv route the bias-free kernels had
+// (numen-tech/gemma4-qat#255): another route sums in another order and moves an
+// fp32 result by a few ulps. An explicit factor still takes the routes it took.
+TEST_CASE("test nil biases keep the qmv route") {
+  using namespace mlx::core;
+  auto dev = mlx::core::Device::gpu;
+  auto traced = [&](int bits, int M, int K, Dtype dtype, bool nil_biases) {
+    int N = 8;
+    auto x = ones({M, K}, dtype, dev);
+    auto w = zeros({N, K * bits / 32}, uint32, dev);
+    auto s = ones({N, K / 32}, dtype, dev);
+    std::optional<array> b;
+    if (!nil_biases) {
+      b = array(bits == 1 ? -0.5f : -1.0f, dtype);
+    }
+    auto y = quantized_matmul(x, w, s, b, true, 32, bits, "affine", dev);
+    eval(x, w, s);
+    metal::kernel_trace_start();
+    eval(y);
+    auto names = metal::kernel_trace_stop();
+    std::string joined;
+    for (auto& name : names) {
+      joined += name + "\n";
+    }
+    return joined;
+  };
+  auto has = [](const std::string& text, const char* needle) {
+    return text.find(needle) != std::string::npos;
+  };
+
+  // K = 128 is a qmv_quad shape, for an explicit factor and not for nil biases.
+  auto quad_nil = traced(2, 1, 128, float32, true);
+  // K = 128 is not qmv_fast aligned at 2 bits: plain qmv, as the old kernels.
+  CHECK(has(quad_nil, "affine_qmv_"));
+  CHECK_FALSE(has(quad_nil, "qmv_quad"));
+  CHECK(has(traced(2, 1, 128, float32, false), "qmv_quad"));
+
+  // 2-bit M = 3 is a qmv_wide shape on gen 15+; never for nil biases.
+  auto wide_nil = traced(2, 3, 512, float32, true);
+  CHECK(has(wide_nil, "affine_qmv_fast_"));
+  CHECK_FALSE(has(wide_nil, "qmv_wide"));
+
+  // The accumulator-domain kernels are the 1-bit half route alone.
+  CHECK(has(traced(1, 1, 512, float16, true), "_sb"));
+  CHECK(has(traced(1, 1, 512, bfloat16, true), "_sb"));
+  CHECK_FALSE(has(traced(1, 1, 512, float32, true), "_sb"));
+  CHECK_FALSE(has(traced(2, 1, 512, float16, true), "_sb"));
+  CHECK_FALSE(has(traced(1, 1, 512, float16, false), "_sb"));
+}
+
 TEST_CASE("test kernel trace records every lookup while on, and only then") {
   using namespace mlx::core;
   auto dev = mlx::core::Device::gpu;

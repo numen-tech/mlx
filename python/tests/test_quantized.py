@@ -1497,6 +1497,53 @@ class TestQuantized(mlx_tests.MLXTestCase):
                     self.assertEqual(y_sym.dtype, dtype)
                     assert_sym_matches_biased(y_sym, y_biased)
 
+    @unittest.skipIf(not mx.metal.is_available(), "requires Metal")
+    def test_affine_sym_half_bias_in_accumulator(self):
+        # 1-bit nil biases over half inputs derive -s / 2 in the fp32 accumulator,
+        # as the bias-free kernels did. In half it rounds for |s| < 2^-13 with an
+        # odd low bit (to 0 at 2^-24, the smallest fp16 subnormal), and every K
+        # below is a shape those kernels served: 512 and 128 ran qmv_fast, 544 at
+        # N = 8 qmv_fast with a partial block, 96 at N = 3 qmv_fast partial rows.
+        # An explicit factor keeps the bias of the materialized form, in T.
+        for K, N in [(512, 8), (128, 8), (544, 8), (96, 3), (160, 8)]:
+            w = mx.zeros((N, K // 32), mx.uint32)
+            x = mx.full((1, K), 4096.0, mx.float16)
+            for scale in [2.0**-24, 3 * 2.0**-24, 2.0**-14 + 2.0**-24]:
+                with self.subTest(K=K, N=N, scale=scale):
+                    s = mx.full((N, K // 32), scale, mx.float16)
+                    exact = -0.5 * s[0, 0].item() * K * 4096.0
+                    y = mx.quantized_matmul(x, w, s, None, True, 32, 1, stream=mx.gpu)
+                    self.assertEqual(y.dtype, mx.float16)
+                    self.assert_bitwise_equal(y, mx.full((1, N), exact, mx.float16))
+                    # The explicit -0.5 of the shipped 1-bit packs, unchanged: its
+                    # bias is the half product, what a stored fp16 bias holds.
+                    y_ib = mx.quantized_matmul(
+                        x, w, s, mx.array(-0.5, mx.float16), True, 32, 1, stream=mx.gpu
+                    )
+                    y_full = mx.quantized_matmul(
+                        x,
+                        w,
+                        s,
+                        s * mx.array(-0.5, mx.float16),
+                        True,
+                        32,
+                        1,
+                        stream=mx.gpu,
+                    )
+                    self.assert_bitwise_equal(y_ib, y_full)
+                    self.assertNotEqual(y_ib[0, 0].item(), y[0, 0].item())
+
+        # The other half type takes the same kernels; its zone is below 2^-125,
+        # past what the Metal cast of a test value keeps, so this only pins the
+        # route: the result of an ordinary scale is the fp32 reference, rounded.
+        K = 512
+        w = mx.zeros((8, K // 32), mx.uint32)
+        x = mx.full((1, K), 8.0, mx.bfloat16)
+        s = mx.full((8, K // 32), 0.25, mx.bfloat16)
+        y = mx.quantized_matmul(x, w, s, None, True, 32, 1, stream=mx.gpu)
+        self.assertEqual(y.dtype, mx.bfloat16)
+        self.assert_bitwise_equal(y, mx.full((1, 8), -512.0, mx.bfloat16))
+
     def test_affine_sym_args(self):
         x = mx.random.normal(shape=(1, 512))
         w = mx.random.normal(shape=(64, 512))

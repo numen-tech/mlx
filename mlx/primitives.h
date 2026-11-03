@@ -1642,12 +1642,14 @@ class QuantizedMatmul : public UnaryPrimitive {
       int group_size,
       int bits,
       QuantizationMode mode,
-      bool transpose)
+      bool transpose,
+      bool symmetric = false)
       : UnaryPrimitive(stream),
         group_size_(group_size),
         bits_(bits),
         mode_(mode),
-        transpose_(transpose) {}
+        transpose_(transpose),
+        symmetric_(symmetric) {}
 
   void eval_cpu(const std::vector<array>& inputs, array& out) override;
   void eval_gpu(const std::vector<array>& inputs, array& out) override;
@@ -1658,7 +1660,7 @@ class QuantizedMatmul : public UnaryPrimitive {
   bool is_equivalent(const Primitive& other) const override;
   std::vector<Shape> output_shapes(const std::vector<array>& inputs) override;
   auto state() const {
-    return std::make_tuple(group_size_, bits_, mode_, transpose_);
+    return std::make_tuple(group_size_, bits_, mode_, transpose_, symmetric_);
   }
 
  private:
@@ -1666,6 +1668,8 @@ class QuantizedMatmul : public UnaryPrimitive {
   int bits_;
   QuantizationMode mode_;
   bool transpose_;
+  // The caller passed nil biases (inputs[3] is then the 0-d symmetric factor).
+  bool symmetric_;
 };
 
 class QQMatmul : public UnaryPrimitive {

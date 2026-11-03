@@ -531,7 +531,8 @@ void qmv(
     int K,
     metal::Device& d,
     const Stream& s,
-    const std::string& mode) {
+    const std::string& mode,
+    bool accum_bias = false) {
   int B = out.size() / M / N;
 
   int bn = 8;
@@ -564,32 +565,46 @@ void qmv(
       global_scale ? "_hgs_1" : "_hgs_0",
       "_r_",
       results_per_simdgroup,
-      is_implied_bias(biases) ? "_ib" : "");
-  auto kernel = is_implied_bias(biases) ? get_quantized_kernel_wrapped(
-                                              d,
-                                              kname,
-                                              (fast ? "qmv_fast" : "qmv"),
-                                              mode,
-                                              type_string,
-                                              group_size,
-                                              bits,
-                                              B > 1,
-                                              partial_rows,
-                                              global_scale.has_value(),
-                                              results_per_simdgroup,
-                                              true)
-                                        : get_quantized_kernel_wrapped(
-                                              d,
-                                              kname,
-                                              (fast ? "qmv_fast" : "qmv"),
-                                              mode,
-                                              type_string,
-                                              group_size,
-                                              bits,
-                                              B > 1,
-                                              partial_rows,
-                                              global_scale.has_value(),
-                                              results_per_simdgroup);
+      accum_bias ? "_sb" : (is_implied_bias(biases) ? "_ib" : ""));
+  auto kernel = accum_bias ? get_quantized_kernel_wrapped(
+                                 d,
+                                 kname,
+                                 (fast ? "qmv_fast" : "qmv"),
+                                 mode,
+                                 type_string,
+                                 group_size,
+                                 bits,
+                                 B > 1,
+                                 partial_rows,
+                                 global_scale.has_value(),
+                                 results_per_simdgroup,
+                                 true,
+                                 true)
+      : is_implied_bias(biases) ? get_quantized_kernel_wrapped(
+                                      d,
+                                      kname,
+                                      (fast ? "qmv_fast" : "qmv"),
+                                      mode,
+                                      type_string,
+                                      group_size,
+                                      bits,
+                                      B > 1,
+                                      partial_rows,
+                                      global_scale.has_value(),
+                                      results_per_simdgroup,
+                                      true)
+                                : get_quantized_kernel_wrapped(
+                                      d,
+                                      kname,
+                                      (fast ? "qmv_fast" : "qmv"),
+                                      mode,
+                                      type_string,
+                                      group_size,
+                                      bits,
+                                      B > 1,
+                                      partial_rows,
+                                      global_scale.has_value(),
+                                      results_per_simdgroup);
 
   auto& compute_encoder = metal::get_command_encoder(s);
   compute_encoder.set_compute_pipeline_state(kernel);
@@ -2333,6 +2348,28 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
 
   int vector_limit = transpose_ ? get_qmv_batch_limit(K, N, d) : 4;
   auto mode = quantization_mode_to_string(mode_);
+  // Nil biases keep the qmv route the bias-free kernels had wherever those ran
+  // (transposed, below the device's usual limit): qmv_quad, qmv_wide and the
+  // SIMT GEMM sum in another order, which moves an fp32 result by a few ulps.
+  // At 1 bit over half inputs the bias is formed in the accumulator ("_sb").
+  if (symmetric_ && transpose_ && M < vector_limit) {
+    qmv(x,
+        w,
+        scales,
+        biases,
+        std::nullopt,
+        out,
+        group_size_,
+        bits_,
+        M,
+        N,
+        K,
+        d,
+        s,
+        mode,
+        /* accum_bias= */ bits_ == 1 && x.dtype() != float32);
+    return;
+  }
   // Apple6 (A13) cannot build the qmm kernels (gpu_family.h): the SIMT GEMM
   // takes what it supports from qgemm_simt_min_m() rows on, the rest of up to
   // kApple6MaxRows rows goes through the vector kernels below whatever the

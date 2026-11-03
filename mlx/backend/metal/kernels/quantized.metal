@@ -252,6 +252,27 @@
       #name "_" #type "_gs_" #group_size "_b_" #bits "_batch_" #batched "_pr_" #partial_rows "_hgs_0_r_4_ib", \
       name, type, group_size, bits, batched, partial_rows, false, 4, true)
 
+// Symmetric-bias ("_sb") variants, formed in the accumulator: the nil-biases
+// qmv route at 1 bit over half activations and scales (mlx::core::QuantizedMatmul
+// symmetric). fp32 and 2-bit run the "_ib" kernels: there f * scale is the same.
+#define instantiate_quantized_sb_qmv(name, type, group_size, batched, partial_rows) \
+  instantiate_kernel(                                                        \
+      #name "_" #type "_gs_" #group_size "_b_1_batch_" #batched "_pr_" #partial_rows "_hgs_0_r_4_sb", \
+      name, type, group_size, 1, batched, partial_rows, false, 4, true, true)
+
+#define instantiate_quantized_sb_funcs(type, group_size)                     \
+  instantiate_quantized_sb_qmv(affine_qmv_fast, type, group_size, 1, 1)      \
+  instantiate_quantized_sb_qmv(affine_qmv_fast, type, group_size, 1, 0)      \
+  instantiate_quantized_sb_qmv(affine_qmv_fast, type, group_size, 0, 1)      \
+  instantiate_quantized_sb_qmv(affine_qmv_fast, type, group_size, 0, 0)      \
+  instantiate_quantized_sb_qmv(affine_qmv, type, group_size, 1, 0)           \
+  instantiate_quantized_sb_qmv(affine_qmv, type, group_size, 0, 0)
+
+#define instantiate_quantized_sb_groups(type)  \
+  instantiate_quantized_sb_funcs(type, 128)    \
+  instantiate_quantized_sb_funcs(type, 64)     \
+  instantiate_quantized_sb_funcs(type, 32)
+
 #define instantiate_quantized_ib_qvm(type, group_size, bits, batched)        \
   instantiate_kernel(                                                        \
       "affine_qvm_" #type "_gs_" #group_size "_b_" #bits "_batch_" #batched "_ib", \
@@ -356,6 +377,8 @@
   instantiate_quantized_ib_groups(1) \
   instantiate_quantized_ib_groups(2) \
   instantiate_quantized_ib_groups(4) \
-  instantiate_quantized_ib_groups(8)
+  instantiate_quantized_ib_groups(8) \
+  instantiate_quantized_sb_groups(float16_t) \
+  instantiate_quantized_sb_groups(bfloat16_t)
 
 instantiate_quantized_all() // clang-format on

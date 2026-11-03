@@ -3699,7 +3699,7 @@ std::vector<array> QuantizedMatmul::jvp(
       tangents[0],
       primals[1],
       primals[2],
-      (mode_ == QuantizationMode::Affine && primals.size() > 3)
+      (mode_ == QuantizationMode::Affine && primals.size() > 3 && !symmetric_)
           ? std::optional<array>(primals[3])
           : std::nullopt,
       transpose_,
@@ -3712,7 +3712,8 @@ std::vector<array> QuantizedMatmul::jvp(
 bool QuantizedMatmul::is_equivalent(const Primitive& other) const {
   const QuantizedMatmul& qm_other = static_cast<const QuantizedMatmul&>(other);
   return group_size_ == qm_other.group_size_ && bits_ == qm_other.bits_ &&
-      mode_ == qm_other.mode_ && transpose_ == qm_other.transpose_;
+      mode_ == qm_other.mode_ && transpose_ == qm_other.transpose_ &&
+      symmetric_ == qm_other.symmetric_;
 }
 
 std::vector<Shape> QuantizedMatmul::output_shapes(

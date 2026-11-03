@@ -5055,7 +5055,12 @@ array quantized_matmul(
       std::move(out_shape),
       dtype,
       std::make_shared<QuantizedMatmul>(
-          to_stream(s), group_size, bits, qmode, transpose),
+          to_stream(s),
+          group_size,
+          bits,
+          qmode,
+          transpose,
+          /* symmetric= */ implied_factor.has_value()),
       std::move(inputs));
 }
 
