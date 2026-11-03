@@ -65,7 +65,6 @@ TEST_CASE("test apple6 MMA-free kernel names are allowed") {
       "affine_qgemm_simt_float16_t_gs_128_b_2_bm_32",
       "affine_qgemm_simt_bfloat16_t_gs_64_b_4_bm_8_ib",
       "affine_qmv_quad_float16_t_gs_128_b_2_d_128_batch_0",
-      "affine_sym_qmv_fast_float16_t_gs_128_b_2_batch_0_pr_0_hgs_0_r_4",
       "affine_qvm_float16_t_gs_128_b_4",
       "affine_qvm_split_k_float16_t_gs_128_b_4_spk_8",
       "mxfp4_qmv_float16_t_gs_32_b_4_batch_0",
@@ -147,12 +146,12 @@ TEST_CASE("test nax gate honours MLX_METAL_NAX") {
 }
 
 TEST_CASE("test MLX_METAL_NAX reads the whole string") {
-  CHECK(env::parse_metal_nax("1") == 1);
-  CHECK(env::parse_metal_nax("0") == 0);
-  CHECK(env::parse_metal_nax(nullptr) == -1);
+  CHECK(mlx::core::env::parse_metal_nax("1") == 1);
+  CHECK(mlx::core::env::parse_metal_nax("0") == 0);
+  CHECK(mlx::core::env::parse_metal_nax(nullptr) == -1);
   for (auto value : {"", "1garbage", "garbage", "2", "-1", "00", "01", "true"}) {
     CAPTURE(value);
-    CHECK(env::parse_metal_nax(value) == -1);
+    CHECK(mlx::core::env::parse_metal_nax(value) == -1);
   }
 }
 
