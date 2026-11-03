@@ -1548,6 +1548,11 @@ class TestQuantized(mlx_tests.MLXTestCase):
         # Biases=None is the implied bias, so it runs wherever the implied-bias
         # path does: non-transposed (qvm), the matrix regime (qmm) and the CPU,
         # which the old bias-free kernels refused.
+        if os.environ.get("MLX_FORCE_GPU_FAMILY", "").lower() == "apple6":
+            # Apple6 (A13) has no MMA: the dense reference matmul and 1-bit
+            # products above eight rows raise there; test_apple6_route.py
+            # covers that route.
+            self.skipTest("MMA-free GPU family")
         devices = [mx.cpu, mx.gpu]
         for bits in [1, 2]:
             w_q, scales, _ = mx.quantize(mx.random.normal(shape=(512, 512)), 64, bits)
