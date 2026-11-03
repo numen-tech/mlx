@@ -147,12 +147,12 @@ TEST_CASE("test nax gate honours MLX_METAL_NAX") {
 }
 
 TEST_CASE("test MLX_METAL_NAX reads the whole string") {
-  CHECK(env::parse_metal_nax("1") == 1);
-  CHECK(env::parse_metal_nax("0") == 0);
-  CHECK(env::parse_metal_nax(nullptr) == -1);
+  CHECK(mlx::core::env::parse_metal_nax("1") == 1);
+  CHECK(mlx::core::env::parse_metal_nax("0") == 0);
+  CHECK(mlx::core::env::parse_metal_nax(nullptr) == -1);
   for (auto value : {"", "1garbage", "garbage", "2", "-1", "00", "01", "true"}) {
     CAPTURE(value);
-    CHECK(env::parse_metal_nax(value) == -1);
+    CHECK(mlx::core::env::parse_metal_nax(value) == -1);
   }
 }
 
