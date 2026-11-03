@@ -146,6 +146,16 @@ TEST_CASE("test nax gate honours MLX_METAL_NAX") {
   CHECK_FALSE(nax_gate(true, 17, false, -1));
 }
 
+TEST_CASE("test MLX_METAL_NAX reads the whole string") {
+  CHECK(env::parse_metal_nax("1") == 1);
+  CHECK(env::parse_metal_nax("0") == 0);
+  CHECK(env::parse_metal_nax(nullptr) == -1);
+  for (auto value : {"", "1garbage", "garbage", "2", "-1", "00", "01", "true"}) {
+    CAPTURE(value);
+    CHECK(env::parse_metal_nax(value) == -1);
+  }
+}
+
 TEST_CASE("test the switch version says MLX_METAL_NAX is there") {
   // Downstream packages gate their force-on on this being >= 2.
   CHECK(kNaxDisableEnvVersion >= 2);

@@ -43,7 +43,11 @@ std::atomic<uint64_t> sync_count{0};
 std::atomic<uint64_t> wait_count{0};
 
 // kernel_trace_start() / kernel_trace_stop().
-std::atomic<bool> kernel_trace_on{false};
+// A lookup keeps the session it saw and appends only if it is still current,
+// under the lock: one that straddles a stop and the next start belongs to
+// neither trace. 0 is off.
+std::atomic<uint64_t> kernel_trace_session{0};
+uint64_t kernel_trace_last_session = 0;
 std::mutex kernel_trace_mtx;
 std::vector<std::string> kernel_trace_names;
 
@@ -980,9 +984,11 @@ MTL::ComputePipelineState* Device::get_kernel(
     const MTLFCList& func_consts /* = {} */,
     const std::vector<MTL::Function*>& linked_functions /* = {} */) {
   const auto& kname = hash_name.empty() ? base_name : hash_name;
-  if (kernel_trace_on.load(std::memory_order_relaxed)) {
+  if (auto session = kernel_trace_session.load(std::memory_order_relaxed)) {
     std::lock_guard<std::mutex> lock(kernel_trace_mtx);
-    kernel_trace_names.push_back(kname);
+    if (session == kernel_trace_session.load(std::memory_order_relaxed)) {
+      kernel_trace_names.push_back(kname);
+    }
   }
   {
     // Multiple readers allowed
@@ -1072,12 +1078,13 @@ bool nax_gate(
 void kernel_trace_start() {
   std::lock_guard<std::mutex> lock(kernel_trace_mtx);
   kernel_trace_names.clear();
-  kernel_trace_on.store(true, std::memory_order_relaxed);
+  kernel_trace_session.store(
+      ++kernel_trace_last_session, std::memory_order_relaxed);
 }
 
 std::vector<std::string> kernel_trace_stop() {
   std::lock_guard<std::mutex> lock(kernel_trace_mtx);
-  kernel_trace_on.store(false, std::memory_order_relaxed);
+  kernel_trace_session.store(0, std::memory_order_relaxed);
   return std::exchange(kernel_trace_names, {});
 }
 
