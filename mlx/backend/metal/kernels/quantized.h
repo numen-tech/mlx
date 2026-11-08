@@ -1306,23 +1306,6 @@ METAL_FUNC void qmv_wide_impl(
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
-  if constexpr (bits == 2 && group_size % 8 == 0) {
-    if (in_vec_size % (8 * SIMD_SIZE) == 0) {
-      qmv_wide_rr_impl<T, group_size, bits, vecs_per_tg, SIMD_SIZE / k_lanes>(
-          w,
-          scales,
-          biases,
-          x,
-          y,
-          in_vec_size,
-          out_vec_size,
-          M,
-          tid,
-          simd_gid,
-          simd_lid);
-      return;
-    }
-  }
   constexpr int num_simdgroups = 2;
   constexpr int results_per_simdgroup = SIMD_SIZE / k_lanes;
   constexpr int sub = 8; // values per sub-chunk (== bits bytes, byte-aligned)
