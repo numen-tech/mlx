@@ -3042,9 +3042,14 @@ template <
   // The host sets `use_nax` only when metal::is_nax_available() reports a
   // tensor unit; every other GPU takes the SIMD body below.
   constexpr bool kSplitkNax = use_nax;
+  // PrismML's body is 2-bit gs128; nothing in it depends on either (4 values
+  // a lane per 16-k step, whole groups a partition), so 4/8-bit and gs 32/64
+  // take it too when the host asks (MLX_NAX_SPLITK_WIDE, gemma4-qat#315).
+  constexpr bool kSplitkNaxWidth = (bits == 2 || bits == 4 || bits == 8) &&
+      (group_size == 32 || group_size == 64 || group_size == 128);
   if constexpr (
-      kSplitkNax && metal::is_same_v<T, float> && bits == 2 &&
-      group_size == 128 && BM == 32 && BN == 32) {
+      kSplitkNax && metal::is_same_v<T, float> && kSplitkNaxWidth &&
+      BM == 32 && BN == 32) {
     static_assert(
         2 * 16 * SIMD_SIZE * sizeof(float) <= BM * BK_padded * sizeof(T),
         "splitk NAX reduction must fit in Xs / Ws");
@@ -3092,8 +3097,8 @@ template <
   // values. The FP32 scratch of the cross-simdgroup reduction fits in the
   // half-typed Xs / Ws for one 16-row half; wider tiles keep the SIMD body.
   if constexpr (
-      kSplitkNax && metal::is_same_v<T, half> && bits == 2 &&
-      group_size == 128 && BM == 32 && BN == 32) {
+      kSplitkNax && metal::is_same_v<T, half> && kSplitkNaxWidth &&
+      BM == 32 && BN == 32) {
     static_assert(
         2 * 8 * SIMD_SIZE * sizeof(float) <= BM * BK_padded * sizeof(T),
         "splitk NAX half reduction must fit in Xs / Ws");

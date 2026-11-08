@@ -222,10 +222,21 @@
   instantiate_quantized_splitk_qmm(affine_qmm_t_splitk, type, group_size, bits, true, false)  \
   instantiate_quantized_splitk_qmm(affine_qmm_t_splitk, type, group_size, bits, false, false)
 
-// The NAX body exists only for float / float16 at gs128, 2 bits.
-#define instantiate_quantized_splitk_qmm_nax(type)                                  \
-  instantiate_quantized_splitk_qmm(affine_qmm_t_splitk, type, 128, 2, true, true)  \
-  instantiate_quantized_splitk_qmm(affine_qmm_t_splitk, type, 128, 2, false, true)
+// The NAX body exists only for float / float16; the host selects it at gs128,
+// 2 bits, and at 4/8 bits and gs 32/64 under MLX_NAX_SPLITK_WIDE (#315).
+#define instantiate_quantized_splitk_qmm_nax_gb(type, group_size, bits)                       \
+  instantiate_quantized_splitk_qmm(affine_qmm_t_splitk, type, group_size, bits, true, true)  \
+  instantiate_quantized_splitk_qmm(affine_qmm_t_splitk, type, group_size, bits, false, true)
+
+#define instantiate_quantized_splitk_qmm_nax_g(type, bits)  \
+  instantiate_quantized_splitk_qmm_nax_gb(type, 128, bits)  \
+  instantiate_quantized_splitk_qmm_nax_gb(type, 64, bits)   \
+  instantiate_quantized_splitk_qmm_nax_gb(type, 32, bits)
+
+#define instantiate_quantized_splitk_qmm_nax(type) \
+  instantiate_quantized_splitk_qmm_nax_g(type, 2)  \
+  instantiate_quantized_splitk_qmm_nax_g(type, 4)  \
+  instantiate_quantized_splitk_qmm_nax_g(type, 8)
 
 #define instantiate_quantized_all_rhs(type, group_size, bits) \
   instantiate_gather_qmm_rhs(affine_gather_qmm_rhs, affine_gather_qmm_rhs_nt, type, group_size, bits, 16, 32, 32, 1, 2, true) \

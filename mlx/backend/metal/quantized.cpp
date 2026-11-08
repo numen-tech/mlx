@@ -101,6 +101,23 @@ inline array ensure_row_contiguous_matrix(
 // (qgemm_simt_ok, gemma4-qat#991) have no row limit.
 constexpr int kApple6MaxRows = 8;
 
+// numen-tech/gemma4-qat#315 spike switches. Read on every call (not cached)
+// so one process can measure both sides; both are off when unset.
+//   MLX_NAX_FEWROW_MIN_M=m  on a NAX GPU, an affine transposed non-batched
+//                           matmul of m or more rows takes the matrix route
+//                           (split-K / qmm_t_nax) below the qmv batch limit.
+//   MLX_NAX_SPLITK_WIDE=1   the split-K NAX body for 4/8-bit and gs 32/64 too,
+//                           not only 2-bit gs128.
+inline int nax_fewrow_min_m() {
+  const char* v = std::getenv("MLX_NAX_FEWROW_MIN_M");
+  return v ? std::max(0, std::atoi(v)) : 0;
+}
+
+inline bool nax_splitk_wide() {
+  const char* v = std::getenv("MLX_NAX_SPLITK_WIDE");
+  return v && std::string(v) == "1";
+}
+
 inline int get_qmv_batch_limit(int D, int O, metal::Device& d) {
   auto arch_size = d.get_architecture().back();
   auto arch_gen = d.get_architecture_gen();
@@ -1528,8 +1545,10 @@ void qmm_splitk(
   // tensor unit. FP32 input honors the MLX_ENABLE_TF32 opt-out like the other
   // NAX dispatches. The fp modes have no NAX variant.
   bool affine = mode == "affine";
-  bool use_nax = affine && metal::is_nax_available() && bits == 2 &&
-      group_size == 128 &&
+  bool nax_width = (bits == 2 && group_size == 128) ||
+      (nax_splitk_wide() && (bits == 2 || bits == 4 || bits == 8) &&
+       (group_size == 32 || group_size == 64 || group_size == 128));
+  bool use_nax = affine && metal::is_nax_available() && nax_width &&
       (x.dtype() == float16 || (x.dtype() == float32 && env::enable_tf32()));
   std::string type_string = get_type_string(x.dtype());
   std::string kname;
@@ -2394,6 +2413,16 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
           std::to_string(kApple6MaxRows) + ")");
     }
     vector_limit = kApple6MaxRows + 1;
+  }
+  // Few-row matrix route (gemma4-qat#315): the qmm kernels mask rows past M,
+  // so no padding is needed, only the bypass of the vector dispatch.
+  if (transpose_ && non_batched && mode == "affine" && biases &&
+      M < vector_limit && metal::is_nax_available() &&
+      (x.dtype() != float32 || env::enable_tf32())) {
+    int min_m = nax_fewrow_min_m();
+    if (min_m > 0 && M >= min_m) {
+      vector_limit = M;
+    }
   }
   // It is a matrix matrix product.
   if (M >= vector_limit) {
