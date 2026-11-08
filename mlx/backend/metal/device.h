@@ -292,6 +292,14 @@ bool nax_gate(
 //    (numen-tech/gemma4-qat#312).
 constexpr int kNaxDisableEnvVersion = 2;
 
+// Bumped when the split-K quantized matmul's tensor-unit (NAX) route changes.
+// A binding reads it to tell which one a core carries.
+// 1: on a GPU with NAX, an affine 2/4/8-bit split-K qmm of group size
+//    32/64/128 takes the NAX body of affine_qmm_t_splitk for FP16 input (FP32
+//    under MLX_ENABLE_TF32), and MLX_DISABLE_QMM_SPLITK_NAX=1 turns it off
+//    (numen-tech/gemma4-qat#315). A GPU without NAX never compiles the body.
+constexpr int kQmmSplitkNaxVersion = 1;
+
 // Records the name of every kernel looked up, cached or not, from
 // kernel_trace_start() to kernel_trace_stop(), in order with repeats. A harness
 // that compares two routes uses it to prove which kernel served an op, since a

@@ -687,6 +687,66 @@ class TestQuantized(mlx_tests.MLXTestCase):
                 rounding = (y_ref.astype(dtype).astype(mx.float32) - y_ref).abs().mean()
                 self.assertLess(error.item(), 1.1 * rounding.item())
 
+    @unittest.skipIf(not mx.metal.is_available(), "requires Metal")
+    def test_qmm_splitk_nax_widths(self):
+        # Split-K NAX (numen-tech/gemma4-qat#315): on a NAX GPU an affine
+        # 2/4/8-bit split-K qmm of group size 32/64/128 takes the tensor-unit
+        # body for FP16 input; MLX_DISABLE_QMM_SPLITK_NAX=1 (read on every
+        # call) takes the SIMD body. Both must match the dequantized reference,
+        # with an explicit bias and with the implied one (a 0-d factor), at M
+        # 13..16 (one 32-row tile, at most 16 rows: the NAX body) and 40 (a
+        # 32-row SIMD tile and an 8-row NAX one). K > 4096 keeps every M here
+        # at or above get_qmv_batch_limit on every GPU, and N = 1536 leaves
+        # few enough tiles for split-K. On a GPU without NAX both runs take
+        # the SIMD body.
+        if mx.default_device() == mx.cpu:
+            self.skipTest("Covers GPU kernels only")
+        K, N = 5120, 1536
+        k1, k2 = mx.random.split(mx.random.key(7))
+        w = (0.02 * mx.random.normal((N, K), key=k2)).astype(mx.float16)
+        x_all = mx.random.normal((40, K), key=k1).astype(mx.float16)
+        key = "MLX_DISABLE_QMM_SPLITK_NAX"
+        saved = os.environ.get(key)
+
+        def run(x, wq, scales, biases, gs, bits, disabled):
+            if disabled:
+                os.environ[key] = "1"
+            else:
+                os.environ.pop(key, None)
+            try:
+                y = mx.quantized_matmul(
+                    x, wq, scales, biases, transpose=True, group_size=gs, bits=bits
+                )
+                mx.eval(y)
+                return y
+            finally:
+                if saved is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = saved
+
+        for bits, gs in product([2, 4, 8], [32, 64, 128]):
+            wq, scales, biases = mx.quantize(w, group_size=gs, bits=bits)
+            w_hat = mx.dequantize(wq, scales, biases, group_size=gs, bits=bits)
+            factor = -(2 ** (bits - 1))
+            implied = mx.array(factor, mx.float16)
+            implied_full = scales * implied
+            for M in [13, 14, 15, 16, 40]:
+                x = x_all[:M]
+                y_ref = x.astype(mx.float32) @ w_hat.astype(mx.float32).T
+                scale = y_ref.abs().max().item()
+                for disabled in [False, True]:
+                    with self.subTest(bits=bits, gs=gs, M=M, disabled=disabled):
+                        y = run(x, wq, scales, biases, gs, bits, disabled)
+                        err = (y.astype(mx.float32) - y_ref).abs().max().item()
+                        self.assertLess(err / scale, 2e-3)
+                        # The implied bias must reproduce the materialized
+                        # one bit for bit on the same route.
+                        self.assert_bitwise_equal(
+                            run(x, wq, scales, implied, gs, bits, disabled),
+                            run(x, wq, scales, implied_full, gs, bits, disabled),
+                        )
+
     def test_qmm_vjp(self):
         key = mx.random.key(0)
         k1, k2 = mx.random.split(key)
