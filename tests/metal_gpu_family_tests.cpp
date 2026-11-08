@@ -161,6 +161,11 @@ TEST_CASE("test the switch version says MLX_METAL_NAX is there") {
   CHECK(kNaxDisableEnvVersion >= 2);
 }
 
+TEST_CASE("test the split-K NAX route version") {
+  // Downstream packages assert the 2/4/8-bit split-K NAX route is there.
+  CHECK(kQmmSplitkNaxVersion >= 1);
+}
+
 TEST_CASE("test kernel trace records every lookup while on, and only then") {
   using namespace mlx::core;
   auto dev = mlx::core::Device::gpu;

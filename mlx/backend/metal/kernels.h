@@ -312,6 +312,15 @@ MTL::ComputePipelineState* get_quantized_kernel(
     const std::string& template_def,
     const std::string& mode);
 
+// A `_nax_true` affine split-K qmm kernel: the get_quantized_kernel source
+// with MLX_QMM_SPLITK_NAX_SOURCE defined first, so the tensor-unit body and
+// its <MetalPerformancePrimitives> include are compiled for it alone
+// (numen-tech/gemma4-qat#315). Ask for it only on a GPU with NAX.
+MTL::ComputePipelineState* get_quantized_splitk_nax_kernel(
+    metal::Device& d,
+    const std::string& kernel_name,
+    const std::string& template_def);
+
 MTL::ComputePipelineState* get_gather_qmm_kernel(
     metal::Device& d,
     const std::string& kernel_name,

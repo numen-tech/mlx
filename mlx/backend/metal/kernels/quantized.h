@@ -2702,20 +2702,28 @@ template <
       simd_lid);
 }
 
-// NAX (Metal 4 tensor ops) body for affine_qmm_t_splitk, T=float, 2-bit,
-// gs128 (verify widths: the host sends M >= 13 here with 32-row tiles). The
-// threadgroup keeps the host's work split: 32 weight rows (tid.x), one 32-row
-// M tile (tid.y), one K partition (tid.z). Each 16-wide K step is one
-// 16x32x16 matmul2d per 16 rows of M: A = input rows, B = the 32 weight rows
-// dequantized straight into the right-operand fragment, so each weight is
-// decoded once for all rows. The 4 simdgroups take every 4th quantization
-// group of the partition; their partials are summed through threadgroup
-// memory (Xs / Ws, unused on this path). Fragment layout, descriptor and
-// cooperative-tensor copies follow steel/gemm/nax.h (BaseNAXFrag::get_coord /
-// mma) as used by qmm_t_nax. Products run at the tensor unit's FP32-input
-// precision (TF32-class, like qmm_t_nax), not the FP32 FMAs of the SIMD path.
-#if defined(__METAL_VERSION__) && (__METAL_VERSION__ >= 400) && \
-    defined(__has_include)
+// NAX (Metal 4 tensor ops) body for affine_qmm_t_splitk: 2/4/8-bit, group
+// size 32/64/128, FP32 and FP16 activations (verify widths: the host sends
+// M >= 13 here with 32-row tiles). The threadgroup keeps the host's work
+// split: 32 weight rows (tid.x), one 32-row M tile (tid.y), one K partition
+// (tid.z). Each 16-wide K step is one 16x32x16 matmul2d per 16 rows of M:
+// A = input rows, B = the 32 weight rows dequantized straight into the
+// right-operand fragment, so each weight is decoded once for all rows. The 4
+// simdgroups take every 4th quantization group of the partition; their
+// partials are summed through threadgroup memory (Xs / Ws, unused on this
+// path). Fragment layout, descriptor and cooperative-tensor copies follow
+// steel/gemm/nax.h (BaseNAXFrag::get_coord / mma) as used by qmm_t_nax.
+// Products run at the tensor unit's FP32-input precision (TF32-class, like
+// qmm_t_nax), not the FP32 FMAs of the SIMD path.
+//
+// Only a source that asks for it compiles the body and its
+// <MetalPerformancePrimitives> include: the JIT source of a `_nax_true`
+// split-K kernel (get_quantized_splitk_nax_kernel), which the host builds only
+// on a GPU with NAX, and the precompiled quantized.metal. Every other JIT
+// quantized kernel, on every GPU, compiles the source it did before this body
+// existed (numen-tech/gemma4-qat#315).
+#if defined(MLX_QMM_SPLITK_NAX_SOURCE) && defined(__METAL_VERSION__) && \
+    (__METAL_VERSION__ >= 400) && defined(__has_include)
 #if __has_include(<MetalPerformancePrimitives/MetalPerformancePrimitives.h>)
 #define MLX_QMM_SPLITK_NAX 1
 #endif
@@ -2848,8 +2856,9 @@ METAL_FUNC void qmm_t_splitk_nax_impl(
     for (int j = 0; j < 4; j++) {
       s[j] = static_cast<U>(sr[j][g]);
       // An implied bias is rounded to T like the SIMD body's affine_bias.
-      b[j] = implied_bias ? static_cast<U>(static_cast<T>(bias_factor * sr[j][g]))
-                          : static_cast<U>(br[j][g]);
+      b[j] = implied_bias
+          ? static_cast<U>(static_cast<T>(bias_factor * sr[j][g]))
+          : static_cast<U>(br[j][g]);
     }
     for (int kk = 0; kk < group_size; kk += kStep) {
       const int k = g * group_size + kk;
@@ -3025,9 +3034,14 @@ template <
   // The host sets `use_nax` only when metal::is_nax_available() reports a
   // tensor unit; every other GPU takes the SIMD body below.
   constexpr bool kSplitkNax = use_nax;
+  // PrismML's body is 2-bit gs128; nothing in it depends on either (4 values
+  // a lane per 16-k step, whole groups a partition), so 4/8-bit and gs 32/64
+  // take it too (numen-tech/gemma4-qat#315).
+  constexpr bool kSplitkNaxWidth = (bits == 2 || bits == 4 || bits == 8) &&
+      (group_size == 32 || group_size == 64 || group_size == 128);
   if constexpr (
-      kSplitkNax && metal::is_same_v<T, float> && bits == 2 &&
-      group_size == 128 && BM == 32 && BN == 32) {
+      kSplitkNax && metal::is_same_v<T, float> && kSplitkNaxWidth && BM == 32 &&
+      BN == 32) {
     static_assert(
         2 * 16 * SIMD_SIZE * sizeof(float) <= BM * BK_padded * sizeof(T),
         "splitk NAX reduction must fit in Xs / Ws");
@@ -3075,8 +3089,8 @@ template <
   // values. The FP32 scratch of the cross-simdgroup reduction fits in the
   // half-typed Xs / Ws for one 16-row half; wider tiles keep the SIMD body.
   if constexpr (
-      kSplitkNax && metal::is_same_v<T, half> && bits == 2 &&
-      group_size == 128 && BM == 32 && BN == 32) {
+      kSplitkNax && metal::is_same_v<T, half> && kSplitkNaxWidth && BM == 32 &&
+      BN == 32) {
     static_assert(
         2 * 8 * SIMD_SIZE * sizeof(float) <= BM * BK_padded * sizeof(T),
         "splitk NAX half reduction must fit in Xs / Ws");

@@ -1,6 +1,9 @@
 // Copyright © 2023-2024 Apple Inc.
 
 // clang-format off
+// The precompiled library carries the split-K NAX body (quantized.h): the
+// host selects its `_nax_true` kernels only on a GPU with NAX.
+#define MLX_QMM_SPLITK_NAX_SOURCE 1
 #include "mlx/backend/metal/kernels/utils.h"
 #include "mlx/backend/metal/kernels/steel/gemm/gemm.h"
 #include "mlx/backend/metal/kernels/quantized_utils.h"
@@ -222,10 +225,23 @@
   instantiate_quantized_splitk_qmm(affine_qmm_t_splitk, type, group_size, bits, true, false)  \
   instantiate_quantized_splitk_qmm(affine_qmm_t_splitk, type, group_size, bits, false, false)
 
-// The NAX body exists only for float / float16 at gs128, 2 bits.
-#define instantiate_quantized_splitk_qmm_nax(type)                                  \
-  instantiate_quantized_splitk_qmm(affine_qmm_t_splitk, type, 128, 2, true, true)  \
-  instantiate_quantized_splitk_qmm(affine_qmm_t_splitk, type, 128, 2, false, true)
+// The NAX body exists only for float / float16, at 2/4/8 bits and group size
+// 32/64/128 (numen-tech/gemma4-qat#315), explicit and implied bias.
+#define instantiate_quantized_splitk_qmm_nax_gb(type, group_size, bits)                        \
+  instantiate_quantized_splitk_qmm(affine_qmm_t_splitk, type, group_size, bits, true, true)   \
+  instantiate_quantized_splitk_qmm(affine_qmm_t_splitk, type, group_size, bits, false, true)  \
+  instantiate_quantized_ib_splitk_qmm(type, group_size, bits, true, true)                      \
+  instantiate_quantized_ib_splitk_qmm(type, group_size, bits, false, true)
+
+#define instantiate_quantized_splitk_qmm_nax_g(type, bits)  \
+  instantiate_quantized_splitk_qmm_nax_gb(type, 32, bits)   \
+  instantiate_quantized_splitk_qmm_nax_gb(type, 64, bits)   \
+  instantiate_quantized_splitk_qmm_nax_gb(type, 128, bits)
+
+#define instantiate_quantized_splitk_qmm_nax(type) \
+  instantiate_quantized_splitk_qmm_nax_g(type, 2)  \
+  instantiate_quantized_splitk_qmm_nax_g(type, 4)  \
+  instantiate_quantized_splitk_qmm_nax_g(type, 8)
 
 #define instantiate_quantized_all_rhs(type, group_size, bits) \
   instantiate_gather_qmm_rhs(affine_gather_qmm_rhs, affine_gather_qmm_rhs_nt, type, group_size, bits, 16, 32, 32, 1, 2, true) \
@@ -384,6 +400,4 @@
 
 instantiate_quantized_all()
 instantiate_quantized_splitk_qmm_nax(float)
-instantiate_quantized_splitk_qmm_nax(float16_t)
-instantiate_quantized_ib_splitk_qmm(float, 128, 2, true, true)
-instantiate_quantized_ib_splitk_qmm(float, 128, 2, false, true) // clang-format on
+instantiate_quantized_splitk_qmm_nax(float16_t) // clang-format on
