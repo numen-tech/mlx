@@ -4,6 +4,7 @@
 
 #include <map>
 #include <mutex>
+#include <unordered_set>
 #include <vector>
 
 #include "mlx/allocator.h"
@@ -21,6 +22,10 @@ class MetalAllocator : public allocator::Allocator {
   virtual void free(Buffer buffer) override;
   virtual size_t size(Buffer buffer) const override;
   virtual Buffer make_buffer(void* ptr, size_t size) override;
+  // make_buffer without the residency-set insert: no wired limit ever wires
+  // the buffer (numen-tech/gemma4-qat#1228). Released with release(), like
+  // any make_buffer buffer.
+  Buffer make_nonresident_buffer(void* ptr, size_t size);
   virtual void release(Buffer buffer) override;
 
   size_t get_active_memory() {
@@ -71,6 +76,10 @@ class MetalAllocator : public allocator::Allocator {
   size_t wired_limit_{0};
   size_t num_resources_{0};
   size_t resource_limit_{0};
+
+  // The make_nonresident_buffer buffers still alive, so release() leaves the
+  // residency sets alone for them.
+  std::unordered_set<const MTL::Buffer*> nonresident_;
 
   std::mutex mutex_;
 };

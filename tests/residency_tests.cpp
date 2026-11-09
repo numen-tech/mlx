@@ -1,6 +1,9 @@
 // Copyright © 2026 Apple Inc.
 
+#include <cstdlib>
 #include <vector>
+
+#include <mach/vm_page_size.h>
 
 #include "doctest/doctest.h"
 
@@ -292,5 +295,90 @@ TEST_CASE("test the wired limit is used up to its boundary") {
   CHECK_EQ(residency().wired_size(), baseline);
 
   allocator::allocator().free(second);
+  CHECK_EQ(residency().wired_size(), baseline);
+}
+
+namespace {
+
+// Page-aligned host memory a no-copy Metal buffer can wrap, filled with a
+// known pattern; the deleter frees it and counts the call.
+struct HostPages {
+  size_t bytes;
+  float* data;
+  explicit HostPages(size_t bytes) : bytes(bytes) {
+    data = static_cast<float*>(std::aligned_alloc(vm_page_size, bytes));
+    for (size_t i = 0; i < bytes / sizeof(float); ++i) {
+      data[i] = static_cast<float>(i % 7);
+    }
+  }
+};
+
+} // namespace
+
+TEST_CASE("test a nonresident array never joins the residency sets") {
+  CHECK_EQ(metal::kNonresidentArrayVersion, 1);
+  if (!residency().enabled()) {
+    return;
+  }
+  LimitGuard guard(0, 0);
+  set_wired_limit(256 * MB);
+  const size_t baseline = residency().wired_size();
+  const size_t active = get_active_memory();
+
+  HostPages pages(16 * MB);
+  int deleted = 0;
+  {
+    auto x = metal::nonresident_array(
+        pages.data,
+        {static_cast<int>(pages.bytes / sizeof(float))},
+        float32,
+        [&deleted](void* p) {
+          ++deleted;
+          std::free(p);
+        });
+    // No copy: the array reads the caller's pages.
+    CHECK_EQ(x.data<float>(), pages.data);
+    CHECK_EQ(get_active_memory(), active + 16 * MB);
+    CHECK_EQ(residency().wired_size(), baseline);
+
+    // A wired limit raised over it later does not wire it either.
+    set_wired_limit(512 * MB);
+    CHECK_EQ(residency().wired_size(), baseline);
+
+    // The CPU stream reads it, and so does the GPU when an op binds it.
+    auto cpu_rows = take(x, array({0, 1, 2, 3, 4, 5, 6, 7}), 0, Device::cpu);
+    eval(cpu_rows);
+    CHECK(array_equal(cpu_rows, array({0.f, 1.f, 2.f, 3.f, 4.f, 5.f, 6.f, 0.f}))
+              .item<bool>());
+    auto gpu_sum = sum(x, Device::gpu);
+    eval(gpu_sum);
+    synchronize();
+    CHECK_EQ(residency().wired_size(), baseline);
+  }
+  // The deleter ran once, and release() left the sets' accounting alone.
+  CHECK_EQ(deleted, 1);
+  CHECK_EQ(get_active_memory(), active);
+  CHECK_EQ(residency().wired_size(), baseline);
+}
+
+TEST_CASE("test an ordinary no-copy array is wired once the limit covers it") {
+  if (!residency().enabled()) {
+    return;
+  }
+  // The control for the case above: the same pages through the plain no-copy
+  // constructor are tracked, and wired as soon as the limit has room.
+  LimitGuard guard(0, 0);
+  set_wired_limit(256 * MB);
+  const size_t baseline = residency().wired_size();
+  HostPages pages(16 * MB);
+  {
+    array x(
+        pages.data,
+        {static_cast<int>(pages.bytes / sizeof(float))},
+        float32,
+        [](void* p) { std::free(p); });
+    CHECK_EQ(x.data<float>(), pages.data);
+    CHECK_EQ(residency().wired_size(), baseline + 16 * MB);
+  }
   CHECK_EQ(residency().wired_size(), baseline);
 }

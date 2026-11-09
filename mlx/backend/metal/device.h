@@ -300,6 +300,13 @@ constexpr int kNaxDisableEnvVersion = 2;
 //    (numen-tech/gemma4-qat#315). A GPU without NAX never compiles the body.
 constexpr int kQmmSplitkNaxVersion = 1;
 
+// Bumped when nonresident_array (metal.h) changes. A binding reads it to tell
+// whether a core carries it.
+// 1: nonresident_array makes a no-copy array whose buffer the allocator keeps
+//    out of the residency sets, so raising the wired limit never wires it
+//    (numen-tech/gemma4-qat#1228).
+constexpr int kNonresidentArrayVersion = 1;
+
 // Records the name of every kernel looked up, cached or not, from
 // kernel_trace_start() to kernel_trace_stop(), in order with repeats. A harness
 // that compares two routes uses it to prove which kernel served an op, since a

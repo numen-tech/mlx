@@ -33,6 +33,14 @@ Counters counters() {
 }
 void reset() {}
 
+array nonresident_array(
+    void* data,
+    Shape shape,
+    Dtype dtype,
+    const std::function<void(void*)>& deleter) {
+  return array(data, std::move(shape), dtype, deleter);
+}
+
 } // namespace metal
 
 } // namespace mlx::core
