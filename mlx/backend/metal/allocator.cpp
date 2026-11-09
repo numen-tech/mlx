@@ -217,6 +217,19 @@ Buffer MetalAllocator::make_buffer(void* ptr, size_t size) {
   return Buffer{static_cast<void*>(buf)};
 }
 
+Buffer MetalAllocator::make_nonresident_buffer(void* ptr, size_t size) {
+  auto buf = device_->newBuffer(ptr, size, resource_options, nullptr);
+  if (!buf) {
+    return Buffer{nullptr};
+  }
+  std::unique_lock lk(mutex_);
+  nonresident_.insert(buf);
+  active_memory_ += buf->length();
+  peak_memory_ = std::max(peak_memory_, active_memory_);
+  num_resources_++;
+  return Buffer{static_cast<void*>(buf)};
+}
+
 void MetalAllocator::release(Buffer buffer) {
   auto buf = static_cast<MTL::Buffer*>(buffer.ptr());
   if (buf == nullptr) {
@@ -225,10 +238,38 @@ void MetalAllocator::release(Buffer buffer) {
   std::unique_lock lk(mutex_);
   active_memory_ -= buf->length();
   num_resources_--;
-  residency_sets_.erase(buf);
+  if (nonresident_.erase(buf) == 0) {
+    residency_sets_.erase(buf);
+  }
   lk.unlock();
   auto pool = metal::new_scoped_memory_pool();
   buf->release();
+}
+
+array nonresident_array(
+    void* data,
+    Shape shape,
+    Dtype dtype,
+    const std::function<void(void*)>& deleter) {
+  size_t nbytes = size_of(dtype);
+  for (auto dim : shape) {
+    nbytes *= dim;
+  }
+  auto buffer = allocator().make_nonresident_buffer(data, nbytes);
+  if (buffer.ptr() == nullptr) {
+    // Metal refused the pointer: the copying constructor's fallback, whose
+    // malloc'd buffer is an ordinary (residency-tracked) allocation.
+    return array(data, std::move(shape), dtype, deleter);
+  }
+  auto wrapped_deleter = [deleter](allocator::Buffer buffer) {
+    auto ptr = buffer.raw_ptr();
+    allocator::release(buffer);
+    return deleter(ptr);
+  };
+  return array(
+      allocator::Data(buffer, std::move(wrapped_deleter)),
+      std::move(shape),
+      dtype);
 }
 
 MetalAllocator& allocator() {

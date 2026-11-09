@@ -3,11 +3,13 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <unordered_map>
 #include <variant>
 
 #include "mlx/api.h"
+#include "mlx/array.h"
 
 namespace mlx::core::metal {
 
@@ -38,5 +40,18 @@ struct Counters {
 };
 MLX_API Counters counters();
 MLX_API void reset();
+
+// A no-copy array over `data`, like array(data, shape, dtype, deleter), whose
+// Metal buffer never joins the residency sets: no wired limit
+// (set_wired_limit) ever wires it, so its pages stay pageable for as long as
+// no GPU command binds the buffer. Use it for a mapping only the CPU stream
+// reads (numen-tech/gemma4-qat#1228). If Metal refuses the pointer, or there
+// is no Metal backend, this is array(data, shape, dtype, deleter).
+// Version: kNonresidentArrayVersion (device.h).
+MLX_API array nonresident_array(
+    void* data,
+    Shape shape,
+    Dtype dtype,
+    const std::function<void(void*)>& deleter);
 
 } // namespace mlx::core::metal
