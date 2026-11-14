@@ -400,4 +400,26 @@
 
 instantiate_quantized_all()
 instantiate_quantized_splitk_qmm_nax(float)
-instantiate_quantized_splitk_qmm_nax(float16_t) // clang-format on
+instantiate_quantized_splitk_qmm_nax(float16_t)
+
+// The full-tile split-K NAX kernel (numen-tech/gemma4-qat#1651,
+// MLX_QMM_SPLITK_NAX_TILE=wide): FP16 only, the type whose wider tiles the
+// `_nax_true` kernel leaves to the SIMD body. Exists only where the body does.
+#ifdef MLX_QMM_SPLITK_NAX
+#define instantiate_quantized_splitk_qmm_nax_wide_gb(type, group_size, bits) \
+  instantiate_kernel(                                                        \
+      "affine_qmm_t_splitk_nax_wide_" #type "_gs_" #group_size "_b_" #bits,  \
+      affine_qmm_t_splitk_nax_wide, type, group_size, bits, false)           \
+  instantiate_kernel(                                                        \
+      "affine_qmm_t_splitk_nax_wide_" #type "_gs_" #group_size "_b_" #bits "_ib", \
+      affine_qmm_t_splitk_nax_wide, type, group_size, bits, true)
+
+#define instantiate_quantized_splitk_qmm_nax_wide_g(type, bits)  \
+  instantiate_quantized_splitk_qmm_nax_wide_gb(type, 32, bits)   \
+  instantiate_quantized_splitk_qmm_nax_wide_gb(type, 64, bits)   \
+  instantiate_quantized_splitk_qmm_nax_wide_gb(type, 128, bits)
+
+instantiate_quantized_splitk_qmm_nax_wide_g(float16_t, 2)
+instantiate_quantized_splitk_qmm_nax_wide_g(float16_t, 4)
+instantiate_quantized_splitk_qmm_nax_wide_g(float16_t, 8)
+#endif // clang-format on

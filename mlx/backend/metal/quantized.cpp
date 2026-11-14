@@ -154,6 +154,41 @@ inline bool use_qmm_splitk_nax(int bits, int group_size, Dtype dtype) {
       metal::is_nax_available() && !qmm_splitk_nax_disabled();
 }
 
+// What an FP16 split-K qmm with NAX does with a tile of more than 16 rows,
+// which the `_nax_true` kernel leaves to its SIMD body (numen-tech/gemma4-qat
+// #1651). A measurement switch between two candidate fixes, not a route:
+// read once, from MLX_QMM_SPLITK_NAX_TILE at the first split-K qmm.
+// - stock (unset, or any other value): today's kernels, bit for bit.
+// - qmm: an FP16 split-K qmm of more than 16 rows that the NAX qmm can take
+//   (K % 64 == 0) goes to qmm (affine_qmm_t_nax) instead of split-K; 16 rows
+//   and fewer keep the `_nax_true` split-K kernel.
+// - wide: the split-K grid stays and its kernel is
+//   affine_qmm_t_splitk_nax_wide, whose tiles of more than 16 rows run the
+//   NAX body over all 32 rows (its tiles of up to 16 rows are bit-identical
+//   to the `_nax_true` kernel's).
+// Both apply only where the split-K NAX route does (use_qmm_splitk_nax, so
+// MLX_DISABLE_QMM_SPLITK_NAX=1 turns them off too) and only to affine FP16:
+// FP32 under TF32 already runs 32-row tiles on the NAX body.
+enum class QmmSplitkNaxTile { stock, qmm, wide };
+
+inline QmmSplitkNaxTile qmm_splitk_nax_tile() {
+  static const QmmSplitkNaxTile tile = [] {
+    const char* v = std::getenv("MLX_QMM_SPLITK_NAX_TILE");
+    if (v == nullptr) {
+      return QmmSplitkNaxTile::stock;
+    }
+    std::string s(v);
+    if (s == "qmm") {
+      return QmmSplitkNaxTile::qmm;
+    }
+    if (s == "wide") {
+      return QmmSplitkNaxTile::wide;
+    }
+    return QmmSplitkNaxTile::stock;
+  }();
+  return tile;
+}
+
 inline int get_qmv_batch_limit(int D, int O, metal::Device& d) {
   auto arch_size = d.get_architecture().back();
   auto arch_gen = d.get_architecture_gen();
@@ -1523,6 +1558,34 @@ void qmm_splitk(
     const Stream& s,
     const std::string& mode) {
   d.require_mma("quantized_matmul (split-K qmm)");
+  bool affine = mode == "affine";
+  bool use_nax = affine && use_qmm_splitk_nax(bits, group_size, x.dtype());
+  // MLX_QMM_SPLITK_NAX_TILE (numen-tech/gemma4-qat#1651): `qmm` sends an FP16
+  // qmm of more than 16 rows to qmm(), whose NAX kernel needs K % 64 == 0
+  // (qmm() takes the SIMD qmm otherwise, so such a K keeps split-K); `wide`
+  // swaps the split-K kernel below.
+  QmmSplitkNaxTile tile = use_nax && x.dtype() == float16
+      ? qmm_splitk_nax_tile()
+      : QmmSplitkNaxTile::stock;
+  if (tile == QmmSplitkNaxTile::qmm && M > 16 && K % 64 == 0) {
+    return qmm(
+        x,
+        w,
+        scales,
+        biases,
+        std::nullopt,
+        out,
+        true,
+        group_size,
+        bits,
+        M,
+        N,
+        K,
+        d,
+        s,
+        mode);
+  }
+  bool use_wide = tile == QmmSplitkNaxTile::wide;
   // Choose split_k to target ~512 threadgroups
   int bm = 32, bn = 32;
   int n_tiles = (N + bn - 1) / bn;
@@ -1576,27 +1639,48 @@ void qmm_splitk(
   MTL::Size grid_dims(n_tiles, m_tiles, split_k);
 
   bool aligned = N % 32 == 0;
-  bool affine = mode == "affine";
-  bool use_nax = affine && use_qmm_splitk_nax(bits, group_size, x.dtype());
   std::string type_string = get_type_string(x.dtype());
   std::string kname;
   kname.reserve(64);
-  concatenate(
-      kname,
-      mode + "_qmm_t_splitk_",
-      type_string,
-      "_gs_",
-      group_size,
-      "_b_",
-      bits,
-      aligned ? "_alN_true" : "_alN_false",
-      affine ? (use_nax ? "_nax_true" : "_nax_false") : "",
-      is_implied_bias(biases) ? "_ib" : "");
+  if (use_wide) {
+    // affine_qmm_t_splitk_nax_wide (#1651): the NAX body on every tile. It
+    // bounds N itself, so it has no aligned variant.
+    concatenate(
+        kname,
+        "affine_qmm_t_splitk_nax_wide_",
+        type_string,
+        "_gs_",
+        group_size,
+        "_b_",
+        bits,
+        is_implied_bias(biases) ? "_ib" : "");
+  } else {
+    concatenate(
+        kname,
+        mode + "_qmm_t_splitk_",
+        type_string,
+        "_gs_",
+        group_size,
+        "_b_",
+        bits,
+        aligned ? "_alN_true" : "_alN_false",
+        affine ? (use_nax ? "_nax_true" : "_nax_false") : "",
+        is_implied_bias(biases) ? "_ib" : "");
+  }
   // use_nax sits before BM in the template, so an affine kernel gets it
   // explicitly (the fp modes have no such parameter); BM/BK/BN = 32 are the
   // kernel defaults, spelled out for the trailing implied-bias arg.
   MTL::ComputePipelineState* kernel;
-  if (is_implied_bias(biases)) {
+  if (use_wide) {
+    auto template_def = get_template_definition(
+        kname,
+        "affine_qmm_t_splitk_nax_wide",
+        type_string,
+        group_size,
+        bits,
+        is_implied_bias(biases));
+    kernel = get_quantized_splitk_nax_kernel(d, kname, template_def);
+  } else if (is_implied_bias(biases)) {
     kernel = get_qmm_splitk_kernel_wrapped(
         d,
         kname,
