@@ -173,6 +173,57 @@ class TestBlas(mlx_tests.MLXTestCase):
 
             self.assertTrue(np.allclose(c_mlx, c_npy, atol=1e-6))
 
+    def test_matmul_nax_split_k_half_precision(self):
+        # On NAX GPUs a matmul with M * N >= 2048^2, K >= 10240 and
+        # K >= 3 * max(M, N) takes the NAX split-K kernel. Its JIT builder used
+        # to instantiate that kernel with the float32 accumulator type as the
+        # input type, so float16 and bfloat16 operands were read as float32:
+        # wrong values and out of bounds reads. Only JIT builds
+        # (MLX_METAL_JIT=ON, mlx-swift) were affected, the precompiled
+        # instantiations use the input type. On other GPUs the same shapes take
+        # the regular kernels and the check still holds.
+        if not mx.is_available(mx.gpu):
+            return
+
+        np.random.seed(0)
+        M, N = 2048, 2048
+        # 10240: four full K partitions, 12289: an unaligned last partition
+        for K in (10240, 12289):
+            # a @ b.T is O(1) like c, so that a wrong product cannot hide
+            # behind the bias in the addmm case
+            a_f32 = mx.array(np.random.normal(0.0, 1.0, (M, K)).astype(np.float32))
+            b_f32 = mx.array(
+                np.random.normal(0.0, 1.0 / math.sqrt(K), (N, K)).astype(np.float32)
+            )
+            c_f32 = mx.array(np.random.normal(0.0, 1.0, (N,)).astype(np.float32))
+            for dt in (mx.float16, mx.bfloat16):
+                a = a_f32.astype(dt)
+                b = b_f32.astype(dt)
+                c = c_f32.astype(dt)
+                b_t = mx.contiguous(b.T)
+                mx.eval(a, b, c, b_t)
+
+                # Reference from the rounded operands, so that only the
+                # error of the matmul itself is left
+                a_npy = np.array(a.astype(mx.float32))
+                b_npy = np.array(b.astype(mx.float32))
+                c_npy = np.array(c.astype(mx.float32))
+                ref = a_npy @ b_npy.T
+
+                outs = {
+                    "nt": (a @ b.T, ref),
+                    "nn": (a @ b_t, ref),
+                    "batched": ((a[None] @ b.T)[0], ref),
+                    "addmm": (mx.addmm(c, a, b.T), ref + c_npy),
+                }
+                for name, (out, expected) in outs.items():
+                    with self.subTest(K=K, dtype=dt, case=name):
+                        self.assertEqual(out.dtype, dt)
+                        out = np.array(out.astype(mx.float32))
+                        self.assertTrue(np.isfinite(out).all())
+                        err = np.linalg.norm(out - expected) / np.linalg.norm(expected)
+                        self.assertLess(err, 1e-2)
+
     def test_matmul_batched(self):
         np.random.seed(0)
         # Batched matmul
