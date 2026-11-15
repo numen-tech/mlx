@@ -749,15 +749,9 @@ class TestQuantized(mlx_tests.MLXTestCase):
 
     @unittest.skipIf(not mx.metal.is_available(), "requires Metal")
     def test_qmm_splitk_fallthrough(self):
-        # Split-K fall-through (numen-tech/gemma4-qat#1651): on a NAX GPU an
-        # FP16 split-K qmm of more than 16 rows with K % 64 == 0 goes to the
-        # NAX qmm; MLX_DISABLE_QMM_SPLITK_FALLTHROUGH=1 (read on every call)
-        # keeps the split-K kernel. Both must match the dequantized reference,
-        # with an explicit and an implied bias, from M 16 (split-K either way)
-        # to 128. At M 16 the switch changes no kernel, so the two runs must
-        # be bit-equal (on a GPU without NAX it changes none at any M).
-        # K > 4096 keeps every M at or above get_qmv_batch_limit on every GPU,
-        # and N = 512 keeps split-K up to M 128 when the fall-through is off.
+        # On a NAX GPU an FP16 split-K qmm of more than 16 rows goes to the NAX
+        # qmm. Both routes must match the reference; at M 16 they are equal.
+        # K > 4096 keeps every M at or above the qmv batch limit.
         if mx.default_device() == mx.cpu:
             self.skipTest("Covers GPU kernels only")
         K, N = 5120, 512

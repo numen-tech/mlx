@@ -138,10 +138,9 @@ constexpr int kApple6MaxRows = 8;
 // body of affine_qmm_t_splitk (`_nax_true`) on a GPU with NAX, at 2/4/8 bits
 // and group size 32/64/128, for FP16 input, or FP32 under MLX_ENABLE_TF32. The
 // body runs the threadgroups of at most 16 rows (32 for FP32); wider tiles of
-// the same kernel take the SIMD body (an FP16 qmm with such tiles falls
-// through to the NAX qmm instead, below). bf16 and the other widths keep the
-// SIMD kernel (`_nax_false`). MLX_DISABLE_QMM_SPLITK_NAX=1 turns it off, back
-// to the SIMD kernel everywhere; it is read on every call (no caching) so one
+// the same kernel take the SIMD body. bf16 and the other widths keep the SIMD
+// kernel (`_nax_false`). MLX_DISABLE_QMM_SPLITK_NAX=1 turns it off, back to
+// the SIMD kernel everywhere; it is read on every call (no caching) so one
 // process can A/B both routes. Version: kQmmSplitkNaxVersion (device.h).
 inline bool qmm_splitk_nax_disabled() {
   const char* v = std::getenv("MLX_DISABLE_QMM_SPLITK_NAX");
@@ -155,17 +154,8 @@ inline bool use_qmm_splitk_nax(int bits, int group_size, Dtype dtype) {
       metal::is_nax_available() && !qmm_splitk_nax_disabled();
 }
 
-// Split-K fall-through (numen-tech/gemma4-qat#1651): the `_nax_true` kernel
-// runs its tensor-unit body on FP16 tiles of at most 16 rows; a fuller FP16
-// tile takes the SIMD body, 2-3x slower than the NAX qmm on the same shape. So
-// an FP16 split-K qmm that the NAX route takes (use_qmm_splitk_nax) with more
-// than 16 rows and K % 64 == 0 (the NAX qmm's alignment) goes to qmm(), whose
-// NAX kernel (affine_qmm_t_nax) runs every row on the tensor units. 16 rows and
-// fewer keep the `_nax_true` split-K kernel; FP32 under TF32 keeps it too (its
-// tiles run all 32 rows on the body). MLX_DISABLE_QMM_SPLITK_FALLTHROUGH=1
-// turns the fall-through off, back to the split-K kernel bit for bit; it is
-// read on every call (no caching) so one process can A/B both routes.
-// Version: kQmmSplitkNaxVersion >= 2 (device.h).
+// An FP16 split-K qmm of more than 16 rows with K % 64 == 0 goes to the NAX
+// qmm. MLX_DISABLE_QMM_SPLITK_FALLTHROUGH=1 (read on every call) turns it off.
 inline bool qmm_splitk_fallthrough_disabled() {
   const char* v = std::getenv("MLX_DISABLE_QMM_SPLITK_FALLTHROUGH");
   return v != nullptr && std::string(v) == "1";
