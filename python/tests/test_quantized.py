@@ -769,6 +769,76 @@ class TestQuantized(mlx_tests.MLXTestCase):
                         )
 
     @unittest.skipIf(not mx.metal.is_available(), "requires Metal")
+    def test_qmm_tile64(self):
+        # 64 x 64 affine qmm tiles on a GPU without NAX (ml-explore/mlx#4826,
+        # numen-tech/gemma4-qat#1695), behind MLX_QMM_TILE64=1 (read on every
+        # call). Both routes must match the dequantized reference, and the
+        # implied bias must equal the materialized one bit for bit. The shapes
+        # cover a tile-aligned N, an N that is 32- but not 64-aligned (the
+        # aligned weight loader would read past N there), an odd N, partial
+        # M tiles, and M just below the 4-bit threshold (where the switch
+        # changes nothing, so the routes are bit-equal). On a NAX GPU the
+        # switch changes nothing either.
+        if mx.default_device() == mx.cpu:
+            self.skipTest("Covers GPU kernels only")
+        key = "MLX_QMM_TILE64"
+        saved = os.environ.get(key)
+
+        def run(x, wq, scales, biases, gs, bits, on):
+            if on:
+                os.environ[key] = "1"
+            else:
+                os.environ.pop(key, None)
+            try:
+                y = mx.quantized_matmul(
+                    x, wq, scales, biases, transpose=True, group_size=gs, bits=bits
+                )
+                mx.eval(y)
+                return y
+            finally:
+                if saved is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = saved
+
+        k1, k2 = mx.random.split(mx.random.key(7))
+        K = 256
+        shapes = [
+            (511, 1280, 4),
+            (512, 1280, 4),
+            (512, 1312, 4),
+            (639, 1281, 4),
+            (640, 1280, 4),
+            (2047, 1280, 8),
+            (2049, 1312, 8),
+        ]
+        for (M, N, bits), gs, dtype in product(
+            shapes, [32, 64, 128], [mx.float32, mx.float16, mx.bfloat16]
+        ):
+            x = (mx.random.normal((M, K), key=k1) / K**0.5).astype(dtype)
+            w = (mx.random.normal((N, K), key=k2) / K**0.5).astype(dtype)
+            wq, scales, biases = mx.quantize(w, group_size=gs, bits=bits)
+            w_hat = mx.dequantize(wq, scales, biases, group_size=gs, bits=bits)
+            y_ref = x.astype(mx.float32) @ w_hat.astype(mx.float32).T
+            implied = mx.array(-(2 ** (bits - 1)), dtype)
+            implied_full = scales * implied
+            tol = 1e-3 if dtype == mx.float32 else 1.5e-2
+            with self.subTest(M=M, N=N, bits=bits, gs=gs, dtype=dtype):
+                ys = {}
+                for on in [False, True]:
+                    y = run(x, wq, scales, biases, gs, bits, on)
+                    self.assertEqual(y.shape, (M, N))
+                    err = (y.astype(mx.float32) - y_ref).abs().max().item()
+                    self.assertLess(err, tol)
+                    self.assert_bitwise_equal(
+                        run(x, wq, scales, implied, gs, bits, on),
+                        run(x, wq, scales, implied_full, gs, bits, on),
+                    )
+                    ys[on] = y
+                if (bits == 4 and M < 512) or (bits == 8 and M < 2048):
+                    self.assert_bitwise_equal(ys[False], ys[True])
+
+    @unittest.skipIf(not mx.metal.is_available(), "requires Metal")
     def test_qmm_splitk_fallthrough(self):
         # On a NAX GPU an FP16 split-K qmm of more than 16 rows goes to the NAX
         # qmm. Both routes must match the reference; at M 16 they are equal.
