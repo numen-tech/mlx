@@ -398,6 +398,30 @@
   instantiate_quantized_ib_groups(4) \
   instantiate_quantized_ib_groups(8)
 
+// 64 x 64 tiles of the transposed, non-batched affine qmm, 4/8-bit, explicit
+// and implied bias (quantized.cpp use_qmm_tile64, numen-tech/gemma4-qat#1695).
+#define instantiate_quantized_qmm_t_64(type, group_size, bits, aligned)    \
+  instantiate_kernel(                                                        \
+      "affine_qmm_t_" #type "_gs_" #group_size "_b_" #bits "_alN_" #aligned "_batch_0_bm_64_bn_64", \
+      affine_qmm_t, type, group_size, bits, aligned, false, false, 64, 32, 64) \
+  instantiate_kernel(                                                        \
+      "affine_qmm_t_" #type "_gs_" #group_size "_b_" #bits "_alN_" #aligned "_batch_0_bm_64_bn_64_ib", \
+      affine_qmm_t, type, group_size, bits, aligned, false, false, 64, 32, 64, true)
+
+#define instantiate_quantized_qmm_t_64_bits(type, group_size)        \
+  instantiate_quantized_qmm_t_64(type, group_size, 4, true)          \
+  instantiate_quantized_qmm_t_64(type, group_size, 4, false)         \
+  instantiate_quantized_qmm_t_64(type, group_size, 8, true)          \
+  instantiate_quantized_qmm_t_64(type, group_size, 8, false)
+
+#define instantiate_quantized_qmm_t_64_groups(type)  \
+  instantiate_quantized_qmm_t_64_bits(type, 32)      \
+  instantiate_quantized_qmm_t_64_bits(type, 64)      \
+  instantiate_quantized_qmm_t_64_bits(type, 128)
+
 instantiate_quantized_all()
+instantiate_quantized_qmm_t_64_groups(float)
+instantiate_quantized_qmm_t_64_groups(float16_t)
+instantiate_quantized_qmm_t_64_groups(bfloat16_t)
 instantiate_quantized_splitk_qmm_nax(float)
 instantiate_quantized_splitk_qmm_nax(float16_t) // clang-format on

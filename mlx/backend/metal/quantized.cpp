@@ -167,6 +167,46 @@ use_qmm_splitk_fallthrough(bool use_nax, Dtype dtype, int M, int K) {
       !qmm_splitk_fallthrough_disabled();
 }
 
+// 64 x 64 tiles for large affine qmm on a GPU without NAX (the port of
+// ml-explore/mlx#4826, numen-tech/gemma4-qat#1695): a transposed, non-batched
+// 4-bit qmm of M >= 512 rows or 8-bit of M >= 2048 rows takes the BM 64 / BK 32
+// / BN 64 instantiation of affine_qmm_t (kernel names end `_bm_64_bn_64`)
+// where the grid has enough tiles to fill the GPU: at least 160 64 x 64 tiles
+// (1024 on an Ultra, architecture suffix 'd'), and either an even count of
+// 32-row tiles or more than 256 rows (2048 from generation 15 and on an Ultra)
+// so the padded rows stay few. That rule is upstream's tile choice for its fp4
+// route (ml-explore/mlx#4709). Only qmm() changes: a GPU with NAX returns into
+// qmm_nax first, Apple6 never reaches qmm(), and split-K, qmv and qmv_wide(_rr)
+// keep their widths (at 512 rows split-K hands N >= 1024 to qmm(), which is
+// where this acts). MLX_QMM_TILE64=1 turns it on (read on every call, so one
+// process can A/B both routes); anything else keeps the 32 x 32 tiles.
+inline bool qmm_tile64_enabled() {
+  const char* v = std::getenv("MLX_QMM_TILE64");
+  return v != nullptr && std::string(v) == "1";
+}
+
+inline bool use_qmm_tile64(
+    metal::Device& d,
+    const std::string& mode,
+    bool transpose,
+    bool has_global_scale,
+    int bits,
+    int B,
+    int M,
+    int N) {
+  if (!transpose || mode != "affine" || has_global_scale || B != 1 ||
+      !(bits == 4 || bits == 8) || M < (bits == 4 ? 512 : 2048) ||
+      metal::is_nax_available()) {
+    return false;
+  }
+  bool ultra = d.get_architecture().back() == 'd';
+  bool pad_free = (ceildiv(M, 32) % 2) == 0;
+  bool pad_ok = M > ((d.get_architecture_gen() < 15 && !ultra) ? 256 : 2048);
+  size_t tgs_64 = ceildiv(N, 64) * ceildiv(M, 64);
+  size_t min_tgs_64 = ultra ? 1024 : 160;
+  return (pad_free || pad_ok) && tgs_64 >= min_tgs_64 && qmm_tile64_enabled();
+}
+
 inline int get_qmv_batch_limit(int D, int O, metal::Device& d) {
   auto arch_size = d.get_architecture().back();
   auto arch_gen = d.get_architecture_gen();
@@ -1424,14 +1464,18 @@ void qmm(
 
   int wm = 2;
   int wn = 2;
-  int bm = 32;
-  int bn = 32;
+  // 32 x 32 output tiles, or 64 x 64 (use_qmm_tile64); BK stays 32.
+  const bool tile64 = use_qmm_tile64(
+      d, mode, transpose, global_scale.has_value(), bits, B, M, N);
+  int bm = tile64 ? 64 : 32;
+  int bn = tile64 ? 64 : 32;
   MTL::Size group_dims(32, wn, wm);
   MTL::Size grid_dims((N + bn - 1) / bn, (M + bm - 1) / bm, B);
 
   std::string kname;
   kname.reserve(64);
-  bool aligned = N % 32 == 0;
+  // aligned_N lets the weight loader skip its N bound, so it holds per tile.
+  bool aligned = N % bn == 0;
   bool batched = B > 1;
   std::string type_string = get_type_string(x.dtype());
   concatenate(
@@ -1445,12 +1489,13 @@ void qmm(
       transpose ? (aligned ? "_alN_true" : "_alN_false") : "",
       batched ? "_batch_1" : "_batch_0",
       global_scale ? "_hgs" : "",
+      tile64 ? "_bm_64_bn_64" : "",
       is_implied_bias(biases) ? "_ib" : "");
   std::string template_def;
   MTL::ComputePipelineState* kernel;
   const bool implied_bias = is_implied_bias(biases);
-  // Implied-bias variants spell out has_global_scale (false) and the default
-  // tiles (32), so the trailing `implied_bias` argument lands in its slot.
+  // Implied-bias and 64 x 64 variants spell out has_global_scale (false) and
+  // the tiles, so the trailing arguments land in their slots.
   if (transpose) {
     kernel = implied_bias ? get_quantized_kernel_wrapped(
                                 d,
@@ -1467,17 +1512,31 @@ void qmm(
                                 32,
                                 bn,
                                 true)
-                          : get_quantized_kernel_wrapped(
-                                d,
-                                kname,
-                                "qmm_t",
-                                mode,
-                                type_string,
-                                group_size,
-                                bits,
-                                aligned,
-                                batched,
-                                global_scale.has_value());
+        : tile64 ? get_quantized_kernel_wrapped(
+                       d,
+                       kname,
+                       "qmm_t",
+                       mode,
+                       type_string,
+                       group_size,
+                       bits,
+                       aligned,
+                       batched,
+                       /* has_global_scale = */ false,
+                       bm,
+                       32,
+                       bn)
+                 : get_quantized_kernel_wrapped(
+                       d,
+                       kname,
+                       "qmm_t",
+                       mode,
+                       type_string,
+                       group_size,
+                       bits,
+                       aligned,
+                       batched,
+                       global_scale.has_value());
   } else {
     kernel = implied_bias
         ? get_quantized_kernel_wrapped(
