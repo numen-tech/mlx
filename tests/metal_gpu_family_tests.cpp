@@ -198,7 +198,8 @@ TEST_CASE(
     "test MLX_QMM_TILE64 picks the 64 x 64 affine qmm on a GPU without NAX") {
   // numen-tech/gemma4-qat#1695: a 512-row 4-bit fp16 qmm over N 1280 takes the
   // `_bm_64_bn_64` kernel with the switch on, and the 32 x 32 one without it.
-  // A NAX GPU takes the NAX qmm either way.
+  // A NAX GPU takes the NAX qmm either way, and an Ultra part the 32 x 32 tiles
+  // at this size.
   using namespace mlx::core;
   auto dev = mlx::core::Device::gpu;
   auto w = astype(random::normal({1280, 256}), float16, dev);
@@ -226,8 +227,12 @@ TEST_CASE(
     }
     return false;
   };
+  // 20 x 8 = 160 threadgroups of 64 x 64: enough below an Ultra part, which
+  // needs 1,024 and keeps the 32 x 32 tiles here.
+  auto& d = metal::device(mlx::core::Device::gpu);
+  bool ultra = d.get_architecture().back() == 'd';
   CHECK_FALSE(has_tile64(names_with(false)));
-  CHECK(has_tile64(names_with(true)) == !is_nax_available());
+  CHECK(has_tile64(names_with(true)) == (!is_nax_available() && !ultra));
 }
 
 TEST_CASE("test is_nax_available is off under MLX_DISABLE_NAX") {

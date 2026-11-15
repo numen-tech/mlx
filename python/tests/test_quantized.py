@@ -84,6 +84,8 @@ class TestQuantized(mlx_tests.MLXTestCase):
         # [min, 0] instead of [min, max] (ml-explore/mlx#4775). Each group here sits in [-3, -2.9]: the
         # dequantized values must sit within half a step of the group's own range, and the GPU's
         # quantization must agree with the CPU's.
+        if not mx.metal.is_available():
+            self.skipTest("Compares the GPU's quantization with the CPU's")
         shape = (1, 2, 8, 256)
         k = mx.random.uniform(shape=shape, key=mx.random.key(4775)) * 0.1 - 3.0
         k = k.astype(mx.float16)
@@ -808,7 +810,10 @@ class TestQuantized(mlx_tests.MLXTestCase):
         # aligned weight loader would read past N there), an odd N, partial
         # M tiles, and M just below the 4-bit threshold (where the switch
         # changes nothing, so the routes are bit-equal). On a NAX GPU the
-        # switch changes nothing either.
+        # switch changes nothing either. Python has no kernel trace: which
+        # kernel ran is asserted by the trace test in
+        # tests/metal_gpu_family_tests.cpp. 2048 x 2048 reaches the 1,024
+        # threadgroups an Ultra part needs.
         if mx.default_device() == mx.cpu:
             self.skipTest("Covers GPU kernels only")
         key = "MLX_QMM_TILE64"
@@ -839,6 +844,7 @@ class TestQuantized(mlx_tests.MLXTestCase):
             (512, 1312, 4),
             (639, 1281, 4),
             (640, 1280, 4),
+            (2048, 2048, 4),
             (2047, 1280, 8),
             (2049, 1312, 8),
         ]
