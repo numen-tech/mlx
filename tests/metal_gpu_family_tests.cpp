@@ -1,5 +1,7 @@
 // Copyright © 2026 numen-tech
 
+#include <cstdlib>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -206,6 +208,25 @@ TEST_CASE(
   auto x = astype(random::normal({512, 256}), float16, dev);
   auto q = quantize(w, 64, 4, "affine", std::nullopt, dev);
   eval(x, q[0], q[1], q[2]);
+  // Restores the caller's MLX_QMM_TILE64 and stops the trace on every exit,
+  // an exception included.
+  const char* entry = std::getenv("MLX_QMM_TILE64");
+  std::optional<std::string> saved =
+      entry ? std::optional<std::string>(entry) : std::nullopt;
+  struct Restore {
+    std::optional<std::string>& saved;
+    bool tracing = false;
+    ~Restore() {
+      if (tracing) {
+        kernel_trace_stop();
+      }
+      if (saved) {
+        setenv("MLX_QMM_TILE64", saved->c_str(), 1);
+      } else {
+        unsetenv("MLX_QMM_TILE64");
+      }
+    }
+  } restore{saved};
   auto names_with = [&](bool on) {
     if (on) {
       setenv("MLX_QMM_TILE64", "1", 1);
@@ -213,11 +234,11 @@ TEST_CASE(
       unsetenv("MLX_QMM_TILE64");
     }
     kernel_trace_start();
+    restore.tracing = true;
     auto y = quantized_matmul(x, q[0], q[1], q[2], true, 64, 4, "affine", dev);
     eval(y);
-    auto names = kernel_trace_stop();
-    unsetenv("MLX_QMM_TILE64");
-    return names;
+    restore.tracing = false;
+    return kernel_trace_stop();
   };
   auto has_tile64 = [](const std::vector<std::string>& names) {
     for (auto& n : names) {
