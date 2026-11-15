@@ -78,6 +78,36 @@ class TestQuantized(mlx_tests.MLXTestCase):
                 # These integer grids have unit spacing in the quantized range.
                 self.assertLess(mx.max(mx.abs(w - restored)).item(), 1e-5)
 
+    def test_affine_quantize_all_negative_kv_group_8bit(self):
+        # numen-tech/gemma4-qat#1694: an 8-bit KV cache quantizes K and V in groups of 64 along the
+        # head dim, and a group that is all negative used to take 0 as its max, so its scale covered
+        # [min, 0] instead of [min, max] (ml-explore/mlx#4775). Each group here sits in [-3, -2.9]: the
+        # dequantized values must sit within half a step of the group's own range, and the GPU's
+        # quantization must agree with the CPU's.
+        shape = (1, 2, 8, 256)
+        k = mx.random.uniform(shape=shape, key=mx.random.key(4775)) * 0.1 - 3.0
+        k = k.astype(mx.float16)
+        groups = k.astype(mx.float32).reshape(-1, 64)
+        step = (groups.max(axis=-1) - groups.min(axis=-1)) / 255
+        for device in [mx.cpu, mx.gpu]:
+            with self.subTest(device=device):
+                wq, scales, biases = mx.quantize(
+                    k, group_size=64, bits=8, stream=device
+                )
+                restored = mx.dequantize(
+                    wq, scales, biases, group_size=64, bits=8, stream=device
+                )
+                error = mx.abs(restored.astype(mx.float32) - k.astype(mx.float32))
+                error = error.reshape(-1, 64).max(axis=-1)
+                # Half a step, plus the fp16 rounding of the output and the scale and bias. The
+                # [min, 0] scale gave steps 30 times too wide here: errors up to about 6e-3.
+                self.assertTrue(mx.all(error <= 0.5 * step + 3e-3).item())
+        wq_c, s_c, b_c = mx.quantize(k, group_size=64, bits=8, stream=mx.cpu)
+        wq_g, s_g, b_g = mx.quantize(k, group_size=64, bits=8, stream=mx.gpu)
+        dq_c = mx.dequantize(wq_c, s_c, b_c, group_size=64, bits=8, stream=mx.cpu)
+        dq_g = mx.dequantize(wq_g, s_g, b_g, group_size=64, bits=8, stream=mx.gpu)
+        self.assertLess(mx.abs(dq_c - dq_g).max().item(), 3e-3)
+
     def test_mxfp4_quantize_dequantize(self):
         lut = mx.array(
             [
