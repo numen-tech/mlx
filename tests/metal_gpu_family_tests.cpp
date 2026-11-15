@@ -162,8 +162,9 @@ TEST_CASE("test the switch version says MLX_METAL_NAX is there") {
 }
 
 TEST_CASE("test the split-K NAX route version") {
-  // Downstream packages assert the 2/4/8-bit split-K NAX route is there.
-  CHECK(kQmmSplitkNaxVersion >= 1);
+  // Downstream packages assert the 2/4/8-bit split-K NAX route is there, and
+  // from 2 the FP16 fall-through to the NAX qmm above 16 rows.
+  CHECK(kQmmSplitkNaxVersion >= 2);
 }
 
 TEST_CASE("test kernel trace records every lookup while on, and only then") {

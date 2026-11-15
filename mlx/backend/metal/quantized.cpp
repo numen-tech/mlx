@@ -154,6 +154,19 @@ inline bool use_qmm_splitk_nax(int bits, int group_size, Dtype dtype) {
       metal::is_nax_available() && !qmm_splitk_nax_disabled();
 }
 
+// An FP16 split-K qmm of more than 16 rows with K % 64 == 0 goes to the NAX
+// qmm. MLX_DISABLE_QMM_SPLITK_FALLTHROUGH=1 (read on every call) turns it off.
+inline bool qmm_splitk_fallthrough_disabled() {
+  const char* v = std::getenv("MLX_DISABLE_QMM_SPLITK_FALLTHROUGH");
+  return v != nullptr && std::string(v) == "1";
+}
+
+inline bool
+use_qmm_splitk_fallthrough(bool use_nax, Dtype dtype, int M, int K) {
+  return use_nax && dtype == float16 && M > 16 && K % 64 == 0 &&
+      !qmm_splitk_fallthrough_disabled();
+}
+
 inline int get_qmv_batch_limit(int D, int O, metal::Device& d) {
   auto arch_size = d.get_architecture().back();
   auto arch_gen = d.get_architecture_gen();
@@ -1523,6 +1536,26 @@ void qmm_splitk(
     const Stream& s,
     const std::string& mode) {
   d.require_mma("quantized_matmul (split-K qmm)");
+  bool affine = mode == "affine";
+  bool use_nax = affine && use_qmm_splitk_nax(bits, group_size, x.dtype());
+  if (use_qmm_splitk_fallthrough(use_nax, x.dtype(), M, K)) {
+    return qmm(
+        x,
+        w,
+        scales,
+        biases,
+        std::nullopt,
+        out,
+        true,
+        group_size,
+        bits,
+        M,
+        N,
+        K,
+        d,
+        s,
+        mode);
+  }
   // Choose split_k to target ~512 threadgroups
   int bm = 32, bn = 32;
   int n_tiles = (N + bn - 1) / bn;
@@ -1576,8 +1609,6 @@ void qmm_splitk(
   MTL::Size grid_dims(n_tiles, m_tiles, split_k);
 
   bool aligned = N % 32 == 0;
-  bool affine = mode == "affine";
-  bool use_nax = affine && use_qmm_splitk_nax(bits, group_size, x.dtype());
   std::string type_string = get_type_string(x.dtype());
   std::string kname;
   kname.reserve(64);

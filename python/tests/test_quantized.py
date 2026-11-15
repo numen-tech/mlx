@@ -747,6 +747,60 @@ class TestQuantized(mlx_tests.MLXTestCase):
                             run(x, wq, scales, implied_full, gs, bits, disabled),
                         )
 
+    @unittest.skipIf(not mx.metal.is_available(), "requires Metal")
+    def test_qmm_splitk_fallthrough(self):
+        # On a NAX GPU an FP16 split-K qmm of more than 16 rows goes to the NAX
+        # qmm. Both routes must match the reference; at M 16 they are equal.
+        # K > 4096 keeps every M at or above the qmv batch limit.
+        if mx.default_device() == mx.cpu:
+            self.skipTest("Covers GPU kernels only")
+        K, N = 5120, 512
+        k1, k2 = mx.random.split(mx.random.key(11))
+        w = (0.02 * mx.random.normal((N, K), key=k2)).astype(mx.float16)
+        x_all = mx.random.normal((128, K), key=k1).astype(mx.float16)
+        key = "MLX_DISABLE_QMM_SPLITK_FALLTHROUGH"
+        saved = os.environ.get(key)
+
+        def run(x, wq, scales, biases, gs, bits, disabled):
+            if disabled:
+                os.environ[key] = "1"
+            else:
+                os.environ.pop(key, None)
+            try:
+                y = mx.quantized_matmul(
+                    x, wq, scales, biases, transpose=True, group_size=gs, bits=bits
+                )
+                mx.eval(y)
+                return y
+            finally:
+                if saved is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = saved
+
+        for bits, gs in product([2, 4, 8], [32, 64, 128]):
+            wq, scales, biases = mx.quantize(w, group_size=gs, bits=bits)
+            w_hat = mx.dequantize(wq, scales, biases, group_size=gs, bits=bits)
+            implied = mx.array(-(2 ** (bits - 1)), mx.float16)
+            implied_full = scales * implied
+            for M in [16, 17, 24, 32, 33, 64, 128]:
+                x = x_all[:M]
+                y_ref = x.astype(mx.float32) @ w_hat.astype(mx.float32).T
+                scale = y_ref.abs().max().item()
+                with self.subTest(bits=bits, gs=gs, M=M):
+                    ys = {}
+                    for disabled in [False, True]:
+                        y = run(x, wq, scales, biases, gs, bits, disabled)
+                        err = (y.astype(mx.float32) - y_ref).abs().max().item()
+                        self.assertLess(err / scale, 2e-3)
+                        self.assert_bitwise_equal(
+                            run(x, wq, scales, implied, gs, bits, disabled),
+                            run(x, wq, scales, implied_full, gs, bits, disabled),
+                        )
+                        ys[disabled] = y
+                    if M <= 16:
+                        self.assert_bitwise_equal(ys[False], ys[True])
+
     def test_qmm_vjp(self):
         key = mx.random.key(0)
         k1, k2 = mx.random.split(key)

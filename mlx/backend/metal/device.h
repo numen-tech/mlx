@@ -298,7 +298,9 @@ constexpr int kNaxDisableEnvVersion = 2;
 //    32/64/128 takes the NAX body of affine_qmm_t_splitk for FP16 input (FP32
 //    under MLX_ENABLE_TF32), and MLX_DISABLE_QMM_SPLITK_NAX=1 turns it off
 //    (numen-tech/gemma4-qat#315). A GPU without NAX never compiles the body.
-constexpr int kQmmSplitkNaxVersion = 1;
+// 2: an FP16 split-K qmm of more than 16 rows falls through to the NAX qmm;
+//    MLX_DISABLE_QMM_SPLITK_FALLTHROUGH=1 turns it off.
+constexpr int kQmmSplitkNaxVersion = 2;
 
 // Bumped when nonresident_array (metal.h) changes. A binding reads it to tell
 // whether a core carries it.
