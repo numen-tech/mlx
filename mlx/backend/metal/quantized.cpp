@@ -765,6 +765,22 @@ inline bool use_qmv_wide_rr(
       !qmv_wide_rr_disabled();
 }
 
+// gemma4-qat#1701 measurement switches, both off by default and read on every
+// call so one process can A/B them: MLX_QMV_WIDE_TILE8=1 takes
+// ml-explore/mlx#4728's affine qmv_wide tiles of up to 8 vectors, and
+// MLX_QMV_MMA=1 takes ml-explore/mlx#4787's affine qmv_mma for 4-16 rows
+// (non-NAX GPUs only).
+inline bool env_flag_on(const char* name) {
+  const char* v = std::getenv(name);
+  return v != nullptr && std::string(v) == "1";
+}
+inline bool qmv_wide_tile8_enabled() {
+  return env_flag_on("MLX_QMV_WIDE_TILE8");
+}
+inline bool qmv_mma_enabled() {
+  return env_flag_on("MLX_QMV_MMA");
+}
+
 // Dispatches qmv_wide (fp modes -> fp_qmv_wide, affine -> affine_qmv_wide):
 // vecs_per_tg input vectors streamed and reused per weight group.
 void qmv_wide(
@@ -795,6 +811,12 @@ void qmv_wide(
   constexpr int max_affine_single_tile = 7;
   if (mode == "affine" && !rr && M <= max_affine_single_tile) {
     vecs_per_tg = M;
+  }
+  // Measurement switch (gemma4-qat#1701): ml-explore/mlx#4728's rule for the
+  // affine kernel, tiles of up to 8 vectors (fewest tiles of at most 8).
+  if (mode == "affine" && !rr && qmv_wide_tile8_enabled()) {
+    n_tiles = (M + 7) / 8;
+    vecs_per_tg = (M + n_tiles - 1) / n_tiles;
   }
 
   // k_lanes: lanes reducing K per output row (32/k_lanes rows per simdgroup).
@@ -2461,6 +2483,106 @@ void dispatch_qmv(
       mode);
 }
 
+// ml-explore/mlx#4787's affine qmv_mma, carried for measurement only
+// (gemma4-qat#1701): taken under MLX_QMV_MMA=1 on a non-NAX GPU, for 4-16 rows
+// (3-16 below gen 15) with upstream's non-NAX affine shape rule. Apple6 has no
+// simdgroup matrices, bias-free affine has no qmv_mma kernel, and qmv_nax
+// (the NAX half of ml-explore/mlx#4712) is not carried.
+inline bool use_qmv_mma(
+    const array& x,
+    const array& w,
+    const array& scales,
+    const std::optional<array>& biases,
+    const std::string& mode,
+    int bits,
+    int M,
+    int N,
+    int K,
+    metal::Device& d) {
+  if (!qmv_mma_enabled() || mode != "affine" || !biases ||
+      metal::is_nax_available() || d.is_apple6()) {
+    return false;
+  }
+  int min_rows = d.get_architecture_gen() >= 15 ? 4 : 3;
+  if (M < min_rows || M > 16 || K % 128 != 0) {
+    return false;
+  }
+  // Require aligned vector load.
+  if ((x.offset() % (8 * x.itemsize())) || (w.offset() % 16) ||
+      (scales.offset() % 2)) {
+    return false;
+  }
+  // Ultra keeps the vector kernels.
+  if (d.get_architecture().back() == 'd') {
+    return false;
+  }
+  return (bits == 4 || bits == 8) && (N >= 512) && (K >= 512) &&
+      (int64_t(N) * K >= (int64_t(1) << 21)) && (N % 16 == 0);
+}
+
+void qmv_mma(
+    const array& x,
+    const array& w,
+    const array& scales,
+    const std::optional<array>& biases,
+    array& out,
+    int group_size,
+    int bits,
+    int M,
+    int N,
+    int K,
+    metal::Device& d,
+    const Stream& s,
+    const std::string& mode) {
+  int wk = 4;
+  int bn = 16;
+  int tm = (M > 8) ? 2 : 1;
+  // Below gen 15, one row tile is faster at 32 columns (M2 Pro, upstream).
+  if ((d.get_architecture_gen() < 15) && (tm == 1) && (N % 32 == 0)) {
+    bn = 32;
+  }
+  const bool implied = is_implied_bias(biases);
+  std::string type_string = get_type_string(x.dtype());
+  std::string kname;
+  kname.reserve(64);
+  concatenate(
+      kname,
+      "affine_qmv_mma_",
+      type_string,
+      "_gs_",
+      group_size,
+      "_b_",
+      bits,
+      "_wk_",
+      wk,
+      "_bn_",
+      bn,
+      "_tm_",
+      tm,
+      implied ? "_ib" : "");
+  auto kernel = implied
+      ? get_quantized_kernel_wrapped(
+            d, kname, "qmv_mma", mode, type_string, group_size, bits, wk, bn,
+            tm, true)
+      : get_quantized_kernel_wrapped(
+            d, kname, "qmv_mma", mode, type_string, group_size, bits, wk, bn,
+            tm);
+
+  auto& compute_encoder = metal::get_command_encoder(s);
+  compute_encoder.set_compute_pipeline_state(kernel);
+  int c = 0;
+  compute_encoder.set_input_array(w, c++);
+  compute_encoder.set_input_array(scales, c++);
+  compute_encoder.set_input_array(*biases, c++);
+  compute_encoder.set_input_array(x, c++);
+  compute_encoder.set_output_array(out, c++);
+  compute_encoder.set_bytes(K, c++);
+  compute_encoder.set_bytes(N, c++);
+  compute_encoder.set_bytes(M, c++);
+  compute_encoder.dispatch_threadgroups(
+      MTL::Size(N / bn, 1, 1), MTL::Size(32, wk, 1));
+}
+
 void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   auto& s = stream();
   auto& d = metal::device(s.device);
@@ -2518,6 +2640,12 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
           std::to_string(kApple6MaxRows) + ")");
     }
     vector_limit = kApple6MaxRows + 1;
+  }
+  // Ahead of the qmv batch limit, as upstream routes it (gemma4-qat#1701).
+  if (transpose_ && non_batched &&
+      use_qmv_mma(x, w, scales, biases, mode, bits_, M, N, K, d)) {
+    qmv_mma(x, w, scales, biases, out, group_size_, bits_, M, N, K, d, s, mode);
+    return;
   }
   // It is a matrix matrix product.
   if (M >= vector_limit) {

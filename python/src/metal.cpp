@@ -13,6 +13,13 @@
 #include "mlx/memory.h"
 #include "python/src/small_vector.h"
 
+// Kernel lookup trace (mlx/backend/metal/device.h), declared here so the
+// bindings need no Metal headers. Measurement hook for gemma4-qat#1701.
+namespace mlx::core::metal {
+void kernel_trace_start();
+std::vector<std::string> kernel_trace_stop();
+} // namespace mlx::core::metal
+
 namespace mx = mlx::core;
 namespace nb = nanobind;
 using namespace nb::literals;
@@ -27,6 +34,14 @@ bool DEPRECATE(const char* old_fn, const char* new_fn) {
 
 void init_metal(nb::module_& m) {
   nb::module_ metal = m.def_submodule("metal", "mlx.metal");
+  metal.def(
+      "_kernel_trace_start",
+      &mx::metal::kernel_trace_start,
+      "Start recording the names of the Metal kernels looked up.");
+  metal.def(
+      "_kernel_trace_stop",
+      &mx::metal::kernel_trace_stop,
+      "Stop recording and return the kernel names looked up since the start.");
   metal.def(
       "is_available",
       &mx::metal::is_available,
