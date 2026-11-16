@@ -3,6 +3,7 @@
 import math
 import os
 import unittest
+from itertools import product
 
 import mlx.core as mx
 import mlx_tests
@@ -351,6 +352,8 @@ class TestConv(mlx_tests.MLXTestCase):
                 (1, 6, 1),
                 (1, 1, 6),
                 (4, 32, 64),
+                (1, 128, 48),
+                (1, 128, 96),
             ):
                 for idim, kdim, stride, padding in (
                     ((1, 1), (1, 1), (1, 1), (0, 0)),
@@ -358,6 +361,8 @@ class TestConv(mlx_tests.MLXTestCase):
                     ((31, 31), (5, 5), (5, 5), (2, 2)),
                 ):
                     run_conv2D(N, C, OC, idim, kdim, stride, padding, dtype=dtype)
+
+            run_conv2D(1, 128, 32, (1, 9601), (1, 7), (1, 1), (0, 3), dtype=dtype)
 
             # Groups tests
             N, C, OC = (4, 32, 64)
@@ -1617,7 +1622,7 @@ class TestConv(mlx_tests.MLXTestCase):
         mx.eval(wide_y)
         self.assertEqual(tuple(wide_y.shape), (1, 1, 500000, 2))
 
-    @unittest.skipIf(not mx.is_available(mx.gpu), "requires GPU")
+    @unittest.skipIf(not mx.metal.is_available(), "requires Metal")
     def test_grouped_depthwise_conv_padding_bounds(self):
         x = mx.random.normal((1, 16, 64))
         w = mx.random.normal((64, 3, 1))
@@ -1625,7 +1630,7 @@ class TestConv(mlx_tests.MLXTestCase):
         mx.eval(y)
         self.assertEqual(tuple(y.shape), (1, 16, 64))
 
-    @unittest.skipIf(not mx.is_available(mx.gpu), "requires GPU")
+    @unittest.skipIf(not mx.metal.is_available(), "requires Metal")
     def test_conv2d_large_output_channels(self):
         x = mx.random.normal((1, 33, 33, 5))
         w = mx.random.normal((32800, 1, 1, 5))
@@ -1633,6 +1638,41 @@ class TestConv(mlx_tests.MLXTestCase):
         yc = mx.conv2d(x, w, stride=(2, 2), stream=mx.cpu)
         mx.eval(yg, yc)
         self.assertTrue(mx.allclose(yg, yc, atol=1e-3))
+
+    @unittest.skipIf(not mx.metal.is_available(), "requires Metal")
+    def test_large_filter_input_grad_bounds(self):
+        length, channels = 65, 16
+        for dtype, batch, size in product(
+            (mx.float32, mx.float16, mx.bfloat16), (1, 2, 3), (16, 17, 32, 64)
+        ):
+            with self.subTest(dtype=dtype, batch=batch, size=size):
+                padding = size // 2
+                out_length = length + 2 * padding - size + 1
+                x = mx.ones((batch, length, channels), dtype=dtype)
+                w = mx.ones((channels, size, channels), dtype=dtype)
+                count = batch * out_length * channels
+                storage = mx.concatenate(
+                    [
+                        mx.ones(count, dtype=dtype),
+                        mx.full((size * channels * 2,), float("nan"), dtype),
+                    ]
+                )
+                mx.eval(storage)
+                cotangent = storage[:count].reshape(batch, out_length, channels)
+                _, (dx,) = mx.vjp(
+                    lambda a: mx.conv1d(a, w, padding=padding),
+                    (x,),
+                    (cotangent,),
+                )
+                counts = [
+                    min(out_length - 1, i + padding)
+                    - max(0, i + padding - size + 1)
+                    + 1
+                    for i in range(length)
+                ]
+                expected = mx.array(counts, dtype=dtype)[None, :, None]
+                expected = mx.broadcast_to(expected * channels, x.shape)
+                self.assertEqualArray(dx, expected, atol=0, rtol=0)
 
 
 if __name__ == "__main__":

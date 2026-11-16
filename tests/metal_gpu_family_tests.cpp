@@ -1,5 +1,7 @@
 // Copyright © 2026 numen-tech
 
+#include <cstdlib>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -23,6 +25,7 @@ TEST_CASE("test apple6 MMA kernel names are denied") {
   const std::vector<std::string> mma = {
       "affine_qmm_t_float16_t_gs_128_b_2_alN_true_batch_0",
       "affine_qmm_t_float16_t_gs_128_b_2_alN_true_batch_0_ib",
+      "affine_qmm_t_float16_t_gs_64_b_4_alN_true_batch_0_bm_64_bn_64_ib",
       "affine_qmm_n_float16_t_gs_128_b_2_batch_0",
       "affine_qmm_t_splitk_float16_t_gs_128_b_2_alN_true",
       "affine_gather_qmm_t_float16_t_gs_128_b_4_alN_true",
@@ -150,7 +153,8 @@ TEST_CASE("test MLX_METAL_NAX reads the whole string") {
   CHECK(mlx::core::env::parse_metal_nax("1") == 1);
   CHECK(mlx::core::env::parse_metal_nax("0") == 0);
   CHECK(mlx::core::env::parse_metal_nax(nullptr) == -1);
-  for (auto value : {"", "1garbage", "garbage", "2", "-1", "00", "01", "true"}) {
+  for (auto value :
+       {"", "1garbage", "garbage", "2", "-1", "00", "01", "true"}) {
     CAPTURE(value);
     CHECK(mlx::core::env::parse_metal_nax(value) == -1);
   }
@@ -190,6 +194,62 @@ TEST_CASE("test kernel trace records every lookup while on, and only then") {
   kernel_trace_start();
   auto names = kernel_trace_stop();
   CHECK(names.empty());
+}
+
+TEST_CASE(
+    "test MLX_QMM_TILE64 picks the 64 x 64 affine qmm on a GPU without NAX") {
+  using namespace mlx::core;
+  auto dev = mlx::core::Device::gpu;
+  auto w = astype(random::normal({1280, 256}), float16, dev);
+  auto x = astype(random::normal({512, 256}), float16, dev);
+  auto q = quantize(w, 64, 4, "affine", std::nullopt, dev);
+  eval(x, q[0], q[1], q[2]);
+  // Restores the env and stops the trace on any exit.
+  const char* entry = std::getenv("MLX_QMM_TILE64");
+  std::optional<std::string> saved =
+      entry ? std::optional<std::string>(entry) : std::nullopt;
+  struct Restore {
+    std::optional<std::string>& saved;
+    bool tracing = false;
+    ~Restore() {
+      if (tracing) {
+        kernel_trace_stop();
+      }
+      if (saved) {
+        setenv("MLX_QMM_TILE64", saved->c_str(), 1);
+      } else {
+        unsetenv("MLX_QMM_TILE64");
+      }
+    }
+  } restore{saved};
+  auto names_with = [&](bool on) {
+    if (on) {
+      setenv("MLX_QMM_TILE64", "1", 1);
+    } else {
+      unsetenv("MLX_QMM_TILE64");
+    }
+    kernel_trace_start();
+    restore.tracing = true;
+    auto y = quantized_matmul(x, q[0], q[1], q[2], true, 64, 4, "affine", dev);
+    eval(y);
+    restore.tracing = false;
+    return kernel_trace_stop();
+  };
+  auto has_tile64 = [](const std::vector<std::string>& names) {
+    for (auto& n : names) {
+      if (n.find("_bm_64_bn_64") != std::string::npos) {
+        return true;
+      }
+    }
+    return false;
+  };
+  // 20 x 8 = 160 tiles: under an Ultra part's 1,024.
+  auto& d = metal::device(mlx::core::Device::gpu);
+  bool ultra = d.get_architecture().back() == 'd';
+  CHECK_FALSE(has_tile64(names_with(false)));
+  CHECK(
+      has_tile64(names_with(true)) ==
+      (!is_nax_available() && !d.is_apple6() && !ultra));
 }
 
 TEST_CASE("test is_nax_available is off under MLX_DISABLE_NAX") {

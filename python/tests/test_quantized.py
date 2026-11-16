@@ -57,6 +57,54 @@ class TestQuantized(mlx_tests.MLXTestCase):
             dq_gpu = mx.dequantize(wq_s, scales_s, biases_s, **quant, stream=mx.gpu)
             self.assertTrue(mx.abs(dq_cpu - dq_gpu).max().item() < 1e-6)
 
+    def test_affine_quantize_signed_groups(self):
+        for gs, bits in product([32, 64, 128], [1, 2, 3, 4, 5, 6, 8]):
+            if bits == 1 and mx.default_device() == mx.gpu and mx.cuda.is_available():
+                continue
+            n_bins = (1 << bits) - 1
+            grid = [i % (n_bins + 1) for i in range(gs)]
+            grid[-1] = n_bins
+            groups = [
+                [v - 2 * n_bins for v in grid],
+                [2 * n_bins - v for v in grid],
+                [v - (1 << (bits - 1)) for v in grid],
+                [-2] * gs,
+                [0] * gs,
+            ]
+            with self.subTest(gs=gs, bits=bits):
+                w = mx.array(groups, dtype=mx.float32)
+                wq, scales, biases = mx.quantize(w, group_size=gs, bits=bits)
+                restored = mx.dequantize(wq, scales, biases, gs, bits)
+                # These integer grids have unit spacing in the quantized range.
+                self.assertLess(mx.max(mx.abs(w - restored)).item(), 1e-5)
+
+    def test_affine_quantize_all_negative_kv_group_8bit(self):
+        # ml-explore/mlx#4775: an all-negative group used to scale over [min, 0].
+        if not mx.metal.is_available():
+            self.skipTest("Compares the GPU's quantization with the CPU's")
+        shape = (1, 2, 8, 256)
+        k = mx.random.uniform(shape=shape, key=mx.random.key(4775)) * 0.1 - 3.0
+        k = k.astype(mx.float16)
+        groups = k.astype(mx.float32).reshape(-1, 64)
+        step = (groups.max(axis=-1) - groups.min(axis=-1)) / 255
+        for device in [mx.cpu, mx.gpu]:
+            with self.subTest(device=device):
+                wq, scales, biases = mx.quantize(
+                    k, group_size=64, bits=8, stream=device
+                )
+                restored = mx.dequantize(
+                    wq, scales, biases, group_size=64, bits=8, stream=device
+                )
+                error = mx.abs(restored.astype(mx.float32) - k.astype(mx.float32))
+                error = error.reshape(-1, 64).max(axis=-1)
+                # Half a step plus fp16 rounding; the old scale erred by up to 6e-3.
+                self.assertTrue(mx.all(error <= 0.5 * step + 3e-3).item())
+        wq_c, s_c, b_c = mx.quantize(k, group_size=64, bits=8, stream=mx.cpu)
+        wq_g, s_g, b_g = mx.quantize(k, group_size=64, bits=8, stream=mx.gpu)
+        dq_c = mx.dequantize(wq_c, s_c, b_c, group_size=64, bits=8, stream=mx.cpu)
+        dq_g = mx.dequantize(wq_g, s_g, b_g, group_size=64, bits=8, stream=mx.gpu)
+        self.assertLess(mx.abs(dq_c - dq_g).max().item(), 3e-3)
+
     def test_mxfp4_quantize_dequantize(self):
         lut = mx.array(
             [
@@ -748,6 +796,70 @@ class TestQuantized(mlx_tests.MLXTestCase):
                         )
 
     @unittest.skipIf(not mx.metal.is_available(), "requires Metal")
+    def test_qmm_tile64(self):
+        # N 1312 is 32- but not 64-aligned, so the aligned weight loader
+        # must not be chosen for the 64-wide tile.
+        if mx.default_device() == mx.cpu:
+            self.skipTest("Covers GPU kernels only")
+        key = "MLX_QMM_TILE64"
+        saved = os.environ.get(key)
+
+        def run(x, wq, scales, biases, gs, bits, on):
+            if on:
+                os.environ[key] = "1"
+            else:
+                os.environ.pop(key, None)
+            try:
+                y = mx.quantized_matmul(
+                    x, wq, scales, biases, transpose=True, group_size=gs, bits=bits
+                )
+                mx.eval(y)
+                return y
+            finally:
+                if saved is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = saved
+
+        k1, k2 = mx.random.split(mx.random.key(7))
+        K = 256
+        shapes = [
+            (511, 1280, 4),
+            (512, 1280, 4),
+            (512, 1312, 4),
+            (639, 1281, 4),
+            (640, 1280, 4),
+            (2048, 2048, 4),
+            (2047, 1280, 8),
+            (2049, 1312, 8),
+        ]
+        for (M, N, bits), gs, dtype in product(
+            shapes, [32, 64, 128], [mx.float32, mx.float16, mx.bfloat16]
+        ):
+            x = (mx.random.normal((M, K), key=k1) / K**0.5).astype(dtype)
+            w = (mx.random.normal((N, K), key=k2) / K**0.5).astype(dtype)
+            wq, scales, biases = mx.quantize(w, group_size=gs, bits=bits)
+            w_hat = mx.dequantize(wq, scales, biases, group_size=gs, bits=bits)
+            y_ref = x.astype(mx.float32) @ w_hat.astype(mx.float32).T
+            implied = mx.array(-(2 ** (bits - 1)), dtype)
+            implied_full = scales * implied
+            tol = 1e-3 if dtype == mx.float32 else 1.5e-2
+            with self.subTest(M=M, N=N, bits=bits, gs=gs, dtype=dtype):
+                ys = {}
+                for on in [False, True]:
+                    y = run(x, wq, scales, biases, gs, bits, on)
+                    self.assertEqual(y.shape, (M, N))
+                    err = (y.astype(mx.float32) - y_ref).abs().max().item()
+                    self.assertLess(err, tol)
+                    self.assert_bitwise_equal(
+                        run(x, wq, scales, implied, gs, bits, on),
+                        run(x, wq, scales, implied_full, gs, bits, on),
+                    )
+                    ys[on] = y
+                if (bits == 4 and M < 512) or (bits == 8 and M < 2048):
+                    self.assert_bitwise_equal(ys[False], ys[True])
+
+    @unittest.skipIf(not mx.metal.is_available(), "requires Metal")
     def test_qmm_splitk_fallthrough(self):
         # On a NAX GPU an FP16 split-K qmm of more than 16 rows goes to the NAX
         # qmm. Both routes must match the reference; at M 16 they are equal.
@@ -943,6 +1055,40 @@ class TestQuantized(mlx_tests.MLXTestCase):
                 y = mx.quantized_matmul(x, q, scales, biases, group_size=gs, bits=bits)
                 expected = mx.full((1, n), sign * k / (4 * denom), dtype)
                 self.assertTrue(mx.array_equal(y, expected).item())
+
+    def test_qmm_accumulation_precision(self):
+        # x repeats [1, eps, -1, 0] and each block of four weights along K is
+        # equal, so each block adds eps * w. A sum in the input type loses
+        # eps * w next to w. In float32 every partial sum is exact.
+        N, K = 128, 256
+        for dtype, transpose, gs, bits in product(
+            [mx.bfloat16, mx.float16],
+            [True, False],
+            [32, 64, 128],
+            [2, 4, 8],
+        ):
+            with self.subTest(dtype=dtype, transpose=transpose, gs=gs, bits=bits):
+                eps = 1 / 256 if dtype == mx.bfloat16 else 1 / 2048
+                x = mx.tile(mx.array([1, eps, -1, 0], dtype), K // 4)
+                x = mx.stack([x, -x])
+                # All bits set give the code 2**bits - 1, and the bias moves w to v.
+                if transpose:
+                    rows, cols = N, K
+                    v = mx.arange(rows)[:, None] + 3 * mx.arange(cols // gs)
+                else:
+                    rows, cols = K, N
+                    v = mx.arange(rows)[:, None] // 4 + 3 * mx.arange(cols // gs)
+                v = v % 8 + 1
+                q = mx.full((rows, cols * bits // 32), 0xFFFFFFFF, mx.uint32)
+                scales = mx.ones(v.shape, dtype)
+                biases = (v - (2**bits - 1)).astype(dtype)
+                w = mx.dequantize(q, scales, biases, group_size=gs, bits=bits)
+                w = w.astype(mx.float32)
+                y_ref = x.astype(mx.float32) @ (w.T if transpose else w)
+                y = mx.quantized_matmul(
+                    x, q, scales, biases, transpose=transpose, group_size=gs, bits=bits
+                )
+                self.assertTrue(mx.array_equal(y, y_ref.astype(dtype)).item())
 
     @unittest.skipIf(not mx.metal.is_available(), "requires Metal")
     def test_qmv_fast_unaligned_n(self):
