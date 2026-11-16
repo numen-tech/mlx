@@ -249,11 +249,13 @@ TEST_CASE(
     return false;
   };
   // 20 x 8 = 160 threadgroups of 64 x 64: enough below an Ultra part, which
-  // needs 1,024 and keeps the 32 x 32 tiles here.
+  // needs 1,024 and keeps the 32 x 32 tiles here. Apple6 takes qgemm_simt.
   auto& d = metal::device(mlx::core::Device::gpu);
   bool ultra = d.get_architecture().back() == 'd';
   CHECK_FALSE(has_tile64(names_with(false)));
-  CHECK(has_tile64(names_with(true)) == (!is_nax_available() && !ultra));
+  CHECK(
+      has_tile64(names_with(true)) ==
+      (!is_nax_available() && !d.is_apple6() && !ultra));
 }
 
 TEST_CASE("test is_nax_available is off under MLX_DISABLE_NAX") {

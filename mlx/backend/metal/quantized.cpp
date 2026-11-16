@@ -167,19 +167,9 @@ use_qmm_splitk_fallthrough(bool use_nax, Dtype dtype, int M, int K) {
       !qmm_splitk_fallthrough_disabled();
 }
 
-// 64 x 64 tiles for large affine qmm on a GPU without NAX (the port of
-// ml-explore/mlx#4826, numen-tech/gemma4-qat#1695): a transposed, non-batched
-// 4-bit qmm of M >= 512 rows or 8-bit of M >= 2048 rows takes the BM 64 / BK 32
-// / BN 64 instantiation of affine_qmm_t (kernel names end `_bm_64_bn_64`)
-// where the grid has enough tiles to fill the GPU: at least 160 64 x 64 tiles
-// (1024 on an Ultra, architecture suffix 'd'), and either an even count of
-// 32-row tiles or more than 256 rows (2048 from generation 15 and on an Ultra)
-// so the padded rows stay few. That rule is upstream's tile choice for its fp4
-// route (ml-explore/mlx#4709). Only qmm() changes: a GPU with NAX returns into
-// qmm_nax first, Apple6 never reaches qmm(), and split-K, qmv and qmv_wide(_rr)
-// keep their widths (at 512 rows split-K hands N >= 1024 to qmm(), which is
-// where this acts). MLX_QMM_TILE64=1 turns it on (read on every call, so one
-// process can A/B both routes); anything else keeps the 32 x 32 tiles.
+// 64 x 64 affine qmm tiles on a GPU without NAX (ml-explore/mlx#4826), on
+// only under MLX_QMM_TILE64=1 (read on every call). The occupancy rule is
+// upstream's fp4 tile choice (ml-explore/mlx#4709).
 inline bool qmm_tile64_enabled() {
   const char* v = std::getenv("MLX_QMM_TILE64");
   return v != nullptr && std::string(v) == "1";
