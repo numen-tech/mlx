@@ -79,11 +79,7 @@ class TestQuantized(mlx_tests.MLXTestCase):
                 self.assertLess(mx.max(mx.abs(w - restored)).item(), 1e-5)
 
     def test_affine_quantize_all_negative_kv_group_8bit(self):
-        # numen-tech/gemma4-qat#1694: an 8-bit KV cache quantizes K and V in groups of 64 along the
-        # head dim, and a group that is all negative used to take 0 as its max, so its scale covered
-        # [min, 0] instead of [min, max] (ml-explore/mlx#4775). Each group here sits in [-3, -2.9]: the
-        # dequantized values must sit within half a step of the group's own range, and the GPU's
-        # quantization must agree with the CPU's.
+        # ml-explore/mlx#4775: an all-negative group used to scale over [min, 0].
         if not mx.metal.is_available():
             self.skipTest("Compares the GPU's quantization with the CPU's")
         shape = (1, 2, 8, 256)
@@ -101,8 +97,7 @@ class TestQuantized(mlx_tests.MLXTestCase):
                 )
                 error = mx.abs(restored.astype(mx.float32) - k.astype(mx.float32))
                 error = error.reshape(-1, 64).max(axis=-1)
-                # Half a step, plus the fp16 rounding of the output and the scale and bias. The
-                # [min, 0] scale gave steps 30 times too wide here: errors up to about 6e-3.
+                # Half a step plus fp16 rounding; the old scale erred by up to 6e-3.
                 self.assertTrue(mx.all(error <= 0.5 * step + 3e-3).item())
         wq_c, s_c, b_c = mx.quantize(k, group_size=64, bits=8, stream=mx.cpu)
         wq_g, s_g, b_g = mx.quantize(k, group_size=64, bits=8, stream=mx.gpu)
@@ -802,18 +797,8 @@ class TestQuantized(mlx_tests.MLXTestCase):
 
     @unittest.skipIf(not mx.metal.is_available(), "requires Metal")
     def test_qmm_tile64(self):
-        # 64 x 64 affine qmm tiles on a GPU without NAX (ml-explore/mlx#4826,
-        # numen-tech/gemma4-qat#1695), behind MLX_QMM_TILE64=1 (read on every
-        # call). Both routes must match the dequantized reference, and the
-        # implied bias must equal the materialized one bit for bit. The shapes
-        # cover a tile-aligned N, an N that is 32- but not 64-aligned (the
-        # aligned weight loader would read past N there), an odd N, partial
-        # M tiles, and M just below the 4-bit threshold (where the switch
-        # changes nothing, so the routes are bit-equal). On a NAX GPU the
-        # switch changes nothing either. Python has no kernel trace: which
-        # kernel ran is asserted by the trace test in
-        # tests/metal_gpu_family_tests.cpp. 2048 x 2048 reaches the 1,024
-        # threadgroups an Ultra part needs.
+        # N 1312 is 32- but not 64-aligned, so the aligned weight loader
+        # must not be chosen for the 64-wide tile.
         if mx.default_device() == mx.cpu:
             self.skipTest("Covers GPU kernels only")
         key = "MLX_QMM_TILE64"

@@ -1484,8 +1484,7 @@ void qmm(
   std::string template_def;
   MTL::ComputePipelineState* kernel;
   const bool implied_bias = is_implied_bias(biases);
-  // Implied-bias and 64 x 64 variants spell out has_global_scale (false) and
-  // the tiles, so the trailing arguments land in their slots.
+  // Spelled out so the trailing template arguments land in their slots.
   if (transpose) {
     kernel = implied_bias ? get_quantized_kernel_wrapped(
                                 d,
