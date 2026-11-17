@@ -1,5 +1,7 @@
 // Copyright © 2023-2026 Apple Inc.
 
+#include <cstring>
+
 #include "mlx/backend/common/quantized.h"
 #include "mlx/backend/common/broadcasting.h"
 #include "mlx/backend/common/compiled.h"
@@ -766,12 +768,13 @@ inline bool use_qmv_wide_rr(
 }
 
 // MLX_QMV_MMA=1 takes ml-explore/mlx#4787's affine qmv_mma for 4-16 rows on a
-// GPU without NAX (use_qmv_mma below). Off by default; read on every call so one
-// process can A/B it (numen-tech/gemma4-qat#1701). Version: kQmvMmaVersion
-// (device.h).
+// GPU without NAX (use_qmv_mma below). Off by default. Not cached: a process sets
+// and clears it per load (numen-tech/gemma4-qat#1701), so use_qmv_mma reads it
+// only for a call that passes every shape test, never at decode's one row.
+// Version: kQmvMmaVersion (device.h).
 inline bool qmv_mma_enabled() {
   const char* v = std::getenv("MLX_QMV_MMA");
-  return v != nullptr && std::string(v) == "1";
+  return v != nullptr && std::strcmp(v, "1") == 0;
 }
 
 // Dispatches qmv_wide (fp modes -> fp_qmv_wide, affine -> affine_qmv_wide):
@@ -2486,12 +2489,9 @@ inline bool use_qmv_mma(
     int N,
     int K,
     metal::Device& d) {
-  if (!qmv_mma_enabled() || mode != "affine" || !biases ||
-      metal::is_nax_available() || d.is_apple6()) {
-    return false;
-  }
   int min_rows = d.get_architecture_gen() >= 15 ? 4 : 3;
-  if (M < min_rows || M > 16 || K % 128 != 0) {
+  if (M < min_rows || M > 16 || K % 128 != 0 || mode != "affine" || !biases ||
+      d.is_apple6()) {
     return false;
   }
   // Require aligned vector load.
@@ -2503,8 +2503,13 @@ inline bool use_qmv_mma(
   if (d.get_architecture().back() == 'd') {
     return false;
   }
-  return (bits == 4 || bits == 8) && (N >= 512) && (K >= 512) &&
-      (int64_t(N) * K >= (int64_t(1) << 21)) && (N % 16 == 0);
+  if (!((bits == 4 || bits == 8) && (N >= 512) && (K >= 512) &&
+        (int64_t(N) * K >= (int64_t(1) << 21)) && (N % 16 == 0))) {
+    return false;
+  }
+  // Last: the process-wide checks, the environment read only for a call R1
+  // would otherwise take.
+  return !metal::is_nax_available() && qmv_mma_enabled();
 }
 
 void qmv_mma(
