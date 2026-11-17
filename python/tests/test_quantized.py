@@ -860,6 +860,79 @@ class TestQuantized(mlx_tests.MLXTestCase):
                     self.assert_bitwise_equal(ys[False], ys[True])
 
     @unittest.skipIf(not mx.metal.is_available(), "requires Metal")
+    def test_qmv_mma_and_wide_tile8_switches(self):
+        # gemma4-qat#1701 measurement switches. MLX_QMV_MMA=1 routes 4/8-bit
+        # affine products of 4-16 rows (3-16 below gen 15) to qmv_mma on a
+        # non-NAX GPU; MLX_QMV_WIDE_TILE8=1 widens the affine qmv_wide tile to
+        # 8 vectors, which must not change a single bit.
+        if mx.default_device() == mx.cpu:
+            self.skipTest("Covers GPU kernels only")
+        keys = ("MLX_QMV_MMA", "MLX_QMV_WIDE_TILE8")
+        saved = {k: os.environ.get(k) for k in keys}
+
+        def run(x, wq, scales, biases, gs, bits, env):
+            for k in keys:
+                if k == env:
+                    os.environ[k] = "1"
+                else:
+                    os.environ.pop(k, None)
+            try:
+                mx.metal._kernel_trace_start()
+                y = mx.quantized_matmul(
+                    x, wq, scales, biases, transpose=True, group_size=gs, bits=bits
+                )
+                mx.eval(y)
+                return y, mx.metal._kernel_trace_stop()
+            finally:
+                for k, v in saved.items():
+                    if v is None:
+                        os.environ.pop(k, None)
+                    else:
+                        os.environ[k] = v
+
+        nax = mx.metal.is_nax_available() if hasattr(mx.metal, "is_nax_available") else False
+        K, N = 1024, 2048
+        k1, k2 = mx.random.split(mx.random.key(17))
+        w = (0.02 * mx.random.normal((N, K), key=k2)).astype(mx.float16)
+        x_all = mx.random.normal((16, K), key=k1).astype(mx.float16)
+        for bits, gs in product([2, 4, 8], [32, 64, 128]):
+            wq, scales, biases = mx.quantize(w, group_size=gs, bits=bits)
+            w_hat = mx.dequantize(wq, scales, biases, group_size=gs, bits=bits)
+            implied = mx.array(-(2 ** (bits - 1)), mx.float16)
+            implied_full = scales * implied
+            w_hat_ib = mx.dequantize(
+                wq, scales, implied_full, group_size=gs, bits=bits
+            )
+            for M in range(1, 17):
+                x = x_all[:M]
+                with self.subTest(bits=bits, gs=gs, M=M):
+                    for b, wh in ((biases, w_hat), (implied, w_hat_ib)):
+                        y_ref = x.astype(mx.float32) @ wh.astype(mx.float32).T
+                        scale = y_ref.abs().max().item()
+                        y0, _ = run(x, wq, scales, b, gs, bits, None)
+                        y1, t1 = run(x, wq, scales, b, gs, bits, "MLX_QMV_MMA")
+                        y2, _ = run(x, wq, scales, b, gs, bits, "MLX_QMV_WIDE_TILE8")
+                        self.assert_bitwise_equal(y0, y2)
+                        err = (y1.astype(mx.float32) - y_ref).abs().max().item()
+                        self.assertLess(err / scale, 2e-3)
+                        took = any("qmv_mma" in n for n in t1)
+                        if bits == 2 or M < 3 or nax:
+                            self.assertFalse(took, t1)
+                    # On the qmv_mma route the implied factor and the
+                    # materialized bias agree bit for bit.
+                    y_ib, t_ib = run(x, wq, scales, implied, gs, bits, "MLX_QMV_MMA")
+                    y_full, t_full = run(
+                        x, wq, scales, implied_full, gs, bits, "MLX_QMV_MMA"
+                    )
+                    if any("qmv_mma" in n for n in t_ib) and any(
+                        "qmv_mma" in n for n in t_full
+                    ):
+                        self.assert_bitwise_equal(y_ib, y_full)
+            if not nax and bits in (4, 8):
+                _, t = run(x_all[:4], wq, scales, biases, gs, bits, "MLX_QMV_MMA")
+                self.assertTrue(any("qmv_mma" in n for n in t), t)
+
+    @unittest.skipIf(not mx.metal.is_available(), "requires Metal")
     def test_qmm_splitk_fallthrough(self):
         # On a NAX GPU an FP16 split-K qmm of more than 16 rows goes to the NAX
         # qmm. Both routes must match the reference; at M 16 they are equal.
