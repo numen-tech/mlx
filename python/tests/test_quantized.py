@@ -2514,6 +2514,37 @@ class TestQuantized(mlx_tests.MLXTestCase):
                             route,
                         )
 
+        # A factor that is no power of two: T(f) and the product both round,
+        # so a kernel that ignored the factor it was given, or formed the
+        # product in another type, would not reproduce `scales * T(f)`.
+        for dtype, factor in product(self.IMPLIED_BIAS_DTYPES, [-5.3, 0.7]):
+            for K, N, qmv in [(2816, 72, "gather_qmv_fast"), (704, 72, "gather_qmv_")]:
+                E, top_k = 4, 2
+                w, scales, full, f = self.gather_implied_weights(
+                    rng, dtype, 4, 32, factor, E, N, K
+                )
+                self.assertFalse(
+                    mx.array_equal(full, self.reference_bias(scales, -8.0)).item()
+                )
+                for L, sort, route in [
+                    (3, False, qmv),
+                    (8, True, "gather_qmm_rhs"),
+                    (37, True, "gather_qmm_rhs"),
+                ]:
+                    with self.subTest(dtype=dtype, factor=factor, K=K, L=L):
+                        check(
+                            tokens(L, K, dtype),
+                            experts(L, top_k, E),
+                            w,
+                            scales,
+                            full,
+                            f,
+                            32,
+                            4,
+                            sort,
+                            route,
+                        )
+
         # Subnormal fp16 scales: the product must round through fp16.
         w, scales, full, f = self.gather_implied_weights(
             rng, mx.float16, 2, 64, -1.0, 4, 72, 512
@@ -2720,6 +2751,73 @@ class TestQuantized(mlx_tests.MLXTestCase):
                     self.assert_bitwise_equal(ds_ib, ds_full)
                     _, (df,) = mx.vjp(lambda f: run(x, scales, f), [f], [cotan])
                     self.assert_bitwise_equal(df, mx.zeros_like(f))
+                    # The factor is a constant for forward mode too, and for
+                    # whatever produced it: sqrt'(0) must not be reached.
+                    (out,), (tf,) = mx.jvp(
+                        lambda f: run(x, scales, f), [f], [mx.array(1.0, dtype)]
+                    )
+                    self.assert_bitwise_equal(tf, mx.zeros_like(out))
+                    g = mx.grad(
+                        lambda t: (
+                            run(x, scales, mx.sqrt(t).astype(dtype))
+                            .astype(mx.float32)
+                            .sum()
+                        )
+                    )(mx.array(0.0))
+                    self.assertEqual(g.item(), 0.0)
+
+    @unittest.skipIf(not mx.metal.is_available(), "requires Metal")
+    def test_implied_bias_gather_shapeless_replay(self):
+        # A shapeless compile replays the traced primitive with other shapes:
+        # the factor the op kept for one row per matrix then reaches routes
+        # with no implied-bias kernel, where the backend forms the bias.
+        if mx.default_device() != mx.gpu:
+            self.skipTest("requires the GPU")
+        rng = np.random.default_rng(13)
+        E, N, K = 4, 64, 512
+        w, scales, full, f = self.gather_implied_weights(
+            rng, mx.float16, 4, 32, -8.0, E, N, K
+        )
+        lhs = mx.array([0, 1, 1], mx.uint32)
+        rhs = mx.array([3, 0, 2], mx.uint32)
+        mx.eval(w, scales, full, f)
+
+        def gather(x, b):
+            return mx.gather_qmm(
+                x,
+                w,
+                scales,
+                b,
+                lhs_indices=lhs,
+                rhs_indices=rhs,
+                transpose=True,
+                group_size=32,
+                bits=4,
+            )
+
+        compiled = mx.compile(lambda x: gather(x, f), shapeless=True)
+        for M, route, implied in [
+            (1, "gather_qmv_fast", True),  # the trace
+            (3, "gather_qmv_fast", False),
+            (64, "gather_qmm_t", False),
+            (1, "gather_qmv_fast", True),
+        ]:
+            x = mx.array(
+                rng.standard_normal((2, M, K)).astype(np.float32) / K**0.5
+            ).astype(mx.float16)
+            mx.eval(x)
+            mx.metal._kernel_trace_start()
+            try:
+                y = compiled(x)
+                mx.eval(y)
+            finally:
+                names = mx.metal._kernel_trace_stop()
+            names = [n for n in names if "_gather_q" in n]
+            with self.subTest(M=M):
+                self.assert_bitwise_equal(y, gather(x, full))
+                self.assertEqual(len(names), 1, names)
+                self.assertIn(route, names[0])
+                self.assertEqual(names[0].endswith("_ib"), implied, names)
 
     def test_implied_bias_grad(self):
         # Reverse products wrt x and scales use the implied-bias kernels and

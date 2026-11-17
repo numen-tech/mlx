@@ -10,10 +10,10 @@ sorted (gather_qmm_rhs from B / E >= 4).
 
   python gather_qmm_ib_bench.py [--save out.npz] [--check ref.npz]
 
---save writes the explicit-bias output of every cell, plus two routes with no
-implied-bias kernel (the matrix gather_qmm and gather_qvm); --check compares
-them bit for bit with an earlier --save, the proof that a core change left the
-explicit-bias path alone.
+--save writes the explicit-bias output of every cell as fp16 bit patterns, plus
+two routes with no implied-bias kernel (the matrix gather_qmm and gather_qvm);
+--check compares them bit for bit with an earlier --save, the proof that a core
+change left the explicit-bias path alone.
 """
 
 import argparse
@@ -112,11 +112,13 @@ def main():
 
             y_full, _ = trace(lambda: run(biases))
             y_ib, names = trace(lambda: run(f))
-            assert mx.array_equal(y_full, y_ib).item(), (layer, tokens)
+            assert mx.array_equal(
+                y_full.view(mx.uint16), y_ib.view(mx.uint16)
+            ).item(), (layer, tokens)
             name = f"{layer}.t{tokens}"
-            saved[name] = np.array(y_full.astype(mx.float32))
+            saved[name] = np.array(y_full.view(mx.uint16))
             if ref is not None:
-                assert np.array_equal(ref[name], saved[name], equal_nan=True), name
+                assert np.array_equal(ref[name], saved[name]), name
             kernel = next((n for n in names if "gather_q" in n), "-")
             for _ in range(args.warmup):
                 mx.eval(run(biases), run(f))
@@ -145,7 +147,7 @@ def main():
             transpose=True,
             group_size=GS,
             bits=BITS,
-        ).astype(mx.float32)
+        ).view(mx.uint16)
     )
     saved["qvm"] = np.array(
         mx.gather_qmm(
@@ -157,11 +159,11 @@ def main():
             transpose=False,
             group_size=GS,
             bits=BITS,
-        ).astype(mx.float32)
+        ).view(mx.uint16)
     )
     if ref is not None:
         for name in ("matrix", "qvm"):
-            assert np.array_equal(ref[name], saved[name], equal_nan=True), name
+            assert np.array_equal(ref[name], saved[name]), name
         print(
             f"explicit-bias outputs equal {args.check} bit for bit "
             f"({len(saved)} arrays)"

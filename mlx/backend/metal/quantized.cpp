@@ -7,6 +7,7 @@
 #include "mlx/backend/common/compiled.h"
 #include "mlx/backend/common/quantized.h"
 #include "mlx/backend/gpu/copy.h"
+#include "mlx/backend/metal/binary.h"
 #include "mlx/backend/metal/device.h"
 #include "mlx/backend/metal/kernels.h"
 #include "mlx/backend/metal/matmul.h"
@@ -2773,11 +2774,13 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
   // implied-bias kernel: the sorted rhs kernel and gather_qmv(_fast). The op
   // (ops.cpp gather_qmm) materializes the bias for everything else, so a 0-d
   // bias here with any other shape is a graph replayed with shapes the op
-  // never saw. Refuse it: no kernel below would read the factor correctly.
+  // never saw (a shapeless compile). No kernel below would read the factor
+  // correctly, so form the bias the op would have: scales * f, in their dtype.
   if (is_implied_bias(biases) && !(transpose_ && M == 1)) {
-    throw std::runtime_error(
-        "[GatherQMM] An implied-bias factor is only supported for a "
-        "transposed product of one row per matrix; pass per-group biases.");
+    array full_biases(scales.shape(), scales.dtype(), nullptr, {});
+    binary_op_gpu({scales, *biases}, full_biases, "Multiply", s);
+    metal::get_command_encoder(s).add_temporary(full_biases);
+    biases = std::move(full_biases);
   }
 
   // We are walking x in order and w is also in order so we can batch up the
