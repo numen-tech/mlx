@@ -1,8 +1,11 @@
 // Copyright © 2023-2026 Apple Inc.
 
-#include "mlx/backend/common/quantized.h"
+#include <atomic>
+#include <cstring>
+
 #include "mlx/backend/common/broadcasting.h"
 #include "mlx/backend/common/compiled.h"
+#include "mlx/backend/common/quantized.h"
 #include "mlx/backend/gpu/copy.h"
 #include "mlx/backend/metal/device.h"
 #include "mlx/backend/metal/kernels.h"
@@ -763,6 +766,29 @@ inline bool use_qmv_wide_rr(
   const int bits_index = bits == 2 ? 0 : (bits == 4 ? 1 : 2);
   return d.get_architecture_gen() >= kQmvWideRRMinGen[bits_index] &&
       !qmv_wide_rr_disabled();
+}
+
+// The qmv_mma switch: metal::set_qmv_mma (a host's per-load switch,
+// numen-tech/gemma4-qat#1701) or MLX_QMV_MMA=1 (never cached). use_qmv_mma
+// reads it only for a call that passes every shape test, never at decode's one
+// row, and the flag first, so a host that sets it never reads the environment.
+// Version: kQmvMmaVersion (device.h).
+static std::atomic<bool> qmv_mma_flag{false};
+
+inline bool qmv_mma_enabled() {
+  if (qmv_mma_flag.load(std::memory_order_relaxed)) {
+    return true;
+  }
+  const char* v = std::getenv("MLX_QMV_MMA");
+  return v != nullptr && std::strcmp(v, "1") == 0;
+}
+
+// The GPU half of use_qmv_mma: no simdgroup matrices on Apple6, an Ultra keeps
+// the vector kernels, and qmv_nax (the NAX half of ml-explore/mlx#4712) is not
+// carried.
+inline bool qmv_mma_gpu(metal::Device& d) {
+  return !d.is_apple6() && d.get_architecture().back() != 'd' &&
+      !metal::is_nax_available();
 }
 
 // Dispatches qmv_wide (fp modes -> fp_qmv_wide, affine -> affine_qmv_wide):
@@ -2461,6 +2487,101 @@ void dispatch_qmv(
       mode);
 }
 
+// ml-explore/mlx#4787's affine qmv_mma (numen-tech/gemma4-qat#1701): taken
+// only under its switch (qmv_mma_enabled), on a GPU qmv_mma_gpu allows, for
+// 4-16 rows (3-16 below gen 15) with upstream's non-NAX affine shape rule.
+// Bias-free affine has no qmv_mma kernel.
+inline bool use_qmv_mma(
+    const array& x,
+    const array& w,
+    const array& scales,
+    const std::optional<array>& biases,
+    const std::string& mode,
+    int bits,
+    int M,
+    int N,
+    int K,
+    metal::Device& d) {
+  int min_rows = d.get_architecture_gen() >= 15 ? 4 : 3;
+  if (M < min_rows || M > 16 || K % 128 != 0 || mode != "affine" || !biases) {
+    return false;
+  }
+  // Require aligned vector load.
+  if ((x.offset() % (8 * x.itemsize())) || (w.offset() % 16) ||
+      (scales.offset() % 2)) {
+    return false;
+  }
+  if (!((bits == 4 || bits == 8) && (N >= 512) && (K >= 512) &&
+        (int64_t(N) * K >= (int64_t(1) << 21)) && (N % 16 == 0))) {
+    return false;
+  }
+  // Last: the GPU and the switch, so only a call R1 would take reads them.
+  return qmv_mma_gpu(d) && qmv_mma_enabled();
+}
+
+void qmv_mma(
+    const array& x,
+    const array& w,
+    const array& scales,
+    const std::optional<array>& biases,
+    array& out,
+    int group_size,
+    int bits,
+    int M,
+    int N,
+    int K,
+    metal::Device& d,
+    const Stream& s,
+    const std::string& mode) {
+  int wk = 4;
+  int bn = 16;
+  int tm = (M > 8) ? 2 : 1;
+  // Below gen 15, one row tile is faster at 32 columns (M2 Pro, upstream).
+  if ((d.get_architecture_gen() < 15) && (tm == 1) && (N % 32 == 0)) {
+    bn = 32;
+  }
+  const bool implied = is_implied_bias(biases);
+  std::string type_string = get_type_string(x.dtype());
+  std::string kname;
+  kname.reserve(64);
+  concatenate(
+      kname,
+      "affine_qmv_mma_",
+      type_string,
+      "_gs_",
+      group_size,
+      "_b_",
+      bits,
+      "_wk_",
+      wk,
+      "_bn_",
+      bn,
+      "_tm_",
+      tm,
+      implied ? "_ib" : "");
+  auto kernel = implied
+      ? get_quantized_kernel_wrapped(
+            d, kname, "qmv_mma", mode, type_string, group_size, bits, wk, bn,
+            tm, true)
+      : get_quantized_kernel_wrapped(
+            d, kname, "qmv_mma", mode, type_string, group_size, bits, wk, bn,
+            tm);
+
+  auto& compute_encoder = metal::get_command_encoder(s);
+  compute_encoder.set_compute_pipeline_state(kernel);
+  int c = 0;
+  compute_encoder.set_input_array(w, c++);
+  compute_encoder.set_input_array(scales, c++);
+  compute_encoder.set_input_array(*biases, c++);
+  compute_encoder.set_input_array(x, c++);
+  compute_encoder.set_output_array(out, c++);
+  compute_encoder.set_bytes(K, c++);
+  compute_encoder.set_bytes(N, c++);
+  compute_encoder.set_bytes(M, c++);
+  compute_encoder.dispatch_threadgroups(
+      MTL::Size(N / bn, 1, 1), MTL::Size(32, wk, 1));
+}
+
 void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   auto& s = stream();
   auto& d = metal::device(s.device);
@@ -2518,6 +2639,12 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
           std::to_string(kApple6MaxRows) + ")");
     }
     vector_limit = kApple6MaxRows + 1;
+  }
+  // Ahead of the qmv batch limit, as upstream routes it (gemma4-qat#1701).
+  if (transpose_ && non_batched &&
+      use_qmv_mma(x, w, scales, biases, mode, bits_, M, N, K, d)) {
+    qmv_mma(x, w, scales, biases, out, group_size_, bits_, M, N, K, d, s, mode);
+    return;
   }
   // It is a matrix matrix product.
   if (M >= vector_limit) {
@@ -2923,5 +3050,19 @@ void fast::ConvertFP8::eval_gpu(
   auto& out = outputs[0];
   unary_op_gpu(inputs, out, name(), stream());
 }
+
+namespace metal {
+
+void set_qmv_mma(bool enabled) {
+  // Relaxed: the host's own synchronization with the thread that dispatches
+  // (its load, then an eval) orders the store before the calls it governs.
+  qmv_mma_flag.store(enabled, std::memory_order_relaxed);
+}
+
+bool qmv_mma_device() {
+  return qmv_mma_gpu(metal::device(mlx::core::Device::gpu));
+}
+
+} // namespace metal
 
 } // namespace mlx::core

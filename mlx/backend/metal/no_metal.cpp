@@ -33,6 +33,16 @@ Counters counters() {
 }
 void reset() {}
 
+void kernel_trace_start() {}
+std::vector<std::string> kernel_trace_stop() {
+  return {};
+}
+
+void set_qmv_mma(bool) {}
+bool qmv_mma_device() {
+  return false;
+}
+
 array nonresident_array(
     void* data,
     Shape shape,

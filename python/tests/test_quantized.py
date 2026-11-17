@@ -860,6 +860,101 @@ class TestQuantized(mlx_tests.MLXTestCase):
                     self.assert_bitwise_equal(ys[False], ys[True])
 
     @unittest.skipIf(not mx.metal.is_available(), "requires Metal")
+    def test_qmv_mma_switch(self):
+        # numen-tech/gemma4-qat#1701: MLX_QMV_MMA=1, or mx.metal._set_qmv_mma,
+        # routes 4/8-bit affine products of 4-16 rows (3-16 below gen 15) to
+        # qmv_mma on a GPU that can take it (no NAX, not Apple6, not an Ultra);
+        # with neither, no product takes it.
+        if mx.default_device() == mx.cpu:
+            self.skipTest("Covers GPU kernels only")
+        key = "MLX_QMV_MMA"
+        saved = os.environ.get(key)
+
+        def run(x, wq, scales, biases, gs, bits, on):
+            if on:
+                os.environ[key] = "1"
+            else:
+                os.environ.pop(key, None)
+            try:
+                mx.metal._kernel_trace_start()
+                y = mx.quantized_matmul(
+                    x, wq, scales, biases, transpose=True, group_size=gs, bits=bits
+                )
+                mx.eval(y)
+                return y, mx.metal._kernel_trace_stop()
+            finally:
+                if saved is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = saved
+
+        def took(trace):
+            return any("qmv_mma" in n for n in trace)
+
+        eligible = mx.metal._qmv_mma_device()
+        arch = mx.metal.device_info()["architecture"]
+        min_rows = (
+            4
+            if int("".join(c for c in arch.split("_g")[-1] if c.isdigit())) >= 15
+            else 3
+        )
+        K, N = 1024, 2048
+        k1, k2 = mx.random.split(mx.random.key(17))
+        w = (0.02 * mx.random.normal((N, K), key=k2)).astype(mx.float16)
+        x_all = mx.random.normal((16, K), key=k1).astype(mx.float16)
+        for bits, gs in product([2, 4, 8], [32, 64, 128]):
+            wq, scales, biases = mx.quantize(w, group_size=gs, bits=bits)
+            w_hat = mx.dequantize(wq, scales, biases, group_size=gs, bits=bits)
+            implied = mx.array(-(2 ** (bits - 1)), mx.float16)
+            implied_full = scales * implied
+            w_hat_ib = mx.dequantize(wq, scales, implied_full, group_size=gs, bits=bits)
+            for M in range(1, 17):
+                x = x_all[:M]
+                with self.subTest(bits=bits, gs=gs, M=M):
+                    for b, wh in ((biases, w_hat), (implied, w_hat_ib)):
+                        y_ref = x.astype(mx.float32) @ wh.astype(mx.float32).T
+                        scale = y_ref.abs().max().item()
+                        _, t0 = run(x, wq, scales, b, gs, bits, False)
+                        y1, t1 = run(x, wq, scales, b, gs, bits, True)
+                        self.assertFalse(took(t0), t0)
+                        err = (y1.astype(mx.float32) - y_ref).abs().max().item()
+                        self.assertLess(err / scale, 2e-3)
+                        self.assertEqual(
+                            took(t1), eligible and bits != 2 and M >= min_rows, t1
+                        )
+                    # On the qmv_mma route the implied factor and the
+                    # materialized bias agree bit for bit.
+                    y_ib, t_ib = run(x, wq, scales, implied, gs, bits, True)
+                    y_full, t_full = run(x, wq, scales, implied_full, gs, bits, True)
+                    if took(t_ib) and took(t_full):
+                        self.assert_bitwise_equal(y_ib, y_full)
+            if bits in (4, 8):
+                # The process flag takes the route as the variable does, and
+                # off again leaves it to the (unset) variable.
+                os.environ.pop(key, None)
+                try:
+                    for on in (True, False):
+                        mx.metal._set_qmv_mma(on)
+                        mx.metal._kernel_trace_start()
+                        mx.eval(
+                            mx.quantized_matmul(
+                                x_all[:4],
+                                wq,
+                                scales,
+                                biases,
+                                transpose=True,
+                                group_size=gs,
+                                bits=bits,
+                            )
+                        )
+                        t = mx.metal._kernel_trace_stop()
+                        self.assertEqual(took(t), on and eligible, t)
+                finally:
+                    mx.metal._set_qmv_mma(False)
+                    if saved is not None:
+                        os.environ[key] = saved
+
+    @unittest.skipIf(not mx.metal.is_available(), "requires Metal")
     def test_qmm_splitk_fallthrough(self):
         # On a NAX GPU an FP16 split-K qmm of more than 16 rows goes to the NAX
         # qmm. Both routes must match the reference; at M 16 they are equal.

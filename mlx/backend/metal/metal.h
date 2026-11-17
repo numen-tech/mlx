@@ -7,6 +7,7 @@
 #include <string>
 #include <unordered_map>
 #include <variant>
+#include <vector>
 
 #include "mlx/api.h"
 #include "mlx/array.h"
@@ -53,5 +54,24 @@ MLX_API array nonresident_array(
     Shape shape,
     Dtype dtype,
     const std::function<void(void*)>& deleter);
+
+// Records the name of every kernel looked up, cached or not, from
+// kernel_trace_start() to kernel_trace_stop(), in order with repeats. A harness
+// that compares two routes uses it to prove which kernel served an op, since a
+// fallback gives a plausible answer too. Process-wide: only one trace at a
+// time, and eval() the op inside it. Off, it costs one relaxed atomic load per
+// kernel lookup. Without a Metal backend the trace is always empty.
+MLX_API void kernel_trace_start();
+MLX_API std::vector<std::string> kernel_trace_stop();
+
+// The affine qmv_mma route (ml-explore/mlx#4787, numen-tech/gemma4-qat#1701),
+// off by default. set_qmv_mma(true) turns it on for the process as
+// MLX_QMV_MMA=1 does; the route is on while either is. A host that switches it
+// per model load calls this instead of setenv/unsetenv, which may race another
+// thread's dispatch reading the variable. qmv_mma_device() is whether this GPU
+// can take the route at all (no NAX, not Apple6, not an Ultra); false without a
+// Metal backend. Version: kQmvMmaVersion (device.h).
+MLX_API void set_qmv_mma(bool enabled);
+MLX_API bool qmv_mma_device();
 
 } // namespace mlx::core::metal

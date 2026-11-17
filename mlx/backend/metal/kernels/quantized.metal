@@ -377,6 +377,34 @@
   instantiate_quantized_ib_types(64, bits)    \
   instantiate_quantized_ib_types(32, bits)
 
+///////////////////////////////////////////////////////////////////////////////
+// affine_qmv_mma (ml-explore/mlx#4787, gemma4-qat#1701): 4/8-bit, with the
+// implied-bias twin. Defaulted template args are spelled out on the "_ib" twin.
+///////////////////////////////////////////////////////////////////////////////
+
+#define instantiate_qmv_mma(type, group_size, bits, wk, bn, tm)                \
+  instantiate_kernel(                                                          \
+      "affine_qmv_mma_" #type "_gs_" #group_size "_b_" #bits "_wk_" #wk "_bn_" #bn "_tm_" #tm, \
+      affine_qmv_mma, type, group_size, bits, wk, bn, tm)                      \
+  instantiate_kernel(                                                          \
+      "affine_qmv_mma_" #type "_gs_" #group_size "_b_" #bits "_wk_" #wk "_bn_" #bn "_tm_" #tm "_ib", \
+      affine_qmv_mma, type, group_size, bits, wk, bn, tm, true)
+
+#define instantiate_qmv_mma_all(type, group_size, bits) \
+  instantiate_qmv_mma(type, group_size, bits, 4, 16, 1) \
+  instantiate_qmv_mma(type, group_size, bits, 4, 16, 2) \
+  instantiate_qmv_mma(type, group_size, bits, 4, 32, 1)
+
+#define instantiate_qmv_mma_types(group_size, bits)       \
+  instantiate_qmv_mma_all(float, group_size, bits)        \
+  instantiate_qmv_mma_all(float16_t, group_size, bits)    \
+  instantiate_qmv_mma_all(bfloat16_t, group_size, bits)
+
+#define instantiate_qmv_mma_groups(bits) \
+  instantiate_qmv_mma_types(128, bits)   \
+  instantiate_qmv_mma_types(64, bits)    \
+  instantiate_qmv_mma_types(32, bits)
+
 #define instantiate_quantized_all() \
   instantiate_quantized_groups(1) \
   instantiate_quantized_groups(2) \
@@ -396,7 +424,9 @@
   instantiate_quantized_ib_groups(1) \
   instantiate_quantized_ib_groups(2) \
   instantiate_quantized_ib_groups(4) \
-  instantiate_quantized_ib_groups(8)
+  instantiate_quantized_ib_groups(8) \
+  instantiate_qmv_mma_groups(4) \
+  instantiate_qmv_mma_groups(8)
 
 // 64 x 64 tiles of the transposed, non-batched affine qmm, 4/8-bit, explicit
 // and implied bias (quantized.cpp use_qmm_tile64, numen-tech/gemma4-qat#1695).

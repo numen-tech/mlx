@@ -28,6 +28,23 @@ bool DEPRECATE(const char* old_fn, const char* new_fn) {
 void init_metal(nb::module_& m) {
   nb::module_ metal = m.def_submodule("metal", "mlx.metal");
   metal.def(
+      "_kernel_trace_start",
+      &mx::metal::kernel_trace_start,
+      "Start recording the names of the Metal kernels looked up.");
+  metal.def(
+      "_kernel_trace_stop",
+      &mx::metal::kernel_trace_stop,
+      "Stop recording and return the kernel names looked up since the start.");
+  metal.def(
+      "_set_qmv_mma",
+      &mx::metal::set_qmv_mma,
+      "enabled"_a,
+      "Turn the affine qmv_mma route on or off, as MLX_QMV_MMA=1 does.");
+  metal.def(
+      "_qmv_mma_device",
+      &mx::metal::qmv_mma_device,
+      "Whether this GPU can take the affine qmv_mma route.");
+  metal.def(
       "is_available",
       &mx::metal::is_available,
       R"pbdoc(

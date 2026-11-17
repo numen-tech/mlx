@@ -12,6 +12,7 @@
 #include "mlx/array.h"
 #include "mlx/backend/common/metal_kernel.h"
 #include "mlx/backend/metal/gpu_family.h"
+#include "mlx/backend/metal/metal.h"
 #include "mlx/backend/metal/resident.h"
 #include "mlx/device.h"
 
@@ -309,14 +310,16 @@ constexpr int kQmmSplitkNaxVersion = 2;
 //    (numen-tech/gemma4-qat#1228).
 constexpr int kNonresidentArrayVersion = 1;
 
-// Records the name of every kernel looked up, cached or not, from
-// kernel_trace_start() to kernel_trace_stop(), in order with repeats. A harness
-// that compares two routes uses it to prove which kernel served an op, since a
-// fallback gives a plausible answer too. Process-wide: only one trace at a
-// time, and eval() the op inside it. Off, it costs one relaxed atomic load per
-// kernel lookup.
-MLX_API void kernel_trace_start();
-MLX_API std::vector<std::string> kernel_trace_stop();
+// Bumped when the affine qmv_mma route (quantized.cpp use_qmv_mma) changes. A
+// binding reads it to tell whether a core carries it.
+// 1: MLX_QMV_MMA=1 (never cached, off by default) routes an affine 4/8-bit
+//    transposed quantized matmul of 4-16 rows (3-16 below gen 15) with
+//    K % 128 == 0 to ml-explore/mlx#4787's affine_qmv_mma on a GPU without NAX
+//    (numen-tech/gemma4-qat#1701).
+// 2: set_qmv_mma(true) (metal.h) turns it on as MLX_QMV_MMA=1 does, without
+//    touching the environment; qmv_mma_device() says whether the GPU can take
+//    it. The environment is read only by a call that passes every shape test.
+constexpr int kQmvMmaVersion = 2;
 
 // Call before each host wait on GPU work.
 void count_host_wait();
