@@ -2278,6 +2278,8 @@ class TestQuantized(mlx_tests.MLXTestCase):
         self.assertEqual(len(k_ib), 1, k_ib)
         self.assertEqual(len(k_full), 1, k_full)
         self.assertIn(route, k_ib[0])
+        if route == "gather_qmv_":
+            self.assertNotIn("gather_qmv_fast", k_ib[0])
 
         # The sorted kernels' names end with their alignment constants.
         def implied(name):
