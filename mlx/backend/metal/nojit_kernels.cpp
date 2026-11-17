@@ -397,6 +397,7 @@ MTL::ComputePipelineState* get_gather_qmm_kernel(
     int,
     int,
     bool,
+    bool,
     bool) {
   return d.get_kernel(kernel_name, hash_name, func_consts);
 }
@@ -497,6 +498,7 @@ MTL::ComputePipelineState* get_gather_qmm_nax_kernel(
     int,
     int,
     int,
+    bool,
     bool,
     bool) {
   return d.get_kernel(kernel_name, hash_name, func_consts);

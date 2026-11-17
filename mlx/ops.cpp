@@ -5818,15 +5818,10 @@ array gather_qmm(
 
   auto [out_type, qmode] = validate_mode_with_type(
       "gather_qmm", scales, biases_, std::nullopt, mode);
-  // The gather kernels have no implied-bias variant: materialize the factor.
-  std::optional<array> biases = biases_;
-  if (is_implied_bias(biases_)) {
-    biases = materialize_implied_bias(scales, *biases_, s);
-  }
   auto [group_size, bits] =
       quantization_params_from_mode(qmode, group_size_, bits_);
   auto [w_inner_dims, w_outer_dims] = extract_quantized_matmul_dims(
-      "gather_qmm", x, w, scales, biases, transpose, group_size, bits);
+      "gather_qmm", x, w, scales, biases_, transpose, group_size, bits);
   if (global_scale) {
     if (qmode != QuantizationMode::Nvfp4) {
       throw std::invalid_argument(
@@ -5864,6 +5859,23 @@ array gather_qmm(
     msg << "[gather_qmm] Only real floating types are supported but "
         << "x.dtype() == " << x.dtype() << ".";
     throw std::invalid_argument(msg.str());
+  }
+
+  // Only the Metal kernels a transposed product of one row per matrix takes
+  // (gather_qmv, gather_qmv_fast and the sorted gather_qmm_rhs: the routes of
+  // a MoE layer) have an implied-bias variant, exact under the same conditions
+  // as quantized_matmul's. The matrix gather_qmm, gather_qvm, the
+  // non-transposed sorted kernel and the CPU get a materialized bias
+  // (numen-tech/gemma4-qat#1833).
+  std::optional<array> biases = biases_;
+  if (is_implied_bias(biases_)) {
+    auto stream = to_stream(s);
+    bool keep_factor = stream.device == Device::gpu && metal::is_available() &&
+        transpose && x.shape(-2) == 1 &&
+        implied_bias_kernels_exact(scales, out_type, bits, stream);
+    if (!keep_factor) {
+      biases = materialize_implied_bias(scales, *biases_, s);
+    }
   }
 
   // Extract indices and broadcast them

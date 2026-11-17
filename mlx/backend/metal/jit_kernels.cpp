@@ -1106,39 +1106,55 @@ MTL::ComputePipelineState* get_gather_qmm_kernel(
     int wm,
     int wn,
     bool transpose,
-    bool has_global_scale) {
+    bool has_global_scale,
+    bool implied_bias) {
   const auto& lib_name = kernel_name;
   auto lib = d.get_library(lib_name, [&]() {
     std::string kernel_source;
     concatenate(
         kernel_source, metal::utils(), metal::quantized_utils(), metal::gemm());
     bool is_affine = mode == "affine";
-    // Only the fp kernel takes a global scale.
-    auto template_def = is_affine ? get_template_definition(
-                                        lib_name,
-                                        "affine_gather_qmm_rhs",
-                                        get_type_string(x.dtype()),
-                                        group_size,
-                                        bits,
-                                        bm,
-                                        bn,
-                                        bk,
-                                        wm,
-                                        wn,
-                                        transpose)
-                                  : get_template_definition(
-                                        lib_name,
-                                        "fp_gather_qmm_rhs",
-                                        get_type_string(x.dtype()),
-                                        group_size,
-                                        bits,
-                                        bm,
-                                        bn,
-                                        bk,
-                                        wm,
-                                        wn,
-                                        transpose,
-                                        has_global_scale);
+    // Only the fp kernel takes a global scale, only the affine one an implied
+    // bias (the trailing template arg, passed on that branch alone).
+    auto template_def = (is_affine && implied_bias)
+        ? get_template_definition(
+              lib_name,
+              "affine_gather_qmm_rhs",
+              get_type_string(x.dtype()),
+              group_size,
+              bits,
+              bm,
+              bn,
+              bk,
+              wm,
+              wn,
+              transpose,
+              true)
+        : is_affine ? get_template_definition(
+                          lib_name,
+                          "affine_gather_qmm_rhs",
+                          get_type_string(x.dtype()),
+                          group_size,
+                          bits,
+                          bm,
+                          bn,
+                          bk,
+                          wm,
+                          wn,
+                          transpose)
+                    : get_template_definition(
+                          lib_name,
+                          "fp_gather_qmm_rhs",
+                          get_type_string(x.dtype()),
+                          group_size,
+                          bits,
+                          bm,
+                          bn,
+                          bk,
+                          wm,
+                          wn,
+                          transpose,
+                          has_global_scale);
     concatenate(
         kernel_source,
         is_affine ? metal::quantized() : metal::fp_quantized(),
@@ -1342,7 +1358,8 @@ MTL::ComputePipelineState* get_gather_qmm_nax_kernel(
     int wm,
     int wn,
     bool transpose,
-    bool has_global_scale) {
+    bool has_global_scale,
+    bool implied_bias) {
   const auto& lib_name = kernel_name;
   auto lib = d.get_library(lib_name, [&]() {
     std::string kernel_source;
@@ -1352,32 +1369,47 @@ MTL::ComputePipelineState* get_gather_qmm_nax_kernel(
         metal::gemm_nax(),
         metal::quantized_utils());
     bool is_affine = mode == "affine";
-    // Only the fp kernel takes a global scale.
-    auto template_def = is_affine ? get_template_definition(
-                                        lib_name,
-                                        "affine_gather_qmm_rhs_nax",
-                                        get_type_string(x.dtype()),
-                                        group_size,
-                                        bits,
-                                        bm,
-                                        bn,
-                                        bk,
-                                        wm,
-                                        wn,
-                                        transpose)
-                                  : get_template_definition(
-                                        lib_name,
-                                        "fp_gather_qmm_rhs_nax",
-                                        get_type_string(x.dtype()),
-                                        group_size,
-                                        bits,
-                                        bm,
-                                        bn,
-                                        bk,
-                                        wm,
-                                        wn,
-                                        transpose,
-                                        has_global_scale);
+    // Only the fp kernel takes a global scale, only the affine one an implied
+    // bias (the trailing template arg, passed on that branch alone).
+    auto template_def = (is_affine && implied_bias)
+        ? get_template_definition(
+              lib_name,
+              "affine_gather_qmm_rhs_nax",
+              get_type_string(x.dtype()),
+              group_size,
+              bits,
+              bm,
+              bn,
+              bk,
+              wm,
+              wn,
+              transpose,
+              true)
+        : is_affine ? get_template_definition(
+                          lib_name,
+                          "affine_gather_qmm_rhs_nax",
+                          get_type_string(x.dtype()),
+                          group_size,
+                          bits,
+                          bm,
+                          bn,
+                          bk,
+                          wm,
+                          wn,
+                          transpose)
+                    : get_template_definition(
+                          lib_name,
+                          "fp_gather_qmm_rhs_nax",
+                          get_type_string(x.dtype()),
+                          group_size,
+                          bits,
+                          bm,
+                          bn,
+                          bk,
+                          wm,
+                          wn,
+                          transpose,
+                          has_global_scale);
     concatenate(
         kernel_source,
         is_affine ? metal::quantized_nax() : metal::fp_quantized_nax(),

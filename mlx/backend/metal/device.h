@@ -321,6 +321,16 @@ constexpr int kNonresidentArrayVersion = 1;
 //    it. The environment is read only by a call that passes every shape test.
 constexpr int kQmvMmaVersion = 2;
 
+// Bumped when the implied-bias (0-d factor) gather kernels change. A binding
+// reads it to tell whether a core carries them.
+// 1: gather_qmm keeps a 0-d implied-bias factor for a transposed product of
+//    one row per matrix on the GPU with unpromoted scales at 1/2/4/8 bits; the
+//    affine gather_qmv, gather_qmv_fast, gather_qmm_rhs and
+//    gather_qmm_rhs_nax kernels form the bias from it ("_ib" names). Every
+//    other gather_qmm call materializes the bias as before
+//    (numen-tech/gemma4-qat#1833).
+constexpr int kGatherImpliedBiasVersion = 1;
+
 // Call before each host wait on GPU work.
 void count_host_wait();
 
