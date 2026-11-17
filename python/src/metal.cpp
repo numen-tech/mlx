@@ -13,13 +13,6 @@
 #include "mlx/memory.h"
 #include "python/src/small_vector.h"
 
-// Kernel lookup trace (mlx/backend/metal/device.h), declared here so the
-// bindings need no Metal headers. Measurement hook for gemma4-qat#1701.
-namespace mlx::core::metal {
-void kernel_trace_start();
-std::vector<std::string> kernel_trace_stop();
-} // namespace mlx::core::metal
-
 namespace mx = mlx::core;
 namespace nb = nanobind;
 using namespace nb::literals;
@@ -42,6 +35,15 @@ void init_metal(nb::module_& m) {
       "_kernel_trace_stop",
       &mx::metal::kernel_trace_stop,
       "Stop recording and return the kernel names looked up since the start.");
+  metal.def(
+      "_set_qmv_mma",
+      &mx::metal::set_qmv_mma,
+      "enabled"_a,
+      "Turn the affine qmv_mma route on or off, as MLX_QMV_MMA=1 does.");
+  metal.def(
+      "_qmv_mma_device",
+      &mx::metal::qmv_mma_device,
+      "Whether this GPU can take the affine qmv_mma route.");
   metal.def(
       "is_available",
       &mx::metal::is_available,

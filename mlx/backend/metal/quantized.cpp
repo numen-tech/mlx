@@ -1,10 +1,11 @@
 // Copyright © 2023-2026 Apple Inc.
 
+#include <atomic>
 #include <cstring>
 
-#include "mlx/backend/common/quantized.h"
 #include "mlx/backend/common/broadcasting.h"
 #include "mlx/backend/common/compiled.h"
+#include "mlx/backend/common/quantized.h"
 #include "mlx/backend/gpu/copy.h"
 #include "mlx/backend/metal/device.h"
 #include "mlx/backend/metal/kernels.h"
@@ -767,14 +768,27 @@ inline bool use_qmv_wide_rr(
       !qmv_wide_rr_disabled();
 }
 
-// MLX_QMV_MMA=1 takes ml-explore/mlx#4787's affine qmv_mma for 4-16 rows on a
-// GPU without NAX (use_qmv_mma below). Off by default. Not cached: a process sets
-// and clears it per load (numen-tech/gemma4-qat#1701), so use_qmv_mma reads it
-// only for a call that passes every shape test, never at decode's one row.
+// The qmv_mma switch: metal::set_qmv_mma (a host's per-load switch,
+// numen-tech/gemma4-qat#1701) or MLX_QMV_MMA=1 (never cached). use_qmv_mma
+// reads it only for a call that passes every shape test, never at decode's one
+// row, and the flag first, so a host that sets it never reads the environment.
 // Version: kQmvMmaVersion (device.h).
+static std::atomic<bool> qmv_mma_flag{false};
+
 inline bool qmv_mma_enabled() {
+  if (qmv_mma_flag.load(std::memory_order_relaxed)) {
+    return true;
+  }
   const char* v = std::getenv("MLX_QMV_MMA");
   return v != nullptr && std::strcmp(v, "1") == 0;
+}
+
+// The GPU half of use_qmv_mma: no simdgroup matrices on Apple6, an Ultra keeps
+// the vector kernels, and qmv_nax (the NAX half of ml-explore/mlx#4712) is not
+// carried.
+inline bool qmv_mma_gpu(metal::Device& d) {
+  return !d.is_apple6() && d.get_architecture().back() != 'd' &&
+      !metal::is_nax_available();
 }
 
 // Dispatches qmv_wide (fp modes -> fp_qmv_wide, affine -> affine_qmv_wide):
@@ -2474,10 +2488,9 @@ void dispatch_qmv(
 }
 
 // ml-explore/mlx#4787's affine qmv_mma (numen-tech/gemma4-qat#1701): taken
-// only under MLX_QMV_MMA=1, on a GPU without NAX, for 4-16 rows
-// (3-16 below gen 15) with upstream's non-NAX affine shape rule. Apple6 has no
-// simdgroup matrices, bias-free affine has no qmv_mma kernel, and qmv_nax
-// (the NAX half of ml-explore/mlx#4712) is not carried.
+// only under its switch (qmv_mma_enabled), on a GPU qmv_mma_gpu allows, for
+// 4-16 rows (3-16 below gen 15) with upstream's non-NAX affine shape rule.
+// Bias-free affine has no qmv_mma kernel.
 inline bool use_qmv_mma(
     const array& x,
     const array& w,
@@ -2490,8 +2503,7 @@ inline bool use_qmv_mma(
     int K,
     metal::Device& d) {
   int min_rows = d.get_architecture_gen() >= 15 ? 4 : 3;
-  if (M < min_rows || M > 16 || K % 128 != 0 || mode != "affine" || !biases ||
-      d.is_apple6()) {
+  if (M < min_rows || M > 16 || K % 128 != 0 || mode != "affine" || !biases) {
     return false;
   }
   // Require aligned vector load.
@@ -2499,17 +2511,12 @@ inline bool use_qmv_mma(
       (scales.offset() % 2)) {
     return false;
   }
-  // Ultra keeps the vector kernels.
-  if (d.get_architecture().back() == 'd') {
-    return false;
-  }
   if (!((bits == 4 || bits == 8) && (N >= 512) && (K >= 512) &&
         (int64_t(N) * K >= (int64_t(1) << 21)) && (N % 16 == 0))) {
     return false;
   }
-  // Last: the process-wide checks, the environment read only for a call R1
-  // would otherwise take.
-  return !metal::is_nax_available() && qmv_mma_enabled();
+  // Last: the GPU and the switch, so only a call R1 would take reads them.
+  return qmv_mma_gpu(d) && qmv_mma_enabled();
 }
 
 void qmv_mma(
@@ -3043,5 +3050,19 @@ void fast::ConvertFP8::eval_gpu(
   auto& out = outputs[0];
   unary_op_gpu(inputs, out, name(), stream());
 }
+
+namespace metal {
+
+void set_qmv_mma(bool enabled) {
+  // Relaxed: the host's own synchronization with the thread that dispatches
+  // (its load, then an eval) orders the store before the calls it governs.
+  qmv_mma_flag.store(enabled, std::memory_order_relaxed);
+}
+
+bool qmv_mma_device() {
+  return qmv_mma_gpu(metal::device(mlx::core::Device::gpu));
+}
+
+} // namespace metal
 
 } // namespace mlx::core
