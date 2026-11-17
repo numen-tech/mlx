@@ -309,6 +309,14 @@ constexpr int kQmmSplitkNaxVersion = 2;
 //    (numen-tech/gemma4-qat#1228).
 constexpr int kNonresidentArrayVersion = 1;
 
+// Bumped when the affine qmv_mma route (quantized.cpp use_qmv_mma) changes. A
+// binding reads it to tell whether a core carries it.
+// 1: MLX_QMV_MMA=1 (read on every call, off by default) routes an affine 4/8-bit
+//    transposed quantized matmul of 4-16 rows (3-16 below gen 15) with
+//    K % 128 == 0 to ml-explore/mlx#4787's affine_qmv_mma on a GPU without NAX
+//    (numen-tech/gemma4-qat#1701).
+constexpr int kQmvMmaVersion = 1;
+
 // Records the name of every kernel looked up, cached or not, from
 // kernel_trace_start() to kernel_trace_stop(), in order with repeats. A harness
 // that compares two routes uses it to prove which kernel served an op, since a

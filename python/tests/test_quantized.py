@@ -860,22 +860,20 @@ class TestQuantized(mlx_tests.MLXTestCase):
                     self.assert_bitwise_equal(ys[False], ys[True])
 
     @unittest.skipIf(not mx.metal.is_available(), "requires Metal")
-    def test_qmv_mma_and_wide_tile8_switches(self):
-        # gemma4-qat#1701 measurement switches. MLX_QMV_MMA=1 routes 4/8-bit
-        # affine products of 4-16 rows (3-16 below gen 15) to qmv_mma on a
-        # non-NAX GPU; MLX_QMV_WIDE_TILE8=1 widens the affine qmv_wide tile to
-        # 8 vectors, which must not change a single bit.
+    def test_qmv_mma_switch(self):
+        # numen-tech/gemma4-qat#1701: MLX_QMV_MMA=1 routes 4/8-bit affine
+        # products of 4-16 rows (3-16 below gen 15) to qmv_mma on a GPU without
+        # NAX; unset, no product takes it.
         if mx.default_device() == mx.cpu:
             self.skipTest("Covers GPU kernels only")
-        keys = ("MLX_QMV_MMA", "MLX_QMV_WIDE_TILE8")
-        saved = {k: os.environ.get(k) for k in keys}
+        key = "MLX_QMV_MMA"
+        saved = os.environ.get(key)
 
-        def run(x, wq, scales, biases, gs, bits, env):
-            for k in keys:
-                if k == env:
-                    os.environ[k] = "1"
-                else:
-                    os.environ.pop(k, None)
+        def run(x, wq, scales, biases, gs, bits, on):
+            if on:
+                os.environ[key] = "1"
+            else:
+                os.environ.pop(key, None)
             try:
                 mx.metal._kernel_trace_start()
                 y = mx.quantized_matmul(
@@ -884,11 +882,13 @@ class TestQuantized(mlx_tests.MLXTestCase):
                 mx.eval(y)
                 return y, mx.metal._kernel_trace_stop()
             finally:
-                for k, v in saved.items():
-                    if v is None:
-                        os.environ.pop(k, None)
-                    else:
-                        os.environ[k] = v
+                if saved is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = saved
+
+        def took(trace):
+            return any("qmv_mma" in n for n in trace)
 
         nax = mx.metal.is_nax_available() if hasattr(mx.metal, "is_nax_available") else False
         K, N = 1024, 2048
@@ -909,28 +909,22 @@ class TestQuantized(mlx_tests.MLXTestCase):
                     for b, wh in ((biases, w_hat), (implied, w_hat_ib)):
                         y_ref = x.astype(mx.float32) @ wh.astype(mx.float32).T
                         scale = y_ref.abs().max().item()
-                        y0, _ = run(x, wq, scales, b, gs, bits, None)
-                        y1, t1 = run(x, wq, scales, b, gs, bits, "MLX_QMV_MMA")
-                        y2, _ = run(x, wq, scales, b, gs, bits, "MLX_QMV_WIDE_TILE8")
-                        self.assert_bitwise_equal(y0, y2)
+                        _, t0 = run(x, wq, scales, b, gs, bits, False)
+                        y1, t1 = run(x, wq, scales, b, gs, bits, True)
+                        self.assertFalse(took(t0), t0)
                         err = (y1.astype(mx.float32) - y_ref).abs().max().item()
                         self.assertLess(err / scale, 2e-3)
-                        took = any("qmv_mma" in n for n in t1)
                         if bits == 2 or M < 3 or nax:
-                            self.assertFalse(took, t1)
+                            self.assertFalse(took(t1), t1)
                     # On the qmv_mma route the implied factor and the
                     # materialized bias agree bit for bit.
-                    y_ib, t_ib = run(x, wq, scales, implied, gs, bits, "MLX_QMV_MMA")
-                    y_full, t_full = run(
-                        x, wq, scales, implied_full, gs, bits, "MLX_QMV_MMA"
-                    )
-                    if any("qmv_mma" in n for n in t_ib) and any(
-                        "qmv_mma" in n for n in t_full
-                    ):
+                    y_ib, t_ib = run(x, wq, scales, implied, gs, bits, True)
+                    y_full, t_full = run(x, wq, scales, implied_full, gs, bits, True)
+                    if took(t_ib) and took(t_full):
                         self.assert_bitwise_equal(y_ib, y_full)
             if not nax and bits in (4, 8):
-                _, t = run(x_all[:4], wq, scales, biases, gs, bits, "MLX_QMV_MMA")
-                self.assertTrue(any("qmv_mma" in n for n in t), t)
+                _, t = run(x_all[:4], wq, scales, biases, gs, bits, True)
+                self.assertTrue(took(t), t)
 
     @unittest.skipIf(not mx.metal.is_available(), "requires Metal")
     def test_qmm_splitk_fallthrough(self):

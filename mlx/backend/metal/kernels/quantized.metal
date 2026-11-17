@@ -136,8 +136,7 @@
   instantiate_quantized_quad(affine_qmv_quad, type, group_size, bits, 128, 1)  \
   instantiate_quantized_quad(affine_qmv_quad, type, group_size, bits, 128, 0)
 
-// vecs_per_tg (input-vector tile) 2..5, affine 2..8 (8 only under
-// MLX_QMV_WIDE_TILE8, gemma4-qat#1701); affine uses k_lanes=8
+// vecs_per_tg (input-vector tile) 2..5, affine 2..7; affine uses k_lanes=8
 // (more rows per simdgroup) where the fp path uses 16.
 #define instantiate_quantized_wide_wrap(name, type, group_size, bits, vecs_per_tg, k_lanes) \
   instantiate_quantized_wide(name, type, group_size, bits, vecs_per_tg, k_lanes, 0)         \
@@ -149,8 +148,7 @@
   instantiate_quantized_wide_wrap(affine_qmv_wide, type, group_size, bits, 4, 8) \
   instantiate_quantized_wide_wrap(affine_qmv_wide, type, group_size, bits, 5, 8) \
   instantiate_quantized_wide_wrap(affine_qmv_wide, type, group_size, bits, 6, 8) \
-  instantiate_quantized_wide_wrap(affine_qmv_wide, type, group_size, bits, 7, 8) \
-  instantiate_quantized_wide_wrap(affine_qmv_wide, type, group_size, bits, 8, 8)
+  instantiate_quantized_wide_wrap(affine_qmv_wide, type, group_size, bits, 7, 8)
 
 // Row-reuse affine qmv_wide (gemma4-qat#313): 2/4/8-bit only, vecs_per_tg
 // 2..5 (the host tiles rr at <= 5 vectors), no k_lanes tag (fixed 8 rows per
@@ -364,8 +362,6 @@
   instantiate_quantized_ib_wide(type, group_size, bits, 6, 8, 1)             \
   instantiate_quantized_ib_wide(type, group_size, bits, 7, 8, 0)             \
   instantiate_quantized_ib_wide(type, group_size, bits, 7, 8, 1)             \
-  instantiate_quantized_ib_wide(type, group_size, bits, 8, 8, 0)             \
-  instantiate_quantized_ib_wide(type, group_size, bits, 8, 8, 1)             \
   instantiate_quantized_ib_split_k(type, group_size, bits, 8)                \
   instantiate_quantized_ib_split_k(type, group_size, bits, 32)               \
   instantiate_quantized_ib_splitk_qmm(type, group_size, bits, true, false)   \

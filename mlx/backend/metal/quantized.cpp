@@ -765,20 +765,13 @@ inline bool use_qmv_wide_rr(
       !qmv_wide_rr_disabled();
 }
 
-// gemma4-qat#1701 measurement switches, both off by default and read on every
-// call so one process can A/B them: MLX_QMV_WIDE_TILE8=1 takes
-// ml-explore/mlx#4728's affine qmv_wide tiles of up to 8 vectors, and
-// MLX_QMV_MMA=1 takes ml-explore/mlx#4787's affine qmv_mma for 4-16 rows
-// (non-NAX GPUs only).
-inline bool env_flag_on(const char* name) {
-  const char* v = std::getenv(name);
-  return v != nullptr && std::string(v) == "1";
-}
-inline bool qmv_wide_tile8_enabled() {
-  return env_flag_on("MLX_QMV_WIDE_TILE8");
-}
+// MLX_QMV_MMA=1 takes ml-explore/mlx#4787's affine qmv_mma for 4-16 rows on a
+// GPU without NAX (use_qmv_mma below). Off by default; read on every call so one
+// process can A/B it (numen-tech/gemma4-qat#1701). Version: kQmvMmaVersion
+// (device.h).
 inline bool qmv_mma_enabled() {
-  return env_flag_on("MLX_QMV_MMA");
+  const char* v = std::getenv("MLX_QMV_MMA");
+  return v != nullptr && std::string(v) == "1";
 }
 
 // Dispatches qmv_wide (fp modes -> fp_qmv_wide, affine -> affine_qmv_wide):
@@ -811,12 +804,6 @@ void qmv_wide(
   constexpr int max_affine_single_tile = 7;
   if (mode == "affine" && !rr && M <= max_affine_single_tile) {
     vecs_per_tg = M;
-  }
-  // Measurement switch (gemma4-qat#1701): ml-explore/mlx#4728's rule for the
-  // affine kernel, tiles of up to 8 vectors (fewest tiles of at most 8).
-  if (mode == "affine" && !rr && qmv_wide_tile8_enabled()) {
-    n_tiles = (M + 7) / 8;
-    vecs_per_tg = (M + n_tiles - 1) / n_tiles;
   }
 
   // k_lanes: lanes reducing K per output row (32/k_lanes rows per simdgroup).
@@ -2483,8 +2470,8 @@ void dispatch_qmv(
       mode);
 }
 
-// ml-explore/mlx#4787's affine qmv_mma, carried for measurement only
-// (gemma4-qat#1701): taken under MLX_QMV_MMA=1 on a non-NAX GPU, for 4-16 rows
+// ml-explore/mlx#4787's affine qmv_mma (numen-tech/gemma4-qat#1701): taken
+// only under MLX_QMV_MMA=1, on a GPU without NAX, for 4-16 rows
 // (3-16 below gen 15) with upstream's non-NAX affine shape rule. Apple6 has no
 // simdgroup matrices, bias-free affine has no qmv_mma kernel, and qmv_nax
 // (the NAX half of ml-explore/mlx#4712) is not carried.
