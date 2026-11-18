@@ -2250,14 +2250,11 @@ class TestQuantized(mlx_tests.MLXTestCase):
         return w, scales, self.reference_bias(scales, factor), mx.array(factor, dtype)
 
     def assert_same_bits(self, a, b):
-        # Equal bit patterns, so the sign of a zero counts too. On a mismatch,
-        # assert_bitwise_equal reports the largest difference.
-        self.assertEqual(a.dtype, b.dtype)
-        self.assertEqual(a.shape, b.shape)
+        # assert_bitwise_equal, and the same bit patterns: the sign of a zero
+        # counts too.
+        self.assert_bitwise_equal(a, b)
         bits_t = mx.uint32 if a.dtype == mx.float32 else mx.uint16
-        if not mx.array_equal(a.view(bits_t), b.view(bits_t)).item():
-            self.assert_bitwise_equal(a, b)
-            self.fail("equal values, other bit patterns (the sign of a zero)")
+        self.assertTrue(mx.array_equal(a.view(bits_t), b.view(bits_t)).item())
 
     @staticmethod
     def traced(dev, fn):
@@ -2770,7 +2767,7 @@ class TestQuantized(mlx_tests.MLXTestCase):
                         gathers = [n for n in names if "_gather_q" in n]
                         self.assertEqual(len(gathers), 1, names)
                         self.assertIn(route, gathers[0])
-                        self.assertEqual(self.is_ib_kernel(gathers[0]), implied, names)
+                        self.assertEqual(gathers[0].endswith("_ib"), implied, names)
                         # The backend's own multiply, only on the replays that
                         # left the "_ib" routes.
                         self.assertEqual(
