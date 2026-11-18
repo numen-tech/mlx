@@ -5870,15 +5870,13 @@ array gather_qmm(
   std::optional<array> biases = biases_;
   if (is_implied_bias(biases_)) {
     auto stream = to_stream(s);
-    bool keep_factor = stream.device == Device::gpu && metal::is_available() &&
-        transpose && x.shape(-2) == 1 &&
+    // implied_bias_kernels_exact holds on the CPU too, hence the device test.
+    bool keep_factor = stream.device == Device::gpu && transpose &&
+        x.shape(-2) == 1 &&
         implied_bias_kernels_exact(scales, out_type, bits, stream);
-    if (keep_factor) {
-      // A constant, as on the materialized path: no gradient flows to it.
-      biases = stop_gradient(astype(*biases_, scales.dtype(), s), s);
-    } else {
-      biases = materialize_implied_bias(scales, *biases_, s);
-    }
+    // Kept or materialized, the factor is a constant: no gradient flows to it.
+    biases = keep_factor ? stop_gradient(astype(*biases_, scales.dtype(), s), s)
+                         : materialize_implied_bias(scales, *biases_, s);
   }
 
   // Extract indices and broadcast them

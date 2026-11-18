@@ -2249,17 +2249,40 @@ class TestQuantized(mlx_tests.MLXTestCase):
         ).astype(dtype)
         return w, scales, self.reference_bias(scales, factor), mx.array(factor, dtype)
 
-    def traced_gather_qmm(self, dev, *args, **kwargs):
-        # The result and the names of the gather kernels that served it (GPU).
+    def assert_same_bits(self, a, b):
+        # Equal bit patterns, so the sign of a zero counts too. On a mismatch,
+        # assert_bitwise_equal reports the largest difference.
+        self.assertEqual(a.dtype, b.dtype)
+        self.assertEqual(a.shape, b.shape)
+        bits_t = mx.uint32 if a.dtype == mx.float32 else mx.uint16
+        if not mx.array_equal(a.view(bits_t), b.view(bits_t)).item():
+            self.assert_bitwise_equal(a, b)
+            self.fail("equal values, other bit patterns (the sign of a zero)")
+
+    @staticmethod
+    def traced(dev, fn):
+        # fn()'s result, evaluated, and the names of the kernels that ran it
+        # (on the GPU; none elsewhere).
         tracing = dev == mx.gpu
         if tracing:
             mx.metal._kernel_trace_start()
         try:
-            y = mx.gather_qmm(*args, stream=dev, **kwargs)
+            y = fn()
             mx.eval(y)
         finally:
             names = mx.metal._kernel_trace_stop() if tracing else []
+        return y, names
+
+    def traced_gather_qmm(self, dev, *args, **kwargs):
+        # The result and the names of the gather kernels that served it (GPU).
+        y, names = self.traced(dev, lambda: mx.gather_qmm(*args, stream=dev, **kwargs))
         return y, [n for n in names if "_gather_q" in n]
+
+    @staticmethod
+    def is_ib_kernel(name):
+        # "_ib" ends the name, or comes before the sorted kernels' alignment
+        # constants.
+        return name.endswith("_ib") or "_ib_align_" in name
 
     def assert_gather_implied(
         self, dev, x, w, scales, full, f, route, implied_kernel, **kwargs
@@ -2269,10 +2292,7 @@ class TestQuantized(mlx_tests.MLXTestCase):
         # family, and its name ends "_ib" only where the op keeps the factor.
         y_ib, k_ib = self.traced_gather_qmm(dev, x, w, scales, f, **kwargs)
         y_full, k_full = self.traced_gather_qmm(dev, x, w, scales, full, **kwargs)
-        self.assert_bitwise_equal(y_ib, y_full)
-        # The same bit patterns, so the sign of a zero counts too.
-        bits_t = mx.uint32 if y_ib.dtype == mx.float32 else mx.uint16
-        self.assertTrue(mx.array_equal(y_ib.view(bits_t), y_full.view(bits_t)).item())
+        self.assert_same_bits(y_ib, y_full)
         if dev != mx.gpu:
             return
         self.assertEqual(len(k_ib), 1, k_ib)
@@ -2280,13 +2300,8 @@ class TestQuantized(mlx_tests.MLXTestCase):
         self.assertIn(route, k_ib[0])
         if route == "gather_qmv_":
             self.assertNotIn("gather_qmv_fast", k_ib[0])
-
-        # The sorted kernels' names end with their alignment constants.
-        def implied(name):
-            return name.endswith("_ib") or "_ib_align_" in name
-
-        self.assertFalse(implied(k_full[0]), k_full)
-        self.assertEqual(implied(k_ib[0]), implied_kernel, k_ib)
+        self.assertFalse(self.is_ib_kernel(k_full[0]), k_full)
+        self.assertEqual(self.is_ib_kernel(k_ib[0]), implied_kernel, k_ib)
         self.assertEqual(k_ib[0].replace("_ib", ""), k_full[0])
 
     @staticmethod
@@ -2313,19 +2328,20 @@ class TestQuantized(mlx_tests.MLXTestCase):
                 rng.standard_normal((L, 1, 1, K)).astype(np.float32) / K**0.5
             ).astype(dtype)
 
-        def experts(L, top_k, E):
-            return mx.array(rng.integers(0, E, (L, top_k)).astype(np.uint32))
-
-        def check(x, idx, w, scales, full, f, gs, bits, sort, route, **extra):
+        def check(wts, L, sort, route, top_k=8, gs=32, bits=4):
+            # wts: (w, scales, explicit bias, factor), as gather_implied_weights
+            # returns them. L tokens of top_k random experts each, in the
+            # scales' dtype; K and the expert count are read off w.
+            w, scales = wts[:2]
+            K, E = w.shape[-1] * 32 // bits, w.shape[0]
+            x = tokens(L, K, scales.dtype)
+            idx = mx.array(rng.integers(0, E, (L, top_k)).astype(np.uint32))
             if sort:
                 x, idx = self.gather_sorted(x, idx)
             self.assert_gather_implied(
                 dev,
                 x,
-                w,
-                scales,
-                full,
-                f,
+                *wts,
                 route,
                 True,
                 rhs_indices=idx,
@@ -2333,7 +2349,6 @@ class TestQuantized(mlx_tests.MLXTestCase):
                 group_size=gs,
                 bits=bits,
                 sorted_indices=sort,
-                **extra,
             )
 
         # The 26B expert shapes at 4-bit, group size 32, fp16: gate/up
@@ -2346,10 +2361,7 @@ class TestQuantized(mlx_tests.MLXTestCase):
             (704, 2816, "gather_qmv_"),
             (2816, 708, "gather_qmv_"),  # N % 8 != 0, and a ragged rhs column tile
         ]:
-            E, top_k = 8, 8
-            w, scales, full, f = self.gather_implied_weights(
-                rng, mx.float16, 4, 32, -8.0, E, N, K
-            )
+            wts = self.gather_implied_weights(rng, mx.float16, 4, 32, -8.0, 8, N, K)
             for L, sort, route in [
                 (1, False, qmv),  # decode
                 (3, False, qmv),  # verify widths
@@ -2361,43 +2373,18 @@ class TestQuantized(mlx_tests.MLXTestCase):
                 (133, True, "gather_qmm_rhs"),
             ]:
                 with self.subTest(K=K, N=N, L=L, sort=sort):
-                    check(
-                        tokens(L, K, mx.float16),
-                        experts(L, top_k, E),
-                        w,
-                        scales,
-                        full,
-                        f,
-                        32,
-                        4,
-                        sort,
-                        route,
-                    )
+                    check(wts, L, sort, route)
 
         # 128 experts, top-8: sorted rows take gather_qmm_rhs from 64 tokens.
-        E, top_k, K, N = 128, 8, 512, 64
-        w, scales, full, f = self.gather_implied_weights(
-            rng, mx.float16, 4, 32, -8.0, E, N, K
-        )
+        wts = self.gather_implied_weights(rng, mx.float16, 4, 32, -8.0, 128, 64, 512)
         for L, route in [
             (8, "gather_qmv_fast"),
             (63, "gather_qmv_fast"),
             (64, "gather_qmm_rhs"),
             (67, "gather_qmm_rhs"),
         ]:
-            with self.subTest(E=E, L=L):
-                check(
-                    tokens(L, K, mx.float16),
-                    experts(L, top_k, E),
-                    w,
-                    scales,
-                    full,
-                    f,
-                    32,
-                    4,
-                    True,
-                    route,
-                )
+            with self.subTest(E=128, L=L):
+                check(wts, L, True, route)
 
         # Experts sliced out of a larger stack (non-zero buffer offsets), and
         # lhs_indices picking the rows.
@@ -2406,23 +2393,11 @@ class TestQuantized(mlx_tests.MLXTestCase):
         )
         for sort, L, route in [(False, 3, "gather_qmv_fast"), (True, 16, "rhs")]:
             with self.subTest(sliced=True, sort=sort):
-                check(
-                    tokens(L, 512, mx.float16),
-                    experts(L, 8, 8),
-                    w[1:],
-                    scales[1:],
-                    full[1:],
-                    f,
-                    32,
-                    4,
-                    sort,
-                    route,
-                )
+                check((w[1:], scales[1:], full[1:], f), L, sort, route)
         with self.subTest(lhs=True):
-            x = tokens(3, 512, mx.float16).squeeze(1)
             self.assert_gather_implied(
                 dev,
-                x,
+                tokens(3, 512, mx.float16).squeeze(1),
                 w,
                 scales,
                 full,
@@ -2439,53 +2414,26 @@ class TestQuantized(mlx_tests.MLXTestCase):
         # Scales and weights in every layout the kernels take without a copy:
         # gather_qmv reads them through their strides, the sorted kernel
         # copies what is not row contiguous.
-        for name, wl, sl, full_l, f_l in self.gather_layouts(
-            rng, mx.float16, 4, 32, -8.0, 4, 64, 512
-        ):
-            if wl.ndim == 4:
+        for name, *wts in self.gather_layouts(rng, mx.float16, 4, 32, -8.0, 4, 64, 512):
+            if wts[0].ndim == 4:
                 continue  # rhs_indices over a 2-d expert grid: the replay test
             for L, sort, route in [(3, False, "gather_qmv_fast"), (16, True, "rhs")]:
                 with self.subTest(layout=name, sort=sort):
-                    check(
-                        tokens(L, 512, mx.float16),
-                        experts(L, 2, 4),
-                        wl,
-                        sl,
-                        full_l,
-                        f_l,
-                        32,
-                        4,
-                        sort,
-                        route,
-                    )
+                    check(wts, L, sort, route, top_k=2)
 
         # The other formats and dtypes with a prebuilt "_ib" kernel.
         for dtype, (bits, gs, factor) in product(
             self.IMPLIED_BIAS_DTYPES,
             self.IMPLIED_BIAS_CASES + [(4, 32, -8.0), (4, 128, -8.0)],
         ):
-            E, top_k, K, N = 4, 2, 1024, 72
-            w, scales, full, f = self.gather_implied_weights(
-                rng, dtype, bits, gs, factor, E, N, K
-            )
+            wts = self.gather_implied_weights(rng, dtype, bits, gs, factor, 4, 72, 1024)
             for L, sort, route in [
                 (3, False, "gather_qmv_fast"),
                 (8, True, "gather_qmm_rhs"),
                 (37, True, "gather_qmm_rhs"),
             ]:
                 with self.subTest(dtype=dtype, bits=bits, gs=gs, L=L, sort=sort):
-                    check(
-                        tokens(L, K, dtype),
-                        experts(L, top_k, E),
-                        w,
-                        scales,
-                        full,
-                        f,
-                        gs,
-                        bits,
-                        sort,
-                        route,
-                    )
+                    check(wts, L, sort, route, top_k=2, gs=gs, bits=bits)
 
         # A lattice export stores a block whose largest code is +2^(bits-1)
         # steps with a negative scale (and a positive bias), and an all-zero
@@ -2496,9 +2444,8 @@ class TestQuantized(mlx_tests.MLXTestCase):
                 (2816, 704, "gather_qmv_fast"),
                 (704, 2816, "gather_qmv_"),
             ]:
-                E, top_k = 8, 8
                 w, scales, _, f = self.gather_implied_weights(
-                    rng, dtype, 4, 32, -8.0, E, N, K
+                    rng, dtype, 4, 32, -8.0, 8, N, K
                 )
                 s = np.array(scales.astype(mx.float32))
                 s *= rng.choice([-1.0, 1.0], s.shape).astype(np.float32)
@@ -2526,28 +2473,15 @@ class TestQuantized(mlx_tests.MLXTestCase):
                     (67, True, "gather_qmm_rhs"),
                 ]:
                     with self.subTest(signed=True, dtype=dtype, K=K, L=L, sort=sort):
-                        check(
-                            tokens(L, K, dtype),
-                            experts(L, top_k, E),
-                            w,
-                            scales,
-                            full,
-                            f,
-                            32,
-                            4,
-                            sort,
-                            route,
-                        )
+                        check((w, scales, full, f), L, sort, route)
 
         # A factor that is no power of two: T(f) and the product both round,
         # so a kernel that ignored the factor it was given, or formed the
         # product in another type, would not reproduce `scales * T(f)`.
         for dtype, factor in product(self.IMPLIED_BIAS_DTYPES, [-5.3, 0.7]):
             for K, N, qmv in [(2816, 72, "gather_qmv_fast"), (704, 72, "gather_qmv_")]:
-                E, top_k = 4, 2
-                w, scales, full, f = self.gather_implied_weights(
-                    rng, dtype, 4, 32, factor, E, N, K
-                )
+                wts = self.gather_implied_weights(rng, dtype, 4, 32, factor, 4, N, K)
+                _, scales, full, _ = wts
                 self.assertFalse(
                     mx.array_equal(full, self.reference_bias(scales, -8.0)).item()
                 )
@@ -2557,18 +2491,7 @@ class TestQuantized(mlx_tests.MLXTestCase):
                     (37, True, "gather_qmm_rhs"),
                 ]:
                     with self.subTest(dtype=dtype, factor=factor, K=K, L=L):
-                        check(
-                            tokens(L, K, dtype),
-                            experts(L, top_k, E),
-                            w,
-                            scales,
-                            full,
-                            f,
-                            32,
-                            4,
-                            sort,
-                            route,
-                        )
+                        check(wts, L, sort, route, top_k=2)
 
         # Subnormal fp16 scales: the product must round through fp16.
         w, scales, full, f = self.gather_implied_weights(
@@ -2582,18 +2505,7 @@ class TestQuantized(mlx_tests.MLXTestCase):
         full = scales * f
         for L, sort, route in [(3, False, "gather_qmv"), (8, True, "gather_qmm_rhs")]:
             with self.subTest(subnormal=True, sort=sort):
-                check(
-                    tokens(L, 512, mx.float16),
-                    experts(L, 2, 4),
-                    w,
-                    scales,
-                    full,
-                    f,
-                    64,
-                    2,
-                    sort,
-                    route,
-                )
+                check((w, scales, full, f), L, sort, route, top_k=2, gs=64, bits=2)
 
     def test_implied_bias_gather_qmm(self):
         # Every gather route without an implied-bias kernel still gets a
@@ -2691,37 +2603,24 @@ class TestQuantized(mlx_tests.MLXTestCase):
                     with self.subTest(
                         dev=dev, x_dtype=x_dtype, s_dtype=s_dtype, bits=bits, L=L
                     ):
-                        self.assert_gather_implied(
-                            dev,
-                            xv,
-                            w,
-                            scales,
-                            full,
-                            f,
-                            "gather_q",
-                            False,
-                            rhs_indices=idx,
-                            transpose=True,
-                            group_size=32,
-                            bits=bits,
-                            sorted_indices=sort,
-                        )
-                        # A float32 factor is cast to the scales' dtype.
-                        self.assert_gather_implied(
-                            dev,
-                            xv,
-                            w,
-                            scales,
-                            full,
-                            mx.array(factor),
-                            "gather_q",
-                            False,
-                            rhs_indices=idx,
-                            transpose=True,
-                            group_size=32,
-                            bits=bits,
-                            sorted_indices=sort,
-                        )
+                        # The factor in the scales' dtype, and a float32 one,
+                        # which is cast to it.
+                        for fac in (f, mx.array(factor)):
+                            self.assert_gather_implied(
+                                dev,
+                                xv,
+                                w,
+                                scales,
+                                full,
+                                fac,
+                                "gather_q",
+                                False,
+                                rhs_indices=idx,
+                                transpose=True,
+                                group_size=32,
+                                bits=bits,
+                                sorted_indices=sort,
+                            )
 
     def test_implied_bias_gather_grad(self):
         # The reverse products of a gather_qmm that keeps the factor equal
@@ -2796,8 +2695,7 @@ class TestQuantized(mlx_tests.MLXTestCase):
         # (each matrix contiguous): contiguous, every other expert of a larger
         # stack (strided), a 2-d expert grid with its axes swapped (permuted
         # strides), and one expert's scales broadcast over all (zero stride).
-        # Each layout: name, w, scales, the explicit bias, the factor, and the
-        # shape rhs_indices index into.
+        # Each layout: name, w, scales, the explicit bias and the factor.
         w, scales, _, f = self.gather_implied_weights(
             rng, dtype, bits, gs, factor, 2 * E, N, K
         )
@@ -2864,28 +2762,15 @@ class TestQuantized(mlx_tests.MLXTestCase):
                         rng.standard_normal((2, M, K)).astype(np.float32) / K**0.5
                     ).astype(mx.float16)
                     mx.eval(x)
-                    tracing = dev == mx.gpu
-                    if tracing:
-                        mx.metal._kernel_trace_start()
-                    try:
-                        y = compiled(x)
-                        mx.eval(y)
-                    finally:
-                        names = mx.metal._kernel_trace_stop() if tracing else []
+                    y, names = self.traced(dev, lambda: compiled(x))
                     with self.subTest(dev=dev, layout=name, M=M, grid=grid):
-                        want = gather(x, full)
-                        self.assert_bitwise_equal(y, want)
-                        self.assertTrue(
-                            mx.array_equal(
-                                y.view(mx.uint16), want.view(mx.uint16)
-                            ).item()
-                        )
-                        if not tracing:
+                        self.assert_same_bits(y, gather(x, full))
+                        if dev != mx.gpu:
                             continue
                         gathers = [n for n in names if "_gather_q" in n]
                         self.assertEqual(len(gathers), 1, names)
                         self.assertIn(route, gathers[0])
-                        self.assertEqual(gathers[0].endswith("_ib"), implied, names)
+                        self.assertEqual(self.is_ib_kernel(gathers[0]), implied, names)
                         # The backend's own multiply, only on the replays that
                         # left the "_ib" routes.
                         self.assertEqual(

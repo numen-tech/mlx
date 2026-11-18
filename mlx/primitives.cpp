@@ -3836,7 +3836,7 @@ std::vector<array> GatherQMM::vjp(
   // gradients are those of the graph that materializes it (ops.cpp
   // gather_qmm): the factor is a constant, and the scales take f times the
   // bias gradient on top of their own.
-  bool implied = biases.has_value() && is_implied_bias(*biases);
+  bool implied = is_implied_bias(biases);
 
   int M = cotan.shape(-2);
   int K = x.shape(-1);

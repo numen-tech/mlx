@@ -28,16 +28,30 @@ FACTOR = -float(2 ** (BITS - 1))
 DTYPE = mx.float16
 
 
-def make_weights(rng, E, N, K, bits=BITS, gs=GS, dtype=DTYPE):
+def make_weights(rng, E, N, K):
     w = mx.array(
-        rng.integers(0, 2**32, (E, N, K * bits // 32), dtype=np.uint64).astype(
+        rng.integers(0, 2**32, (E, N, K * BITS // 32), dtype=np.uint64).astype(
             np.uint32
         )
     )
-    scales = mx.array(rng.uniform(0.002, 0.02, (E, N, K // gs))).astype(dtype)
-    biases = scales * mx.array(FACTOR, dtype)
+    scales = mx.array(rng.uniform(0.002, 0.02, (E, N, K // GS))).astype(DTYPE)
+    biases = scales * mx.array(FACTOR, DTYPE)
     mx.eval(w, scales, biases)
     return w, scales, biases
+
+
+def gqmm(x, w, scales, b, idx, transpose=True, sorted_indices=False):
+    return mx.gather_qmm(
+        x,
+        w,
+        scales,
+        b,
+        rhs_indices=idx,
+        transpose=transpose,
+        group_size=GS,
+        bits=BITS,
+        sorted_indices=sorted_indices,
+    )
 
 
 def gather_sort(x, indices):
@@ -98,17 +112,7 @@ def main():
             mx.eval(x, idx)
 
             def run(b):
-                return mx.gather_qmm(
-                    x,
-                    w,
-                    scales,
-                    b,
-                    rhs_indices=idx,
-                    transpose=True,
-                    group_size=GS,
-                    bits=BITS,
-                    sorted_indices=do_sort,
-                )
+                return gqmm(x, w, scales, b, idx, sorted_indices=do_sort)
 
             y_full, _ = trace(lambda: run(biases))
             y_ib, names = trace(lambda: run(f))
@@ -137,30 +141,9 @@ def main():
     w, scales, biases = make_weights(rng, 4, 512, 512)
     x = mx.array(rng.standard_normal((4, 64, 512)) / 512**0.5).astype(DTYPE)
     idx = mx.array([3, 0, 2, 2], mx.uint32)
-    saved["matrix"] = np.array(
-        mx.gather_qmm(
-            x,
-            w,
-            scales,
-            biases,
-            rhs_indices=idx,
-            transpose=True,
-            group_size=GS,
-            bits=BITS,
-        ).view(mx.uint16)
-    )
-    saved["qvm"] = np.array(
-        mx.gather_qmm(
-            x[:, :1],
-            w,
-            scales,
-            biases,
-            rhs_indices=idx,
-            transpose=False,
-            group_size=GS,
-            bits=BITS,
-        ).view(mx.uint16)
-    )
+    for name, xs, transpose in [("matrix", x, True), ("qvm", x[:, :1], False)]:
+        y = gqmm(xs, w, scales, biases, idx, transpose)
+        saved[name] = np.array(y.view(mx.uint16))
     if ref is not None:
         for name in ("matrix", "qvm"):
             assert np.array_equal(ref[name], saved[name]), name
