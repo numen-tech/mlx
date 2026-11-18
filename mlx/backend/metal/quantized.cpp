@@ -2777,8 +2777,14 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
   // never saw (a shapeless compile). No kernel below would read the factor
   // correctly, so form the bias the op would have: scales * f, in their dtype.
   if (is_implied_bias(biases) && !(transpose_ && M == 1)) {
+    // The factor as a zero-stride view of the scales' shape: the scales can
+    // be strided across matrices (each matrix is contiguous, so they were
+    // not copied above), which takes the binary op's general path, and that
+    // path reads every operand's strides at the scales' rank.
+    array factor(scales.shape(), scales.dtype(), nullptr, {});
+    broadcast(*biases, factor);
     array full_biases(scales.shape(), scales.dtype(), nullptr, {});
-    binary_op_gpu({scales, *biases}, full_biases, "Multiply", s);
+    binary_op_gpu({scales, factor}, full_biases, "Multiply", s);
     metal::get_command_encoder(s).add_temporary(full_biases);
     biases = std::move(full_biases);
   }
