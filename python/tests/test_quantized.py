@@ -2236,36 +2236,543 @@ class TestQuantized(mlx_tests.MLXTestCase):
                 e_ib = mx.dequantize(w_q[idx], scales[idx], f, gs, bits, stream=dev)
                 self.assert_bitwise_equal(e_ib, e_full)
 
+    def gather_implied_weights(self, rng, dtype, bits, gs, factor, E, N, K):
+        # Random codes and scales: what a lattice export holds, with the
+        # explicit bias `scales * T(f)` and the 0-d factor that stands for it.
+        w = mx.array(
+            rng.integers(0, 2**32, (E, N, K * bits // 32), dtype=np.uint64).astype(
+                np.uint32
+            )
+        )
+        scales = mx.array(
+            rng.uniform(0.01, 1.0, (E, N, K // gs)).astype(np.float32)
+        ).astype(dtype)
+        return w, scales, self.reference_bias(scales, factor), mx.array(factor, dtype)
+
+    def assert_same_bits(self, a, b):
+        # assert_bitwise_equal, and the same bit patterns: the sign of a zero
+        # counts too.
+        self.assert_bitwise_equal(a, b)
+        bits_t = mx.uint32 if a.dtype == mx.float32 else mx.uint16
+        self.assertTrue(mx.array_equal(a.view(bits_t), b.view(bits_t)).item())
+
+    @staticmethod
+    def traced(dev, fn):
+        # fn()'s result, evaluated, and the names of the kernels that ran it
+        # (on the GPU; none elsewhere).
+        tracing = dev == mx.gpu
+        if tracing:
+            mx.metal._kernel_trace_start()
+        try:
+            y = fn()
+            mx.eval(y)
+        finally:
+            names = mx.metal._kernel_trace_stop() if tracing else []
+        return y, names
+
+    def traced_gather_qmm(self, dev, *args, **kwargs):
+        # The result and the names of the gather kernels that served it (GPU).
+        y, names = self.traced(dev, lambda: mx.gather_qmm(*args, stream=dev, **kwargs))
+        return y, [n for n in names if "_gather_q" in n]
+
+    @staticmethod
+    def is_ib_kernel(name):
+        # "_ib" ends the name, or comes before the sorted kernels' alignment
+        # constants.
+        return name.endswith("_ib") or "_ib_align_" in name
+
+    def assert_gather_implied(
+        self, dev, x, w, scales, full, f, route, implied_kernel, **kwargs
+    ):
+        # The factor must reproduce the explicit bias bit for bit. On the GPU
+        # the trace proves which kernel did it: `route` names the kernel
+        # family, and its name ends "_ib" only where the op keeps the factor.
+        y_ib, k_ib = self.traced_gather_qmm(dev, x, w, scales, f, **kwargs)
+        y_full, k_full = self.traced_gather_qmm(dev, x, w, scales, full, **kwargs)
+        self.assert_same_bits(y_ib, y_full)
+        if dev != mx.gpu:
+            return
+        self.assertEqual(len(k_ib), 1, k_ib)
+        self.assertEqual(len(k_full), 1, k_full)
+        self.assertIn(route, k_ib[0])
+        if route == "gather_qmv_":
+            self.assertNotIn("gather_qmv_fast", k_ib[0])
+        self.assertFalse(self.is_ib_kernel(k_full[0]), k_full)
+        self.assertEqual(self.is_ib_kernel(k_ib[0]), implied_kernel, k_ib)
+        self.assertEqual(k_ib[0].replace("_ib", ""), k_full[0])
+
+    @staticmethod
+    def gather_sorted(x, indices):
+        # mlx-lm's _gather_sort: one row per (token, expert), experts in order.
+        m = indices.shape[-1]
+        indices = indices.flatten()
+        order = mx.argsort(indices)
+        return x.flatten(0, -3)[order // m], indices[order]
+
+    @unittest.skipIf(not mx.metal.is_available(), "requires Metal")
+    def test_implied_bias_gather_routes(self):
+        # numen-tech/gemma4-qat#1833: with one row per matrix, transposed, on
+        # the GPU and with unpromoted scales (what mlx-lm's SwitchGLU presents
+        # for MoE experts) the op keeps the 0-d factor and the gather_qmv,
+        # gather_qmv_fast and sorted gather_qmm_rhs kernels form the bias.
+        if mx.default_device() != mx.gpu:
+            self.skipTest("requires the GPU")
+        rng = np.random.default_rng(1833)
+        dev = mx.gpu
+
+        def tokens(L, K, dtype):
+            return mx.array(
+                rng.standard_normal((L, 1, 1, K)).astype(np.float32) / K**0.5
+            ).astype(dtype)
+
+        def check(wts, L, sort, route, top_k=8, gs=32, bits=4):
+            # wts: (w, scales, explicit bias, factor), as gather_implied_weights
+            # returns them. L tokens of top_k random experts each, in the
+            # scales' dtype; K and the expert count are read off w.
+            w, scales = wts[:2]
+            K, E = w.shape[-1] * 32 // bits, w.shape[0]
+            x = tokens(L, K, scales.dtype)
+            idx = mx.array(rng.integers(0, E, (L, top_k)).astype(np.uint32))
+            if sort:
+                x, idx = self.gather_sorted(x, idx)
+            self.assert_gather_implied(
+                dev,
+                x,
+                *wts,
+                route,
+                True,
+                rhs_indices=idx,
+                transpose=True,
+                group_size=gs,
+                bits=bits,
+                sorted_indices=sort,
+            )
+
+        # The 26B expert shapes at 4-bit, group size 32, fp16: gate/up
+        # (K % 256 == 0: gather_qmv_fast) and down (gather_qmv). Rows are
+        # tokens x top-k. Unsorted, or sorted below B >= 16 and B / E >= 4,
+        # takes gather_qmv; sorted above it gather_qmm_rhs (with a ragged
+        # last row tile at 1064 rows).
+        for K, N, qmv in [
+            (2816, 704, "gather_qmv_fast"),
+            (704, 2816, "gather_qmv_"),
+            (2816, 708, "gather_qmv_"),  # N % 8 != 0, and a ragged rhs column tile
+        ]:
+            wts = self.gather_implied_weights(rng, mx.float16, 4, 32, -8.0, 8, N, K)
+            for L, sort, route in [
+                (1, False, qmv),  # decode
+                (3, False, qmv),  # verify widths
+                (5, False, qmv),
+                (1, True, qmv),  # sorted, B < 16
+                (3, True, qmv),  # sorted, B / E < 4
+                (8, True, "gather_qmm_rhs"),  # prefill widths
+                (64, True, "gather_qmm_rhs"),
+                (133, True, "gather_qmm_rhs"),
+            ]:
+                with self.subTest(K=K, N=N, L=L, sort=sort):
+                    check(wts, L, sort, route)
+
+        # 128 experts, top-8: sorted rows take gather_qmm_rhs from 64 tokens.
+        wts = self.gather_implied_weights(rng, mx.float16, 4, 32, -8.0, 128, 64, 512)
+        for L, route in [
+            (8, "gather_qmv_fast"),
+            (63, "gather_qmv_fast"),
+            (64, "gather_qmm_rhs"),
+            (67, "gather_qmm_rhs"),
+        ]:
+            with self.subTest(E=128, L=L):
+                check(wts, L, True, route)
+
+        # Experts sliced out of a larger stack (non-zero buffer offsets), and
+        # lhs_indices picking the rows.
+        w, scales, full, f = self.gather_implied_weights(
+            rng, mx.float16, 4, 32, -8.0, 9, 64, 512
+        )
+        for sort, L, route in [(False, 3, "gather_qmv_fast"), (True, 16, "rhs")]:
+            with self.subTest(sliced=True, sort=sort):
+                check((w[1:], scales[1:], full[1:], f), L, sort, route)
+        with self.subTest(lhs=True):
+            self.assert_gather_implied(
+                dev,
+                tokens(3, 512, mx.float16).squeeze(1),
+                w,
+                scales,
+                full,
+                f,
+                "gather_qmv_fast",
+                True,
+                lhs_indices=mx.array([2, 0, 1, 1, 2], mx.uint32),
+                rhs_indices=mx.array([8, 3, 3, 0, 5], mx.uint32),
+                transpose=True,
+                group_size=32,
+                bits=4,
+            )
+
+        # Scales and weights in every layout the kernels take without a copy:
+        # gather_qmv reads them through their strides, the sorted kernel
+        # copies what is not row contiguous.
+        for name, *wts in self.gather_layouts(rng, mx.float16, 4, 32, -8.0, 4, 64, 512):
+            if wts[0].ndim == 4:
+                continue  # rhs_indices over a 2-d expert grid: the replay test
+            for L, sort, route in [(3, False, "gather_qmv_fast"), (16, True, "rhs")]:
+                with self.subTest(layout=name, sort=sort):
+                    check(wts, L, sort, route, top_k=2)
+
+        # The other formats and dtypes with a prebuilt "_ib" kernel.
+        for dtype, (bits, gs, factor) in product(
+            self.IMPLIED_BIAS_DTYPES,
+            self.IMPLIED_BIAS_CASES + [(4, 32, -8.0), (4, 128, -8.0)],
+        ):
+            wts = self.gather_implied_weights(rng, dtype, bits, gs, factor, 4, 72, 1024)
+            for L, sort, route in [
+                (3, False, "gather_qmv_fast"),
+                (8, True, "gather_qmm_rhs"),
+                (37, True, "gather_qmm_rhs"),
+            ]:
+                with self.subTest(dtype=dtype, bits=bits, gs=gs, L=L, sort=sort):
+                    check(wts, L, sort, route, top_k=2, gs=gs, bits=bits)
+
+        # A lattice export stores a block whose largest code is +2^(bits-1)
+        # steps with a negative scale (and a positive bias), and an all-zero
+        # block may hold a -0.0 scale, whose bias is +0.0: no kernel may
+        # assume scales > 0. Mixed signs, both zeros and whole zero rows.
+        for dtype in [mx.float16, mx.bfloat16, mx.float32]:
+            for K, N, qmv in [
+                (2816, 704, "gather_qmv_fast"),
+                (704, 2816, "gather_qmv_"),
+            ]:
+                w, scales, _, f = self.gather_implied_weights(
+                    rng, dtype, 4, 32, -8.0, 8, N, K
+                )
+                s = np.array(scales.astype(mx.float32))
+                s *= rng.choice([-1.0, 1.0], s.shape).astype(np.float32)
+                flat = s.reshape(-1)
+                zeros = rng.choice(flat.size, 400, replace=False)
+                flat[zeros[:200]] = -0.0
+                flat[zeros[200:]] = 0.0
+                s[0, 0] = -0.0
+                s[1, 1] = 0.0
+                scales = mx.array(s).astype(dtype)
+                full = self.reference_bias(scales, -8.0)
+                neg_zero = mx.array(np.signbit(s) & (s == 0))
+                # -8 * -0.0 is +0.0: the explicit bias of a -0.0 scale.
+                self.assertFalse(
+                    mx.any(
+                        mx.array(np.signbit(np.array(full.astype(mx.float32))))
+                        & neg_zero
+                    ).item()
+                )
+                for L, sort, route in [
+                    (1, False, qmv),
+                    (5, False, qmv),
+                    (3, True, qmv),
+                    (8, True, "gather_qmm_rhs"),
+                    (67, True, "gather_qmm_rhs"),
+                ]:
+                    with self.subTest(signed=True, dtype=dtype, K=K, L=L, sort=sort):
+                        check((w, scales, full, f), L, sort, route)
+
+        # A factor that is no power of two: T(f) and the product both round,
+        # so a kernel that ignored the factor it was given, or formed the
+        # product in another type, would not reproduce `scales * T(f)`.
+        for dtype, factor in product(self.IMPLIED_BIAS_DTYPES, [-5.3, 0.7]):
+            for K, N, qmv in [(2816, 72, "gather_qmv_fast"), (704, 72, "gather_qmv_")]:
+                wts = self.gather_implied_weights(rng, dtype, 4, 32, factor, 4, N, K)
+                _, scales, full, _ = wts
+                self.assertFalse(
+                    mx.array_equal(full, self.reference_bias(scales, -8.0)).item()
+                )
+                for L, sort, route in [
+                    (3, False, qmv),
+                    (8, True, "gather_qmm_rhs"),
+                    (37, True, "gather_qmm_rhs"),
+                ]:
+                    with self.subTest(dtype=dtype, factor=factor, K=K, L=L):
+                        check(wts, L, sort, route, top_k=2)
+
+        # Subnormal fp16 scales: the product must round through fp16.
+        w, scales, full, f = self.gather_implied_weights(
+            rng, mx.float16, 2, 64, -1.0, 4, 72, 512
+        )
+        s = np.array(scales)
+        pick = rng.choice(s.size, 200, replace=False)
+        s.flat[pick] = (rng.integers(1, 1024, 200) * 2.0**-24).astype(np.float16)
+        scales = mx.array(s)
+        f = mx.array(-0.5, mx.float16)
+        full = scales * f
+        for L, sort, route in [(3, False, "gather_qmv"), (8, True, "gather_qmm_rhs")]:
+            with self.subTest(subnormal=True, sort=sort):
+                check((w, scales, full, f), L, sort, route, top_k=2, gs=64, bits=2)
+
     def test_implied_bias_gather_qmm(self):
-        # gather_qmm has no implied-bias kernels: the op materializes the bias,
-        # so the result equals the per-group-bias call bit for bit.
-        key = mx.random.key(7)
-        k1, k2 = mx.random.split(key)
+        # Every gather route without an implied-bias kernel still gets a
+        # materialized bias from the op: the matrix gather_qmm, gather_qvm,
+        # the non-transposed sorted kernel, more than one row per matrix,
+        # promoted scales, a bit width with no prebuilt "_ib" kernel, and the
+        # CPU. The result equals the per-group-bias call bit for bit and no
+        # "_ib" kernel runs.
+        rng = np.random.default_rng(7)
         lhs = mx.array([0, 1, 1])
         rhs = mx.array([1, 0, 1])
         for dev, dtype, (bits, gs, factor) in product(
             self.implied_bias_devices(),
             self.IMPLIED_BIAS_DTYPES,
-            self.IMPLIED_BIAS_CASES,
+            self.IMPLIED_BIAS_CASES + [(4, 32, -8.0)],
         ):
-            with self.subTest(dev=dev, dtype=dtype, bits=bits, gs=gs):
-                x = mx.random.normal(shape=(2, 3, 512), key=k1).astype(dtype)
-                w = mx.random.normal(shape=(2, 64, 512), key=k2).astype(dtype)
-                w_q, scales, _ = mx.quantize(w, gs, bits)
-                full = self.reference_bias(scales, factor)
-                f = mx.array(factor, dtype)
-                self.assert_implied_bias_matches(
-                    mx.gather_qmm,
-                    (x, w_q, scales),
-                    full,
-                    f,
-                    lhs,
-                    rhs,
-                    True,
-                    gs,
-                    bits,
-                    stream=dev,
+            E, N, K = 2, 64, 512
+            w, scales, full, f = self.gather_implied_weights(
+                rng, dtype, bits, gs, factor, E, N, K
+            )
+
+            def x(*shape):
+                return mx.array(
+                    rng.standard_normal(shape).astype(np.float32) / shape[-1] ** 0.5
+                ).astype(dtype)
+
+            sorted_rhs = mx.array(np.sort(rng.integers(0, E, 64)).astype(np.uint32))
+            cases = [
+                # name, x, kwargs, kernel family
+                (
+                    "rows_3",
+                    x(2, 3, K),
+                    dict(lhs_indices=lhs, rhs_indices=rhs, transpose=True),
+                    "gather_qmv",
+                ),
+                (
+                    "matrix",
+                    x(2, 64, K),
+                    dict(lhs_indices=lhs, rhs_indices=rhs, transpose=True),
+                    "gather_qmm_t",
+                ),
+                (
+                    "matrix_n",
+                    x(2, 64, N),
+                    dict(lhs_indices=lhs, rhs_indices=rhs, transpose=False),
+                    "gather_qmm_n",
+                ),
+                (
+                    "qvm",
+                    x(2, 1, N),
+                    dict(lhs_indices=lhs, rhs_indices=rhs, transpose=False),
+                    "gather_qvm",
+                ),
+                (
+                    "sorted_n",
+                    x(64, 1, N),
+                    dict(rhs_indices=sorted_rhs, transpose=False, sorted_indices=True),
+                    "gather_qmm_rhs",
+                ),
+            ]
+            for name, xv, kwargs, route in cases:
+                with self.subTest(dev=dev, dtype=dtype, bits=bits, gs=gs, case=name):
+                    self.assert_gather_implied(
+                        dev,
+                        xv,
+                        w,
+                        scales,
+                        full,
+                        f,
+                        route,
+                        False,
+                        group_size=gs,
+                        bits=bits,
+                        **kwargs,
+                    )
+
+        # One row per matrix, transposed: the factor is kept on the GPU only
+        # with unpromoted scales and a prebuilt width.
+        for dev in self.implied_bias_devices():
+            for x_dtype, s_dtype, bits in [
+                (mx.float32, mx.float16, 4),
+                (mx.float32, mx.bfloat16, 4),
+                (mx.float16, mx.float16, 3),
+                (mx.float16, mx.float16, 6),
+            ]:
+                factor = -float(2 ** (bits - 1))
+                w, scales, full, f = self.gather_implied_weights(
+                    rng, s_dtype, bits, 32, factor, 4, 64, 512
                 )
+                for L, sort in [(3, False), (32, True)]:
+                    xv = mx.array(
+                        rng.standard_normal((L, 1, 512)).astype(np.float32) / 16
+                    ).astype(x_dtype)
+                    idx = mx.array(np.sort(rng.integers(0, 4, L)).astype(np.uint32))
+                    with self.subTest(
+                        dev=dev, x_dtype=x_dtype, s_dtype=s_dtype, bits=bits, L=L
+                    ):
+                        # The factor in the scales' dtype, and a float32 one,
+                        # which is cast to it.
+                        for fac in (f, mx.array(factor)):
+                            self.assert_gather_implied(
+                                dev,
+                                xv,
+                                w,
+                                scales,
+                                full,
+                                fac,
+                                "gather_q",
+                                False,
+                                rhs_indices=idx,
+                                transpose=True,
+                                group_size=32,
+                                bits=bits,
+                                sorted_indices=sort,
+                            )
+
+    def test_implied_bias_gather_grad(self):
+        # The reverse products of a gather_qmm that keeps the factor equal
+        # those of the explicit `scales * f` graph: the factor is a constant
+        # and the scales gradient carries its f * d(bias) term.
+        rng = np.random.default_rng(11)
+        for dev, dtype, (bits, gs, factor) in product(
+            self.implied_bias_devices(),
+            [mx.float32, mx.float16],
+            [(4, 32, -8.0), (2, 64, -2.0), (8, 64, -128.0)],
+        ):
+            if dev == mx.cpu and dtype != mx.float32:
+                continue  # the CPU's GatherMM (the scales gradient) is fp32 only
+            E, N, K = 4, 64, 512
+            w, scales, _, f = self.gather_implied_weights(
+                rng, dtype, bits, gs, factor, E, N, K
+            )
+            for L, sort in [(3, False), (32, True)]:
+                x = mx.array(
+                    rng.standard_normal((L, 1, K)).astype(np.float32) / K**0.5
+                ).astype(dtype)
+                idx = mx.array(np.sort(rng.integers(0, E, L)).astype(np.uint32))
+                cotan = mx.array(
+                    rng.standard_normal((L, 1, N)).astype(np.float32)
+                ).astype(dtype)
+
+                def run(x, scales, b):
+                    return mx.gather_qmm(
+                        x,
+                        w,
+                        scales,
+                        b,
+                        rhs_indices=idx,
+                        transpose=True,
+                        group_size=gs,
+                        bits=bits,
+                        sorted_indices=sort,
+                        stream=dev,
+                    )
+
+                def f_ib(x, scales):
+                    return run(x, scales, f)
+
+                def f_full(x, scales):
+                    return run(x, scales, scales * f)
+
+                with self.subTest(dev=dev, dtype=dtype, bits=bits, L=L, sort=sort):
+                    (y_ib,), (dx_ib, ds_ib) = mx.vjp(f_ib, [x, scales], [cotan])
+                    (y_full,), (dx_full, ds_full) = mx.vjp(f_full, [x, scales], [cotan])
+                    self.assert_bitwise_equal(y_ib, y_full)
+                    self.assert_bitwise_equal(dx_ib, dx_full)
+                    self.assert_bitwise_equal(ds_ib, ds_full)
+                    _, (df,) = mx.vjp(lambda f: run(x, scales, f), [f], [cotan])
+                    self.assert_bitwise_equal(df, mx.zeros_like(f))
+                    # The factor is a constant for forward mode too, and for
+                    # whatever produced it: sqrt'(0) must not be reached.
+                    (out,), (tf,) = mx.jvp(
+                        lambda f: run(x, scales, f), [f], [mx.array(1.0, dtype)]
+                    )
+                    self.assert_bitwise_equal(tf, mx.zeros_like(out))
+                    g = mx.grad(
+                        lambda t: (
+                            run(x, scales, mx.sqrt(t).astype(dtype))
+                            .astype(mx.float32)
+                            .sum()
+                        )
+                    )(mx.array(0.0))
+                    self.assertEqual(g.item(), 0.0)
+
+    def gather_layouts(self, rng, dtype, bits, gs, factor, E, N, K):
+        # The same E experts in every layout the backends keep without a copy
+        # (each matrix contiguous): contiguous, every other expert of a larger
+        # stack (strided), a 2-d expert grid with its axes swapped (permuted
+        # strides), and one expert's scales broadcast over all (zero stride).
+        # Each layout: name, w, scales, the explicit bias and the factor.
+        w, scales, _, f = self.gather_implied_weights(
+            rng, dtype, bits, gs, factor, 2 * E, N, K
+        )
+        mx.eval(w, scales)
+        layouts = [
+            ("contiguous", w[:E], scales[:E]),
+            ("strided", w[::2], scales[::2]),
+            (
+                "permuted",
+                w[:E].reshape(2, E // 2, N, -1).swapaxes(0, 1),
+                scales[:E].reshape(2, E // 2, N, -1).swapaxes(0, 1),
+            ),
+            ("broadcast", w[:E], mx.broadcast_to(scales[:1], (E, N, K // gs))),
+        ]
+        out = []
+        for name, wl, sl in layouts:
+            # Evaluated views: the strides are what the kernels see.
+            mx.eval(wl, sl)
+            full = sl * f
+            mx.eval(full)
+            out.append((name, wl, sl, full, f))
+        return out
+
+    def test_implied_bias_gather_shapeless_replay(self):
+        # A shapeless compile replays the traced primitive with other shapes:
+        # the factor the op kept for one row per matrix then reaches routes
+        # with no implied-bias kernel, where the backend forms the bias, for
+        # scales in any layout (strided scales take the general binary
+        # kernel, which reads every operand's strides). On the CPU the op
+        # materializes at trace time, so the replay is the plain graph.
+        rng = np.random.default_rng(13)
+        E, N, K = 4, 64, 512
+        for dev in self.implied_bias_devices():
+            for name, w, scales, full, f in self.gather_layouts(
+                rng, mx.float16, 4, 32, -8.0, E, N, K
+            ):
+                grid = w.ndim == 4
+                lhs = mx.array([0, 1, 1], mx.uint32)
+                rhs = mx.array([3, 0, 2], mx.uint32)
+
+                def gather(x, b):
+                    return mx.gather_qmm(
+                        x,
+                        w,
+                        scales,
+                        b,
+                        lhs_indices=lhs,
+                        rhs_indices=rhs,
+                        transpose=True,
+                        group_size=32,
+                        bits=4,
+                        stream=dev,
+                    )
+
+                compiled = mx.compile(lambda x: gather(x, f), shapeless=True)
+                for M, route, implied in [
+                    (1, "gather_qmv_fast", True),  # the trace
+                    (3, "gather_qmv_fast", False),  # verify widths
+                    (5, "gather_qmv_fast", False),
+                    (64, "gather_qmm_t", False),  # a prefill width
+                    (1, "gather_qmv_fast", True),
+                ]:
+                    x = mx.array(
+                        rng.standard_normal((2, M, K)).astype(np.float32) / K**0.5
+                    ).astype(mx.float16)
+                    mx.eval(x)
+                    y, names = self.traced(dev, lambda: compiled(x))
+                    with self.subTest(dev=dev, layout=name, M=M, grid=grid):
+                        self.assert_same_bits(y, gather(x, full))
+                        if dev != mx.gpu:
+                            continue
+                        gathers = [n for n in names if "_gather_q" in n]
+                        self.assertEqual(len(gathers), 1, names)
+                        self.assertIn(route, gathers[0])
+                        self.assertEqual(gathers[0].endswith("_ib"), implied, names)
+                        # The backend's own multiply, only on the replays that
+                        # left the "_ib" routes.
+                        self.assertEqual(
+                            any("Multiply" in n for n in names), not implied, names
+                        )
 
     def test_implied_bias_grad(self):
         # Reverse products wrt x and scales use the implied-bias kernels and

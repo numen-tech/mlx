@@ -1106,7 +1106,8 @@ MTL::ComputePipelineState* get_gather_qmm_kernel(
     int wm,
     int wn,
     bool transpose,
-    bool has_global_scale) {
+    bool has_global_scale,
+    bool implied_bias) {
   const auto& lib_name = kernel_name;
   auto lib = d.get_library(lib_name, [&]() {
     std::string kernel_source;
@@ -1139,6 +1140,23 @@ MTL::ComputePipelineState* get_gather_qmm_kernel(
                                         wn,
                                         transpose,
                                         has_global_scale);
+    // The implied-bias twin takes a trailing template arg, passed on this
+    // branch alone so every other definition stays byte-identical.
+    if (is_affine && implied_bias) {
+      template_def = get_template_definition(
+          lib_name,
+          "affine_gather_qmm_rhs",
+          get_type_string(x.dtype()),
+          group_size,
+          bits,
+          bm,
+          bn,
+          bk,
+          wm,
+          wn,
+          transpose,
+          true);
+    }
     concatenate(
         kernel_source,
         is_affine ? metal::quantized() : metal::fp_quantized(),
@@ -1342,7 +1360,8 @@ MTL::ComputePipelineState* get_gather_qmm_nax_kernel(
     int wm,
     int wn,
     bool transpose,
-    bool has_global_scale) {
+    bool has_global_scale,
+    bool implied_bias) {
   const auto& lib_name = kernel_name;
   auto lib = d.get_library(lib_name, [&]() {
     std::string kernel_source;
@@ -1378,6 +1397,23 @@ MTL::ComputePipelineState* get_gather_qmm_nax_kernel(
                                         wn,
                                         transpose,
                                         has_global_scale);
+    // The implied-bias twin takes a trailing template arg, passed on this
+    // branch alone so every other definition stays byte-identical.
+    if (is_affine && implied_bias) {
+      template_def = get_template_definition(
+          lib_name,
+          "affine_gather_qmm_rhs_nax",
+          get_type_string(x.dtype()),
+          group_size,
+          bits,
+          bm,
+          bn,
+          bk,
+          wm,
+          wn,
+          transpose,
+          true);
+    }
     concatenate(
         kernel_source,
         is_affine ? metal::quantized_nax() : metal::fp_quantized_nax(),

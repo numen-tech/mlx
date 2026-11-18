@@ -3832,6 +3832,11 @@ std::vector<array> GatherQMM::vjp(
   auto global_scale = (mode_ != QuantizationMode::Affine && primals.size() == 6)
       ? std::optional<array>(primals[3])
       : std::nullopt;
+  // Implied bias: primals[3] is a 0-d factor f and bias = f * scale. The
+  // gradients are those of the graph that materializes it (ops.cpp
+  // gather_qmm): the factor is a constant, and the scales take f times the
+  // bias gradient on top of their own.
+  bool implied = is_implied_bias(biases);
 
   int M = cotan.shape(-2);
   int K = x.shape(-1);
@@ -3886,6 +3891,8 @@ std::vector<array> GatherQMM::vjp(
     } else if (global_scale && arg == 3) {
       throw std::runtime_error(
           "[GatherQMM::vjp] no gradient wrt the global scale.");
+    } else if (implied && arg == 3) {
+      vjps.push_back(zeros_like(primals[3], stream()));
     } else {
       if (mode_ != QuantizationMode::Affine) {
         std::ostringstream msg;
@@ -3914,14 +3921,15 @@ std::vector<array> GatherQMM::vjp(
       if (arg == 3) {
         vjps.push_back(sum(*dsb, -1, false, stream()));
       } else {
-        vjps.push_back(
+        auto ds =
             sum(multiply(
                     *dsb,
                     unflatten(
                         dequantize(
                             w,
                             ones_like(scales, stream()),
-                            zeros_like(*biases, stream()),
+                            implied ? zeros_like(scales, stream())
+                                    : zeros_like(*biases, stream()),
                             group_size_,
                             bits_,
                             quantization_mode_to_string(mode_),
@@ -3934,7 +3942,16 @@ std::vector<array> GatherQMM::vjp(
                     stream()),
                 -1,
                 false,
-                stream()));
+                stream());
+        if (implied) {
+          auto f = astype(
+              stop_gradient(*biases, stream()), scales.dtype(), stream());
+          ds =
+              add(ds,
+                  multiply(sum(*dsb, -1, false, stream()), f, stream()),
+                  stream());
+        }
+        vjps.push_back(ds);
       }
     }
   }

@@ -1608,7 +1608,8 @@ template <
     int BK,
     int WM,
     int WN,
-    bool transpose>
+    bool transpose,
+    bool implied_bias = false>
 [[kernel]] void affine_gather_qmm_rhs_nax(
     const device T* x [[buffer(0)]],
     const device uint32_t* w [[buffer(1)]],
@@ -1636,7 +1637,8 @@ template <
       transpose,
       WM * WN * SIMD_SIZE,
       group_size,
-      bits>;
+      bits,
+      implied_bias>;
 
   threadgroup T Ws[transpose ? BN * BK_padded : BK * BN_padded];
 
@@ -1667,13 +1669,17 @@ template <
   const short2 tile_w =
       transpose ? short2(k_remain, tgp_bn) : short2(tgp_bn, k_remain);
 
-  // Move x and output to the correct block
+  // Move x and output to the correct block. An implied bias is one factor:
+  // `biases` stays on it, for every column and every expert.
   auto wl = (const device uint8_t*)w;
   x += y_row_long * K;
   y += y_row_long * N + y_col_long;
   wl += transpose ? y_col_long * K_w : y_col * bytes_per_pack / pack_factor;
   scales += transpose ? y_col_long * K_g : y_col / group_size;
-  biases += transpose ? y_col_long * K_g : y_col / group_size;
+  if (!implied_bias) {
+    biases += transpose ? y_col_long * K_g : y_col / group_size;
+    biases += group * stride_s;
+  }
 
   constexpr short SM = BM / WM;
   constexpr short SN = BN / WN;
@@ -1709,7 +1715,7 @@ template <
   thread loader_w_t loader_w(
       wl + group * stride_w,
       scales + group * stride_s,
-      biases + group * stride_s,
+      biases,
       transpose ? K : N,
       Ws,
       simd_group_id,

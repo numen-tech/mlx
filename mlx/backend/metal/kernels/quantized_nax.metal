@@ -113,7 +113,15 @@
       #name "_" #type "_gs_" #group_size "_b_" #bits "_bm" #bm "_bn" #bn "_bk" #bk "_wm" #wm "_wn" #wn "_alN_" #aligned "_batch_" #batched "_ib", \
       name, type, group_size, bits, aligned, batched, bm, bk, bn, wm, wn, false, true)
 
+// The transposed sorted gather kernel (gemma4-qat#1833), both row tiles.
+#define instantiate_quantized_ib_gather_rhs(type, group_size, bits, bm)     \
+  instantiate_kernel(                                                    \
+      "affine_gather_qmm_rhs_nax_nt_" #type "_gs_" #group_size "_b_" #bits "_bm_" #bm "_bn_64_bk_64_wm_2_wn_2_ib", \
+      affine_gather_qmm_rhs_nax, type, group_size, bits, bm, 64, 64, 2, 2, true, true)
+
 #define instantiate_quantized_ib_funcs(type, group_size, bits) \
+  instantiate_quantized_ib_gather_rhs(type, group_size, bits, 64) \
+  instantiate_quantized_ib_gather_rhs(type, group_size, bits, 32) \
   instantiate_quantized_ib_batched(affine_qmm_n_nax, type, group_size, bits, 64, 64, 64, 2, 2, 1) \
   instantiate_quantized_ib_batched(affine_qmm_n_nax, type, group_size, bits, 64, 64, 64, 2, 2, 0) \
   instantiate_quantized_ib_aligned_batched(affine_qmm_t_nax, type, group_size, bits, 64, 64, 64, 2, 2, true, 1) \

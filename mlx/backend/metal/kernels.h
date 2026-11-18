@@ -336,7 +336,8 @@ MTL::ComputePipelineState* get_gather_qmm_kernel(
     int wm,
     int wn,
     bool transpose,
-    bool has_global_scale);
+    bool has_global_scale,
+    bool implied_bias);
 
 MTL::ComputePipelineState* get_steel_gemm_fused_nax_kernel(
     metal::Device& d,
@@ -423,7 +424,8 @@ MTL::ComputePipelineState* get_gather_qmm_nax_kernel(
     int wm,
     int wn,
     bool transpose,
-    bool has_global_scale);
+    bool has_global_scale,
+    bool implied_bias);
 
 MTL::ComputePipelineState* get_steel_attention_kernel(
     metal::Device& d,

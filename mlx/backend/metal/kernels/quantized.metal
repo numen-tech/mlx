@@ -330,8 +330,23 @@
       "affine_dequantize_" #type "_gs_" #group_size "_b_" #bits "_ib",       \
       affine_dequantize, type, group_size, bits, false, true)
 
+// The gather kernels a one-row-per-expert MoE layer takes (gemma4-qat#1833):
+// gather_qmv, gather_qmv_fast and the transposed sorted gather_qmm_rhs.
+#define instantiate_quantized_ib_gather_qmv(name, type, group_size, bits)    \
+  instantiate_kernel(                                                        \
+      #name "_" #type "_gs_" #group_size "_b_" #bits "_ib",                  \
+      name, type, group_size, bits, false, true)
+
+#define instantiate_quantized_ib_gather_rhs(type, group_size, bits)          \
+  instantiate_kernel(                                                        \
+      "affine_gather_qmm_rhs_nt_" #type "_gs_" #group_size "_b_" #bits "_bm_16_bn_32_bk_32_wm_1_wn_2_ib", \
+      affine_gather_qmm_rhs, type, group_size, bits, 16, 32, 32, 1, 2, true, true)
+
 #define instantiate_quantized_ib_funcs(type, group_size, bits)               \
   instantiate_quantized_ib_dequantize(type, group_size, bits)                \
+  instantiate_quantized_ib_gather_qmv(affine_gather_qmv_fast, type, group_size, bits) \
+  instantiate_quantized_ib_gather_qmv(affine_gather_qmv, type, group_size, bits) \
+  instantiate_quantized_ib_gather_rhs(type, group_size, bits)                \
   instantiate_quantized_ib_qmv(affine_qmv_fast, type, group_size, bits, 1, 1) \
   instantiate_quantized_ib_qmv(affine_qmv_fast, type, group_size, bits, 1, 0) \
   instantiate_quantized_ib_qmv(affine_qmv_fast, type, group_size, bits, 0, 1) \

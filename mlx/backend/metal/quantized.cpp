@@ -7,6 +7,7 @@
 #include "mlx/backend/common/compiled.h"
 #include "mlx/backend/common/quantized.h"
 #include "mlx/backend/gpu/copy.h"
+#include "mlx/backend/metal/binary.h"
 #include "mlx/backend/metal/device.h"
 #include "mlx/backend/metal/kernels.h"
 #include "mlx/backend/metal/matmul.h"
@@ -1904,6 +1905,8 @@ void gather_qmv(
   kname.reserve(64);
   std::string type_string = get_type_string(x.dtype());
   bool fast = N % bn == 0 && K % qmv_fast_k_alignment(bits, mode) == 0;
+  // An implied bias is a bias, so it never comes with a global scale.
+  const bool implied = is_implied_bias(biases);
   concatenate(
       kname,
       mode + (fast ? "_gather_qmv_fast_" : "_gather_qmv_"),
@@ -1912,17 +1915,28 @@ void gather_qmv(
       group_size,
       "_b_",
       bits,
-      global_scale ? "_hgs" : "");
+      global_scale ? "_hgs" : "",
+      implied ? "_ib" : "");
 
-  auto kernel = get_quantized_kernel_wrapped(
-      d,
-      kname,
-      (fast ? "gather_qmv_fast" : "gather_qmv"),
-      mode,
-      type_string,
-      group_size,
-      bits,
-      global_scale.has_value());
+  auto kernel = implied ? get_quantized_kernel_wrapped(
+                              d,
+                              kname,
+                              (fast ? "gather_qmv_fast" : "gather_qmv"),
+                              mode,
+                              type_string,
+                              group_size,
+                              bits,
+                              false,
+                              true)
+                        : get_quantized_kernel_wrapped(
+                              d,
+                              kname,
+                              (fast ? "gather_qmv_fast" : "gather_qmv"),
+                              mode,
+                              type_string,
+                              group_size,
+                              bits,
+                              global_scale.has_value());
 
   auto& compute_encoder = metal::get_command_encoder(s);
   compute_encoder.set_compute_pipeline_state(kernel);
@@ -2057,9 +2071,12 @@ void gather_qmm_rhs_nax(
   array x = broadcast_with_indices(x_);
   array w = ensure_row_contiguous(w_, d, s);
   array scales = ensure_row_contiguous(scales_, d, s);
+  // An implied-bias factor (0-d) is passed as is: the "_ib" kernel reads it
+  // once and never offsets the pointer.
+  const bool implied = is_implied_bias(biases_);
   std::optional<array> biases;
   if (biases_) {
-    biases = ensure_row_contiguous(*biases_, d, s);
+    biases = implied ? *biases_ : ensure_row_contiguous(*biases_, d, s);
   }
   std::optional<array> gs;
   if (global_scale) {
@@ -2098,7 +2115,8 @@ void gather_qmm_rhs_nax(
       wm,
       "_wn_",
       wn,
-      global_scale ? "_hgs" : "");
+      global_scale ? "_hgs" : "",
+      implied ? "_ib" : "");
 
   metal::MTLFCList func_consts = {
       {&align_N, MTL::DataType::DataTypeBool, 201},
@@ -2135,7 +2153,8 @@ void gather_qmm_rhs_nax(
       wm,
       wn,
       transpose,
-      global_scale.has_value());
+      global_scale.has_value(),
+      implied);
   compute_encoder.set_compute_pipeline_state(kernel);
 
   MTL::Size group_dims(32, wn, wm);
@@ -2224,9 +2243,12 @@ void gather_qmm_rhs(
   array x = broadcast_with_indices(x_);
   array w = ensure_row_contiguous(w_, d, s);
   array scales = ensure_row_contiguous(scales_, d, s);
+  // An implied-bias factor (0-d) is passed as is: the "_ib" kernel reads it
+  // once and never offsets the pointer.
+  const bool implied = is_implied_bias(biases_);
   std::optional<array> biases;
   if (biases_) {
-    biases = ensure_row_contiguous(*biases_, d, s);
+    biases = implied ? *biases_ : ensure_row_contiguous(*biases_, d, s);
   }
   std::optional<array> gs;
   if (global_scale) {
@@ -2263,7 +2285,8 @@ void gather_qmm_rhs(
       wm,
       "_wn_",
       wn,
-      global_scale ? "_hgs" : "");
+      global_scale ? "_hgs" : "",
+      implied ? "_ib" : "");
 
   metal::MTLFCList func_consts = {
       {&align_N, MTL::DataType::DataTypeBool, 201},
@@ -2300,7 +2323,8 @@ void gather_qmm_rhs(
       wm,
       wn,
       transpose,
-      global_scale.has_value());
+      global_scale.has_value(),
+      implied);
   compute_encoder.set_compute_pipeline_state(kernel);
 
   MTL::Size group_dims(32, wn, wm);
@@ -2745,6 +2769,25 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
   int E = w.size() / w.shape(-1) / w.shape(-2);
   int vector_limit = transpose_ ? get_qmv_batch_limit(K, N, d) : 4;
   auto mode = quantization_mode_to_string(mode_);
+
+  // Only the routes a transposed product of one row per matrix takes have an
+  // implied-bias kernel: the sorted rhs kernel and gather_qmv(_fast). The op
+  // (ops.cpp gather_qmm) materializes the bias for everything else, so a 0-d
+  // bias here with any other shape is a graph replayed with shapes the op
+  // never saw (a shapeless compile). No kernel below would read the factor
+  // correctly, so form the bias the op would have: scales * f, in their dtype.
+  if (is_implied_bias(biases) && !(transpose_ && M == 1)) {
+    // The factor as a zero-stride view of the scales' shape: the scales can
+    // be strided across matrices (each matrix is contiguous, so they were
+    // not copied above), which takes the binary op's general path, and that
+    // path reads every operand's strides at the scales' rank.
+    array factor(scales.shape(), scales.dtype(), nullptr, {});
+    broadcast(*biases, factor);
+    array full_biases(scales.shape(), scales.dtype(), nullptr, {});
+    binary_op_gpu({scales, factor}, full_biases, "Multiply", s);
+    metal::get_command_encoder(s).add_temporary(full_biases);
+    biases = std::move(full_biases);
+  }
 
   // We are walking x in order and w is also in order so we can batch up the
   // matmuls and reuse reading x and w.
