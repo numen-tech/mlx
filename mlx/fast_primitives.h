@@ -335,7 +335,8 @@ class ScaledDotProductAttention : public Custom {
         do_causal_,
         has_sinks_,
         output_logsumexp_,
-        force_fused_);
+        force_fused_,
+        blocked_d512_);
   }
 
  private:
@@ -344,7 +345,9 @@ class ScaledDotProductAttention : public Custom {
   bool has_sinks_;
   bool output_logsumexp_;
   bool force_fused_;
-  // Not in state(): a process-local routing choice, not part of the op.
+  // In state() (last, matching the constructor), so an exported and imported
+  // function keeps the path it was built with; eval_gpu still re-checks the
+  // shape before taking the blocked path.
   bool blocked_d512_;
 };
 

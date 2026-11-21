@@ -1,5 +1,6 @@
 import math
 import os
+import tempfile
 import unittest
 from itertools import product
 
@@ -509,6 +510,49 @@ class TestFastSDPA(mlx_tests.MLXTestCase):
         _, on_names = run(q, k, k, "causal", True)
         _, off_names = run(q, k, k, "causal", False)
         self.assertEqual(on_names, off_names)
+
+    @unittest.skipIf(not mx.metal.is_available(), "Metal kernel path only")
+    def test_sdpa_d512_prefill_route_export_import(self):
+        # numen-tech/gemma4-qat#1972: the route's decision is part of the
+        # primitive's state, so a function exported with the route on imports
+        # with it and takes the blocked path whatever the flag reads then.
+        if mx.default_device() != mx.gpu:
+            self.skipTest("requires GPU")
+        if os.environ.get("MLX_FORCE_GPU_FAMILY") == "apple6":
+            self.skipTest("Apple6 never takes the route")
+        mx.random.seed(0)
+        q = (0.5 * mx.random.normal((1, 16, 16, 512))).astype(mx.float16)
+        k = (0.5 * mx.random.normal((1, 2, 96, 512))).astype(mx.float16)
+        v = (0.5 * mx.random.normal((1, 2, 96, 512))).astype(mx.float16)
+        mx.eval(q, k, v)
+
+        def fun(q, k, v):
+            return mx.fast.scaled_dot_product_attention(
+                q, k, v, scale=512**-0.5, mask="causal"
+            )
+
+        def traced(f, *args):
+            mx.metal._kernel_trace_start()
+            out = f(*args)
+            mx.eval(out)
+            return out, mx.metal._kernel_trace_stop()
+
+        def blocked(names):
+            return any(n.startswith("sdpa_blocked_") for n in names)
+
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "d512_route.mlxfn")
+            mx.metal._set_sdpa_d512_prefill(True)
+            try:
+                on, on_names = traced(fun, q, k, v)
+                mx.export_function(path, fun, q, k, v)
+            finally:
+                mx.metal._set_sdpa_d512_prefill(False)
+            self.assertTrue(blocked(on_names), on_names)
+            imported = mx.import_function(path)
+            out, names = traced(imported, q, k, v)
+        self.assertTrue(blocked(names), names)
+        self.assertTrue(mx.allclose(out[0], on, atol=1e-4, rtol=1e-3))
 
     @unittest.skipIf(not mx.metal.is_available(), "Metal kernel path only")
     def test_sdpa_full_head_dim_512_nax(self):
