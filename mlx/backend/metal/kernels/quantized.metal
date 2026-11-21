@@ -420,6 +420,82 @@
   instantiate_qmv_mma_types(64, bits)    \
   instantiate_qmv_mma_types(32, bits)
 
+///////////////////////////////////////////////////////////////////////////////
+// Row-stride ("_rs") variants (quantized.cpp use_row_stride, gemma4-qat#1973):
+// affine 4/8-bit with an explicit bias, w / scales / biases read through their
+// row strides. Defaulted template args are spelled out.
+///////////////////////////////////////////////////////////////////////////////
+
+#define instantiate_quantized_rs_qmv(name, type, group_size, bits, batched, partial_rows) \
+  instantiate_kernel(                                                        \
+      #name "_" #type "_gs_" #group_size "_b_" #bits "_batch_" #batched "_pr_" #partial_rows "_hgs_0_r_4_rs", \
+      name, type, group_size, bits, batched, partial_rows, false, 4, false, true)
+
+#define instantiate_quantized_rs_wide(type, group_size, bits, vecs_per_tg, batched) \
+  instantiate_kernel(                                                        \
+      "affine_qmv_wide_" #type "_gs_" #group_size "_b_" #bits "_nv_" #vecs_per_tg "_kl_8_batch_" #batched "_rs", \
+      affine_qmv_wide, type, group_size, bits, vecs_per_tg, 8, batched, false, true)
+
+#define instantiate_quantized_rs_wide_rr(type, group_size, bits, vecs_per_tg, batched) \
+  instantiate_kernel(                                                        \
+      "affine_qmv_wide_rr_" #type "_gs_" #group_size "_b_" #bits "_nv_" #vecs_per_tg "_batch_" #batched "_rs", \
+      affine_qmv_wide_rr, type, group_size, bits, vecs_per_tg, batched, false, true)
+
+#define instantiate_quantized_rs_qvm(type, group_size, bits, batched)        \
+  instantiate_kernel(                                                        \
+      "affine_qvm_" #type "_gs_" #group_size "_b_" #bits "_batch_" #batched "_rs", \
+      affine_qvm, type, group_size, bits, batched, false, false, true)
+
+#define instantiate_quantized_rs_split_k(type, group_size, bits, split_k)    \
+  instantiate_kernel(                                                        \
+      "affine_qvm_split_k_" #type "_gs_" #group_size "_b_" #bits "_spk_" #split_k "_rs", \
+      affine_qvm_split_k, type, group_size, bits, split_k, false, true)
+
+#define instantiate_quantized_rs_qmm_n(type, group_size, bits, batched)      \
+  instantiate_kernel(                                                        \
+      "affine_qmm_n_" #type "_gs_" #group_size "_b_" #bits "_batch_" #batched "_rs", \
+      affine_qmm_n, type, group_size, bits, batched, false, 32, 32, 32, false, true)
+
+#define instantiate_quantized_rs_qmm_t(type, group_size, bits, aligned, batched) \
+  instantiate_kernel(                                                        \
+      "affine_qmm_t_" #type "_gs_" #group_size "_b_" #bits "_alN_" #aligned "_batch_" #batched "_rs", \
+      affine_qmm_t, type, group_size, bits, aligned, batched, false, 32, 32, 32, false, true)
+
+#define instantiate_quantized_rs_batch(type, group_size, bits, batched)             \
+  instantiate_quantized_rs_qmv(affine_qmv_fast, type, group_size, bits, batched, 1) \
+  instantiate_quantized_rs_qmv(affine_qmv_fast, type, group_size, bits, batched, 0) \
+  instantiate_quantized_rs_qmv(affine_qmv, type, group_size, bits, batched, 0)      \
+  instantiate_quantized_rs_wide(type, group_size, bits, 2, batched)                 \
+  instantiate_quantized_rs_wide(type, group_size, bits, 3, batched)                 \
+  instantiate_quantized_rs_wide(type, group_size, bits, 4, batched)                 \
+  instantiate_quantized_rs_wide(type, group_size, bits, 5, batched)                 \
+  instantiate_quantized_rs_wide(type, group_size, bits, 6, batched)                 \
+  instantiate_quantized_rs_wide(type, group_size, bits, 7, batched)                 \
+  instantiate_quantized_rs_wide_rr(type, group_size, bits, 2, batched)              \
+  instantiate_quantized_rs_wide_rr(type, group_size, bits, 3, batched)              \
+  instantiate_quantized_rs_wide_rr(type, group_size, bits, 4, batched)              \
+  instantiate_quantized_rs_wide_rr(type, group_size, bits, 5, batched)              \
+  instantiate_quantized_rs_qvm(type, group_size, bits, batched)                     \
+  instantiate_quantized_rs_qmm_n(type, group_size, bits, batched)                   \
+  instantiate_quantized_rs_qmm_t(type, group_size, bits, true, batched)             \
+  instantiate_quantized_rs_qmm_t(type, group_size, bits, false, batched)
+
+#define instantiate_quantized_rs_funcs(type, group_size, bits) \
+  instantiate_quantized_rs_batch(type, group_size, bits, 1)    \
+  instantiate_quantized_rs_batch(type, group_size, bits, 0)    \
+  instantiate_quantized_rs_split_k(type, group_size, bits, 8)  \
+  instantiate_quantized_rs_split_k(type, group_size, bits, 32)
+
+#define instantiate_quantized_rs_types(group_size, bits)        \
+  instantiate_quantized_rs_funcs(float, group_size, bits)       \
+  instantiate_quantized_rs_funcs(float16_t, group_size, bits)   \
+  instantiate_quantized_rs_funcs(bfloat16_t, group_size, bits)
+
+#define instantiate_quantized_rs_groups(bits) \
+  instantiate_quantized_rs_types(128, bits)   \
+  instantiate_quantized_rs_types(64, bits)    \
+  instantiate_quantized_rs_types(32, bits)
+
 #define instantiate_quantized_all() \
   instantiate_quantized_groups(1) \
   instantiate_quantized_groups(2) \
@@ -441,7 +517,9 @@
   instantiate_quantized_ib_groups(4) \
   instantiate_quantized_ib_groups(8) \
   instantiate_qmv_mma_groups(4) \
-  instantiate_qmv_mma_groups(8)
+  instantiate_qmv_mma_groups(8) \
+  instantiate_quantized_rs_groups(4) \
+  instantiate_quantized_rs_groups(8)
 
 // 64 x 64 tiles of the transposed, non-batched affine qmm, 4/8-bit, explicit
 // and implied bias (quantized.cpp use_qmm_tile64, numen-tech/gemma4-qat#1695).

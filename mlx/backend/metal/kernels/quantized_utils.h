@@ -88,3 +88,31 @@ METAL_FUNC void gemm_loop_finalize(
   threadgroup_barrier(mem_flags::mem_threadgroup);
   mma_op.mma(As, Bs);
 }
+
+// Row strides of a quantized matrix read in place (gemma4-qat#1973): the
+// bytes between consecutive rows of w and the elements between rows of scales
+// and of biases. Only a kernel instantiated with row_stride (an "_rs" name)
+// reads them; every other instantiation keeps the packed row widths.
+struct QRowStrides {
+  int w;
+  int s;
+  int b;
+};
+
+// For an "_rs" kernel the host binds the stride vectors batched or not
+// (add_strides_and_shapes); the entry after the batch dims is each array's row
+// stride in elements (uint32 words for w).
+template <bool row_stride>
+METAL_FUNC QRowStrides load_row_strides(
+    const constant int& w_batch_ndims,
+    const constant int64_t* w_strides,
+    const constant int64_t* s_strides,
+    const constant int64_t* b_strides) {
+  if (row_stride) {
+    return QRowStrides{
+        static_cast<int>(w_strides[w_batch_ndims]) * 4,
+        static_cast<int>(s_strides[w_batch_ndims]),
+        static_cast<int>(b_strides[w_batch_ndims])};
+  }
+  return QRowStrides{0, 0, 0};
+}
