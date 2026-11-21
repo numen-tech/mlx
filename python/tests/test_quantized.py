@@ -4625,6 +4625,13 @@ class TestQuantized(mlx_tests.MLXTestCase):
         self.assert_same_bits(y_on, y_ref)
         self.assert_same_bits(y_off, y_ref)
         self.assertFalse(any(map(self.is_rs_kernel, t_ref)), t_ref)
+        if view[0].ndim > 2 and view[0].shape[-2] == 1:
+            # One row broadcast over the batch dims has row stride 0
+            # (broadcast_to), which eval_gpu copies even when the row is
+            # packed; the route leaves that alone.
+            self.assertEqual(t_on, t_off)
+            self.assertEqual(t_on, t_ref)
+            return []
         self.assertFalse(any(map(self.is_copy_kernel, t_ref)), t_ref)
         # Off: the stock kernels after one copy per array.
         self.assertEqual([n for n in t_off if not self.is_copy_kernel(n)], t_ref)

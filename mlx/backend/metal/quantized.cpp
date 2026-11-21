@@ -2815,6 +2815,8 @@ inline bool quantized_row_stride_enabled() {
 // (transposed); qvm, qvm_split_k, qmm_n, qmm_n_nax (not transposed). No twin:
 // the Apple6 routes, qmv_mma, qmv_quad and the split-K qmm (a transposed
 // non-batched product at or above the qmv batch limit).
+// A single row broadcast over batch dims has row stride 0 and is copied, as it
+// is when packed.
 inline bool use_row_stride(
     const std::vector<array>& inputs,
     const array& x,
