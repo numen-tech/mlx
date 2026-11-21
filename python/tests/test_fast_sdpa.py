@@ -405,6 +405,89 @@ class TestFastSDPA(mlx_tests.MLXTestCase):
             self.assertTrue(mx.allclose(ref, out, atol=1e-3, rtol=1e-3))
 
     @unittest.skipIf(not mx.metal.is_available(), "Metal kernel path only")
+    def test_sdpa_d512_prefill_route(self):
+        # numen-tech/gemma4-qat#1972: mx.metal._set_sdpa_d512_prefill(True)
+        # lets a causal head-dim-512 call of 9 or more rows take the blocked
+        # path (no NAX) or the NAX d512 kernel; off, such a call below 1,024
+        # rows stays unfused, as before.
+        if mx.default_device() != mx.gpu:
+            self.skipTest("requires GPU")
+        nax = None
+
+        def run(q, k, v, mask, on, off_at_eval=False):
+            mx.metal._set_sdpa_d512_prefill(on)
+            try:
+                out = mx.fast.scaled_dot_product_attention(
+                    q, k, v, scale=512**-0.5, mask=mask
+                )
+                if off_at_eval:
+                    # Built with the route on, evaluated with it off: the
+                    # call keeps the path it was built for.
+                    mx.metal._set_sdpa_d512_prefill(False)
+                mx.metal._kernel_trace_start()
+                mx.eval(out)
+                return out, mx.metal._kernel_trace_stop()
+            finally:
+                mx.metal._set_sdpa_d512_prefill(False)
+
+        def fused(names):
+            blocked = any(n.startswith("sdpa_blocked_causal_mask_") for n in names)
+            nax_d512 = any(
+                n.startswith("steel_attention") and "_bd512" in n for n in names
+            )
+            return blocked, nax_d512
+
+        self.assertFalse(mx.metal._sdpa_d512_prefill())
+        mx.random.seed(0)
+        cases = (
+            # (B, qH, kH, qL, kL): GQA prefill chunks over a longer cache, a
+            # short tail, an image-block-sized call and the 9-row floor.
+            (1, 16, 2, 512, 1536, 1e-3),
+            (1, 32, 4, 512, 1029, 1e-3),
+            (1, 8, 1, 280, 811, 1e-3),
+            (1, 16, 2, 9, 300, 1e-3),
+            (2, 4, 1, 300, 300, 1e-3),
+        )
+        for dtype, (B, qH, kH, qL, kL, tol) in product(
+            (mx.float16, mx.bfloat16), cases
+        ):
+            with self.subTest(dtype=dtype, qH=qH, qL=qL, kL=kL):
+                q = (0.5 * mx.random.normal((B, qH, qL, 512))).astype(dtype)
+                k = (0.5 * mx.random.normal((B, kH, kL, 512))).astype(dtype)
+                v = (0.5 * mx.random.normal((B, kH, kL, 512))).astype(dtype)
+                ref = mlx_ref_attn(q, k, v, scale=512**-0.5, mask="causal")
+                tol = 1e-2 if dtype == mx.bfloat16 else tol
+                off, off_names = run(q, k, v, "causal", False)
+                self.assertEqual(fused(off_names), (False, False), off_names)
+                on, on_names = run(q, k, v, "causal", True)
+                blocked, nax_d512 = fused(on_names)
+                if nax is None:
+                    nax = nax_d512
+                self.assertTrue(blocked != nax_d512, on_names)
+                self.assertEqual(nax_d512, nax)
+                self.assertTrue(mx.allclose(ref, on, atol=tol, rtol=tol))
+                self.assertTrue(mx.allclose(ref, off, atol=tol, rtol=tol))
+                late, late_names = run(q, k, v, "causal", True, off_at_eval=True)
+                self.assertEqual(fused(late_names), (blocked, nax_d512))
+                self.assertTrue(mx.array_equal(late, on))
+
+        # The route never takes 8 rows or fewer (the vector kernels' range), an
+        # array mask, or a head dim other than 512.
+        q = mx.random.normal((1, 16, 8, 512), mx.float16)
+        k = mx.random.normal((1, 2, 600, 512), mx.float16)
+        _, names = run(q, k, k, "causal", True)
+        self.assertEqual(fused(names), (False, False), names)
+        q = mx.random.normal((1, 16, 64, 512), mx.float16)
+        mask = mx.random.uniform(shape=(1, 1, 64, 600)) > 0.2
+        _, names = run(q, k, k, mask, True)
+        self.assertEqual(fused(names), (False, False), names)
+        q = mx.random.normal((1, 16, 512, 256), mx.float16)
+        k = mx.random.normal((1, 2, 900, 256), mx.float16)
+        _, on_names = run(q, k, k, "causal", True)
+        _, off_names = run(q, k, k, "causal", False)
+        self.assertEqual(on_names, off_names)
+
+    @unittest.skipIf(not mx.metal.is_available(), "Metal kernel path only")
     def test_sdpa_full_head_dim_512_nax(self):
         if mx.default_device() != mx.gpu:
             self.skipTest("requires GPU")

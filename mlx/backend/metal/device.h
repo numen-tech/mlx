@@ -321,6 +321,18 @@ constexpr int kNonresidentArrayVersion = 1;
 //    it. The environment is read only by a call that passes every shape test.
 constexpr int kQmvMmaVersion = 2;
 
+// Bumped when the head-dim-512 prefill route (scaled_dot_product_attention.cpp
+// set_sdpa_d512_prefill) changes. A binding reads it to tell whether a core
+// carries it.
+// 1: set_sdpa_d512_prefill(true) (metal.h, off by default) lets a causal
+//    head-dim-512 call with no array mask, no sinks and no logsumexp take the
+//    fused d512 paths from 9 query rows instead of 1,024: the blocked path
+//    (sdpa_full_self_attention_blocked) on a GPU without NAX, the NAX d512
+//    kernel on a NAX GPU (whose query-block floor it also lifts). The blocked
+//    path's score buffer is min(256, qL) rows. Off, every call routes as before
+//    (numen-tech/gemma4-qat#1972).
+constexpr int kSdpaD512PrefillVersion = 1;
+
 // Bumped when the implied-bias (0-d factor) gather kernels change. A binding
 // reads it to tell whether a core carries them.
 // 1: gather_qmm keeps a 0-d implied-bias factor for a transposed product of

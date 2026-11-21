@@ -74,4 +74,16 @@ MLX_API std::vector<std::string> kernel_trace_stop();
 MLX_API void set_qmv_mma(bool enabled);
 MLX_API bool qmv_mma_device();
 
+// The head-dim-512 prefill route (numen-tech/gemma4-qat#1972), off by default.
+// set_sdpa_d512_prefill(true) lets a causal head-dim-512 attention of 9 or more
+// query rows (no array mask, sinks or logsumexp) take the fused d512 paths,
+// which otherwise need 1,024 rows: the blocked path on a GPU without NAX, the
+// NAX d512 kernel on a NAX GPU. Neither materializes the full
+// [heads x rows x keys] score array the unfused path builds. A host that
+// switches it per model load calls this; the decision is taken when the op is
+// built, and a call built with it on still runs fused if it is switched off
+// before the call is evaluated. Version: kSdpaD512PrefillVersion (device.h).
+MLX_API void set_sdpa_d512_prefill(bool enabled);
+MLX_API bool sdpa_d512_prefill();
+
 } // namespace mlx::core::metal
