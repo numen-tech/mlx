@@ -408,11 +408,13 @@ class TestFastSDPA(mlx_tests.MLXTestCase):
     def test_sdpa_d512_prefill_route(self):
         # numen-tech/gemma4-qat#1972: mx.metal._set_sdpa_d512_prefill(True)
         # sends a causal head-dim-512 call of 9 or more rows to the blocked
-        # path on every GPU, NAX included (never the NAX d512 kernel), and its
-        # output matches the unfused path bit for bit; off, such a call below
-        # 1,024 rows stays unfused, as before.
+        # path on every GPU, NAX included (never the NAX d512 kernel), and on
+        # these inputs its output matches the unfused path bit for bit; off,
+        # such a call below 1,024 rows stays unfused, as before.
         if mx.default_device() != mx.gpu:
             self.skipTest("requires GPU")
+        if os.environ.get("MLX_FORCE_GPU_FAMILY") == "apple6":
+            self.skipTest("Apple6 never takes the route")
 
         def run(q, k, v, mask, on, off_at_eval=False):
             mx.metal._set_sdpa_d512_prefill(on)
@@ -468,6 +470,20 @@ class TestFastSDPA(mlx_tests.MLXTestCase):
                 late, late_names = run(q, k, v, "causal", True, off_at_eval=True)
                 self.assertEqual(fused(late_names), (True, False), late_names)
                 self.assertTrue(mx.array_equal(late, on))
+
+        # At the stock floors (1,024 rows, 32 x 32 query blocks) the flag-off
+        # call takes upstream's fused path (the NAX d512 kernel on NAX, the
+        # blocked path without), and the flag-on call the blocked path.
+        q = (0.5 * mx.random.normal((1, 32, 1024, 512))).astype(mx.float16)
+        k = (0.5 * mx.random.normal((1, 4, 1024, 512))).astype(mx.float16)
+        v = (0.5 * mx.random.normal((1, 4, 1024, 512))).astype(mx.float16)
+        mx.eval(q, k, v)
+        off, off_names = run(q, k, v, "causal", False)
+        self.assertIn(fused(off_names), ((True, False), (False, True)), off_names)
+        on, on_names = run(q, k, v, "causal", True)
+        self.assertEqual(fused(on_names), (True, False), on_names)
+        if fused(off_names) == (True, False):
+            self.assertTrue(mx.array_equal(on, off))
 
         # The route never takes 8 rows or fewer (the vector kernels' range), an
         # array mask, or a head dim other than 512.

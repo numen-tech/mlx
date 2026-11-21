@@ -927,7 +927,12 @@ array scaled_dot_product_attention(
   bool is_training = detail::in_grad_tracing();
   bool has_fast_vjp = !ScaledDotProductAttentionVJP::use_fallback(q, stream);
   bool output_logsumexp = is_training && has_fast_vjp;
-  if (!ScaledDotProductAttention::use_fallback(
+  // The head-dim-512 prefill route (numen-tech/gemma4-qat#1972): its flag is
+  // read here once, so the same answer admits the call and records its path.
+  const bool blocked_d512 = ScaledDotProductAttention::use_d512_prefill_route(
+      q, k, v, has_arr_mask, do_causal, has_sinks, output_logsumexp, stream);
+  if (blocked_d512 ||
+      !ScaledDotProductAttention::use_fallback(
           q,
           k,
           v,
@@ -958,15 +963,7 @@ array scaled_dot_product_attention(
         has_sinks,
         output_logsumexp,
         force_fused,
-        ScaledDotProductAttention::use_d512_prefill_route(
-            q,
-            k,
-            v,
-            has_arr_mask,
-            do_causal,
-            has_sinks,
-            output_logsumexp,
-            stream));
+        blocked_d512);
     if (output_logsumexp) {
       return array::make_arrays(
           {std::move(out_shape), Shape{q.shape(0), q.shape(1), q.shape(2), 1}},

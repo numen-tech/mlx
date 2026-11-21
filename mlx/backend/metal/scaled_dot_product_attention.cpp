@@ -30,8 +30,8 @@ std::atomic<bool> sdpa_d512_prefill_flag{false};
 constexpr int kD512PrefillMinRows = 9;
 
 // Whether the blocked d512 path can serve a call (half precision, head dim
-// 512, causal with no array mask, sinks or logsumexp), whatever its row count
-// and GPU.
+// 512, causal with no array mask, sinks or logsumexp, as many values as keys),
+// whatever its row count and GPU.
 bool blocked_d512_shape(
     const array& q,
     const array& k,
@@ -43,8 +43,9 @@ bool blocked_d512_shape(
     Stream s) {
   return s.device == Device::gpu &&
       (q.dtype() == float16 || q.dtype() == bfloat16) && q.shape(-1) == 512 &&
-      v.shape(-1) == 512 && q.shape(2) <= k.shape(2) && do_causal &&
-      !has_arr_mask && !has_sinks && !output_logsumexp;
+      v.shape(-1) == 512 && q.shape(2) <= k.shape(2) &&
+      k.shape(2) == v.shape(2) && do_causal && !has_arr_mask && !has_sinks &&
+      !output_logsumexp;
 }
 
 // Upstream's blocked d512 rule: a GPU without NAX, 1,024 rows or more.
@@ -57,9 +58,19 @@ bool use_blocked_d512(
     bool has_sinks,
     bool output_logsumexp,
     Stream s) {
-  return !metal::is_nax_available() && q.shape(2) >= 1024 &&
+  // The shape test first: it rejects a CPU stream before the NAX probe
+  // touches the GPU.
+  return q.shape(2) >= 1024 &&
       blocked_d512_shape(
-          q, k, v, has_arr_mask, do_causal, has_sinks, output_logsumexp, s);
+             q,
+             k,
+             v,
+             has_arr_mask,
+             do_causal,
+             has_sinks,
+             output_logsumexp,
+             s) &&
+      !metal::is_nax_available();
 }
 
 void sdpa_blocked_softmax(const Stream& s, metal::Device& d, array& scores) {
@@ -1464,9 +1475,9 @@ bool ScaledDotProductAttention::use_fallback(
     // The unfused path is matmul + softmax, i.e. steel GEMMs (gemma4-qat#991).
     return !has_fused;
   }
+  // The head-dim-512 prefill route is decided by the caller (fast.cpp), once,
+  // so that one flag read both admits the call and records its path.
   if (use_blocked_d512(
-          q, k, v, has_arr_mask, do_causal, has_sinks, output_logsumexp, s) ||
-      use_d512_prefill_route(
           q, k, v, has_arr_mask, do_causal, has_sinks, output_logsumexp, s)) {
     return false;
   }
@@ -1702,8 +1713,18 @@ void ScaledDotProductAttention::eval_gpu(
     }
 
     // The prefill route's decision was taken when the op was built
-    // (blocked_d512_); otherwise upstream's rule.
-    if (blocked_d512_ ||
+    // (blocked_d512_), re-checked against the shape a shapeless compile may
+    // replay it with; otherwise upstream's rule.
+    if ((blocked_d512_ &&
+         blocked_d512_shape(
+             q,
+             k,
+             v,
+             has_arr_mask,
+             do_causal_,
+             sinks.has_value(),
+             lse != nullptr,
+             s)) ||
         use_blocked_d512(
             q,
             k,
