@@ -473,16 +473,24 @@ class TestFastSDPA(mlx_tests.MLXTestCase):
 
         # The route never takes 8 rows or fewer (the vector kernels' range), an
         # array mask, or a head dim other than 512.
+        # Inputs are evaluated first so each trace holds the attention alone.
         q = mx.random.normal((1, 16, 8, 512), mx.float16)
         k = mx.random.normal((1, 2, 600, 512), mx.float16)
+        mx.eval(q, k)
         _, names = run(q, k, k, "causal", True)
         self.assertEqual(fused(names), (False, False), names)
+        self.assertFalse(any(n.startswith("sdpa_blocked_") for n in names), names)
+        _, off_names = run(q, k, k, "causal", False)
+        self.assertEqual(names, off_names)
         q = mx.random.normal((1, 16, 64, 512), mx.float16)
         mask = mx.random.uniform(shape=(1, 1, 64, 600)) > 0.2
+        mx.eval(q, mask)
         _, names = run(q, k, k, mask, True)
         self.assertEqual(fused(names), (False, False), names)
+        self.assertFalse(any(n.startswith("sdpa_blocked_") for n in names), names)
         q = mx.random.normal((1, 16, 512, 256), mx.float16)
         k = mx.random.normal((1, 2, 900, 256), mx.float16)
+        mx.eval(q, k)
         _, on_names = run(q, k, k, "causal", True)
         _, off_names = run(q, k, k, "causal", False)
         self.assertEqual(on_names, off_names)
