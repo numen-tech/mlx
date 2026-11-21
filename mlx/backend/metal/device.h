@@ -331,7 +331,14 @@ constexpr int kQmvMmaVersion = 2;
 //    kernel on a NAX GPU (whose query-block floor it also lifts). The blocked
 //    path's score buffer is min(256, qL) rows. Off, every call routes as before
 //    (numen-tech/gemma4-qat#1972).
-constexpr int kSdpaD512PrefillVersion = 1;
+// 2: on a NAX GPU too the route takes the blocked path, never the NAX d512
+//    kernel, at any row count from 9 (the NAX kernel was slower than unfused
+//    at 512-row chunks and moved the logits by up to 0.38; the blocked path
+//    matched the measured models' logits bit for bit, and an op-level call
+//    within an fp16 ulp or two). The decision is
+//    recorded on the primitive when the op is built. Apple6 never takes it.
+//    Off, every call routes as upstream does, the NAX d512 kernel included.
+constexpr int kSdpaD512PrefillVersion = 2;
 
 // Bumped when the implied-bias (0-d factor) gather kernels change. A binding
 // reads it to tell whether a core carries them.

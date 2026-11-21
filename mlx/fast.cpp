@@ -927,7 +927,12 @@ array scaled_dot_product_attention(
   bool is_training = detail::in_grad_tracing();
   bool has_fast_vjp = !ScaledDotProductAttentionVJP::use_fallback(q, stream);
   bool output_logsumexp = is_training && has_fast_vjp;
-  if (!ScaledDotProductAttention::use_fallback(
+  // The head-dim-512 prefill route (numen-tech/gemma4-qat#1972): its flag is
+  // read here once, so the same answer admits the call and records its path.
+  const bool blocked_d512 = ScaledDotProductAttention::use_d512_prefill_route(
+      q, k, v, has_arr_mask, do_causal, has_sinks, output_logsumexp, stream);
+  if (blocked_d512 ||
+      !ScaledDotProductAttention::use_fallback(
           q,
           k,
           v,
@@ -957,7 +962,8 @@ array scaled_dot_product_attention(
         do_causal,
         has_sinks,
         output_logsumexp,
-        force_fused);
+        force_fused,
+        blocked_d512);
     if (output_logsumexp) {
       return array::make_arrays(
           {std::move(out_shape), Shape{q.shape(0), q.shape(1), q.shape(2), 1}},
@@ -1027,7 +1033,8 @@ bool ScaledDotProductAttention::is_equivalent(const Primitive& other) const {
   return scale_ == a_other.scale_ && do_causal_ == a_other.do_causal_ &&
       has_sinks_ == a_other.has_sinks_ &&
       output_logsumexp_ == a_other.output_logsumexp_ &&
-      force_fused_ == a_other.force_fused_;
+      force_fused_ == a_other.force_fused_ &&
+      blocked_d512_ == a_other.blocked_d512_;
 }
 
 bool ScaledDotProductAttentionVJP::is_equivalent(const Primitive& other) const {

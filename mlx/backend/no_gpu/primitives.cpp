@@ -49,6 +49,18 @@ bool fast::ScaledDotProductAttentionVJP::use_fallback(
   return true;
 }
 
+bool fast::ScaledDotProductAttention::use_d512_prefill_route(
+    const array& q,
+    const array& k,
+    const array& v,
+    bool has_arr_mask,
+    bool do_causal,
+    bool has_sinks,
+    bool output_logsumexp,
+    Stream s) {
+  return false;
+}
+
 bool fast::ScaledDotProductAttention::supports_bool_mask() {
   return false;
 }

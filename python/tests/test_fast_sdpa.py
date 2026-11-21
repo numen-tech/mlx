@@ -1,5 +1,6 @@
 import math
 import os
+import tempfile
 import unittest
 from itertools import product
 
@@ -407,12 +408,15 @@ class TestFastSDPA(mlx_tests.MLXTestCase):
     @unittest.skipIf(not mx.metal.is_available(), "Metal kernel path only")
     def test_sdpa_d512_prefill_route(self):
         # numen-tech/gemma4-qat#1972: mx.metal._set_sdpa_d512_prefill(True)
-        # lets a causal head-dim-512 call of 9 or more rows take the blocked
-        # path (no NAX) or the NAX d512 kernel; off, such a call below 1,024
-        # rows stays unfused, as before.
+        # sends a causal head-dim-512 call of 9 or more rows to the blocked
+        # path on every GPU, NAX included (never the NAX d512 kernel), within
+        # an fp16 ulp or two of the unfused path (the GEMM tiles differ with
+        # the row count, so a few elements can round the other way); off,
+        # such a call below 1,024 rows stays unfused, as before.
         if mx.default_device() != mx.gpu:
             self.skipTest("requires GPU")
-        nax = None
+        if os.environ.get("MLX_FORCE_GPU_FAMILY") == "apple6":
+            self.skipTest("Apple6 never takes the route")
 
         def run(q, k, v, mask, on, off_at_eval=False):
             mx.metal._set_sdpa_d512_prefill(on)
@@ -460,16 +464,28 @@ class TestFastSDPA(mlx_tests.MLXTestCase):
                 off, off_names = run(q, k, v, "causal", False)
                 self.assertEqual(fused(off_names), (False, False), off_names)
                 on, on_names = run(q, k, v, "causal", True)
-                blocked, nax_d512 = fused(on_names)
-                if nax is None:
-                    nax = nax_d512
-                self.assertTrue(blocked != nax_d512, on_names)
-                self.assertEqual(nax_d512, nax)
+                self.assertEqual(fused(on_names), (True, False), on_names)
                 self.assertTrue(mx.allclose(ref, on, atol=tol, rtol=tol))
                 self.assertTrue(mx.allclose(ref, off, atol=tol, rtol=tol))
+                # The blocked path sums as the unfused one does, but for a
+                # few last-bit roundings (measured dmax 6.1e-5 on the M5 Air).
+                self.assertTrue(mx.allclose(on, off, atol=1e-4, rtol=1e-3))
                 late, late_names = run(q, k, v, "causal", True, off_at_eval=True)
-                self.assertEqual(fused(late_names), (blocked, nax_d512))
+                self.assertEqual(fused(late_names), (True, False), late_names)
                 self.assertTrue(mx.array_equal(late, on))
+
+        # At the stock floors (1,024 rows, 32 x 32 query blocks) the flag-off
+        # call takes upstream's fused path (the NAX d512 kernel on NAX, the
+        # blocked path without), and the flag-on call the blocked path.
+        q = (0.5 * mx.random.normal((1, 32, 1024, 512))).astype(mx.float16)
+        k = (0.5 * mx.random.normal((1, 4, 1024, 512))).astype(mx.float16)
+        v = (0.5 * mx.random.normal((1, 4, 1024, 512))).astype(mx.float16)
+        mx.eval(q, k, v)
+        off, off_names = run(q, k, v, "causal", False)
+        self.assertIn(fused(off_names), ((True, False), (False, True)), off_names)
+        on, on_names = run(q, k, v, "causal", True)
+        self.assertEqual(fused(on_names), (True, False), on_names)
+        self.assertTrue(mx.allclose(on, off, atol=1e-2, rtol=1e-2))
 
         # The route never takes 8 rows or fewer (the vector kernels' range), an
         # array mask, or a head dim other than 512.
@@ -494,6 +510,49 @@ class TestFastSDPA(mlx_tests.MLXTestCase):
         _, on_names = run(q, k, k, "causal", True)
         _, off_names = run(q, k, k, "causal", False)
         self.assertEqual(on_names, off_names)
+
+    @unittest.skipIf(not mx.metal.is_available(), "Metal kernel path only")
+    def test_sdpa_d512_prefill_route_export_import(self):
+        # numen-tech/gemma4-qat#1972: the route's decision is part of the
+        # primitive's state, so a function exported with the route on imports
+        # with it and takes the blocked path whatever the flag reads then.
+        if mx.default_device() != mx.gpu:
+            self.skipTest("requires GPU")
+        if os.environ.get("MLX_FORCE_GPU_FAMILY") == "apple6":
+            self.skipTest("Apple6 never takes the route")
+        mx.random.seed(0)
+        q = (0.5 * mx.random.normal((1, 16, 16, 512))).astype(mx.float16)
+        k = (0.5 * mx.random.normal((1, 2, 96, 512))).astype(mx.float16)
+        v = (0.5 * mx.random.normal((1, 2, 96, 512))).astype(mx.float16)
+        mx.eval(q, k, v)
+
+        def fun(q, k, v):
+            return mx.fast.scaled_dot_product_attention(
+                q, k, v, scale=512**-0.5, mask="causal"
+            )
+
+        def traced(f, *args):
+            mx.metal._kernel_trace_start()
+            out = f(*args)
+            mx.eval(out)
+            return out, mx.metal._kernel_trace_stop()
+
+        def blocked(names):
+            return any(n.startswith("sdpa_blocked_") for n in names)
+
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "d512_route.mlxfn")
+            mx.metal._set_sdpa_d512_prefill(True)
+            try:
+                on, on_names = traced(fun, q, k, v)
+                mx.export_function(path, fun, q, k, v)
+            finally:
+                mx.metal._set_sdpa_d512_prefill(False)
+            self.assertTrue(blocked(on_names), on_names)
+            imported = mx.import_function(path)
+            out, names = traced(imported, q, k, v)
+        self.assertTrue(blocked(names), names)
+        self.assertTrue(mx.allclose(out[0], on, atol=1e-4, rtol=1e-3))
 
     @unittest.skipIf(not mx.metal.is_available(), "Metal kernel path only")
     def test_sdpa_full_head_dim_512_nax(self):
