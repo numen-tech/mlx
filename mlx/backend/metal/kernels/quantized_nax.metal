@@ -143,6 +143,40 @@
   instantiate_quantized_ib_types(64, bits)    \
   instantiate_quantized_ib_types(32, bits)
 
+// Row-stride ("_rs") variants (quantized.cpp use_row_stride,
+// gemma4-qat#1973): affine 4/8-bit with an explicit bias.
+#define instantiate_quantized_rs_batched(name, type, group_size, bits, bm, bn, bk, wm, wn, batched)     \
+  instantiate_kernel(                                                    \
+      #name "_" #type "_gs_" #group_size "_b_" #bits "_bm" #bm "_bn" #bn "_bk" #bk "_wm" #wm "_wn" #wn "_batch_" #batched "_rs", \
+      name, type, group_size, bits, batched, bm, bk, bn, wm, wn, false, true)
+
+#define instantiate_quantized_rs_aligned_batched(name, type, group_size, bits, bm, bn, bk, wm, wn, aligned, batched)     \
+  instantiate_kernel(                                                                     \
+      #name "_" #type "_gs_" #group_size "_b_" #bits "_bm" #bm "_bn" #bn "_bk" #bk "_wm" #wm "_wn" #wn "_alN_" #aligned "_batch_" #batched "_rs", \
+      name, type, group_size, bits, aligned, batched, bm, bk, bn, wm, wn, false, false, true)
+
+#define instantiate_quantized_rs_funcs(type, group_size, bits) \
+  instantiate_quantized_rs_batched(affine_qmm_n_nax, type, group_size, bits, 64, 64, 64, 2, 2, 1) \
+  instantiate_quantized_rs_batched(affine_qmm_n_nax, type, group_size, bits, 64, 64, 64, 2, 2, 0) \
+  instantiate_quantized_rs_aligned_batched(affine_qmm_t_nax, type, group_size, bits, 64, 64, 64, 2, 2, true, 1) \
+  instantiate_quantized_rs_aligned_batched(affine_qmm_t_nax, type, group_size, bits, 64, 64, 64, 2, 2, true, 0) \
+  instantiate_quantized_rs_aligned_batched(affine_qmm_t_nax, type, group_size, bits, 64, 64, 64, 2, 2, false, 1) \
+  instantiate_quantized_rs_aligned_batched(affine_qmm_t_nax, type, group_size, bits, 64, 64, 64, 2, 2, false, 0) \
+  instantiate_quantized_rs_aligned_batched(affine_qmm_t_nax, type, group_size, bits, 32, 64, 64, 2, 2, true, 1) \
+  instantiate_quantized_rs_aligned_batched(affine_qmm_t_nax, type, group_size, bits, 32, 64, 64, 2, 2, true, 0) \
+  instantiate_quantized_rs_aligned_batched(affine_qmm_t_nax, type, group_size, bits, 32, 64, 64, 2, 2, false, 1) \
+  instantiate_quantized_rs_aligned_batched(affine_qmm_t_nax, type, group_size, bits, 32, 64, 64, 2, 2, false, 0)
+
+#define instantiate_quantized_rs_types(group_size, bits)        \
+  instantiate_quantized_rs_funcs(float, group_size, bits)       \
+  instantiate_quantized_rs_funcs(float16_t, group_size, bits)   \
+  instantiate_quantized_rs_funcs(bfloat16_t, group_size, bits)
+
+#define instantiate_quantized_rs_groups(bits) \
+  instantiate_quantized_rs_types(128, bits)   \
+  instantiate_quantized_rs_types(64, bits)    \
+  instantiate_quantized_rs_types(32, bits)
+
 #define instantiate_quantized_all() \
   instantiate_quantized_groups(1) \
   instantiate_quantized_groups(2) \
@@ -154,6 +188,8 @@
   instantiate_quantized_ib_groups(1) \
   instantiate_quantized_ib_groups(2) \
   instantiate_quantized_ib_groups(4) \
-  instantiate_quantized_ib_groups(8)
+  instantiate_quantized_ib_groups(8) \
+  instantiate_quantized_rs_groups(4) \
+  instantiate_quantized_rs_groups(8)
 
 instantiate_quantized_all() // clang-format on

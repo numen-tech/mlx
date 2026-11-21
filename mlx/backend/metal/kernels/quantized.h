@@ -692,7 +692,8 @@ template <
     short tgp_size,
     short group_size,
     short bits,
-    bool implied_bias = false>
+    bool implied_bias = false,
+    bool row_stride = false>
 struct QuantizedBlockLoader {
   static_assert(
       BCOLS <= group_size,
@@ -722,6 +723,9 @@ struct QuantizedBlockLoader {
   const int tile_stride;
   short group_step_cnt;
   const int group_stride;
+  // Rows of biases per tile step; group_stride unless row_stride ("_rs"
+  // kernels, gemma4-qat#1973: QRowStrides gives each array's own row stride).
+  const int bias_stride;
 
   const short thread_idx;
   const short bi;
@@ -740,21 +744,31 @@ struct QuantizedBlockLoader {
       const int src_ld_,
       threadgroup T* dst_,
       ushort simd_group_id [[simdgroup_index_in_threadgroup]],
-      ushort simd_lane_id [[thread_index_in_simdgroup]]) thread
+      ushort simd_lane_id [[thread_index_in_simdgroup]],
+      const QRowStrides rs = QRowStrides{0, 0, 0}) thread
       : src_ld(src_ld_),
         tile_stride(
             reduction_dim ? BCOLS_PACKED* bytes_per_pack
-                          : BROWS * src_ld * bytes_per_pack / pack_factor),
+                          : (row_stride ? BROWS * rs.w
+                                        : BROWS * src_ld * bytes_per_pack /
+                                              pack_factor)),
         group_step_cnt(0),
-        group_stride(BROWS* src_ld / group_size),
+        group_stride(row_stride ? BROWS * rs.s : BROWS * src_ld / group_size),
+        bias_stride(row_stride ? BROWS * rs.b : BROWS * src_ld / group_size),
         thread_idx(simd_group_id * 32 + simd_lane_id),
         bi(n_reads* thread_idx / BCOLS_PACKED),
         bj((n_reads * thread_idx) % BCOLS_PACKED),
         dst(dst_ + bi * dst_ld + bj * pack_factor),
-        src(src_ + bi * src_ld * bytes_per_pack / pack_factor +
+        src(src_ +
+            (row_stride ? bi * rs.w
+                        : bi * src_ld * bytes_per_pack / pack_factor) +
             bj * bytes_per_pack),
-        scales(scales_ + bi * src_ld / group_size),
-        biases(implied_bias ? biases_ : biases_ + bi * src_ld / group_size),
+        scales(scales_ + (row_stride ? bi * rs.s : bi * src_ld / group_size)),
+        biases(
+            implied_bias ? biases_
+                         : biases_ +
+                               (row_stride ? bi * rs.b
+                                           : bi * src_ld / group_size)),
         bias_factor(implied_bias ? biases_[0] : T(0)) {}
 
   T load_bias(T scale) const thread {
@@ -819,7 +833,7 @@ struct QuantizedBlockLoader {
     } else {
       scales += group_stride;
       if (!implied_bias) {
-        biases += group_stride;
+        biases += row_stride ? bias_stride : group_stride;
       }
     }
   }
@@ -897,7 +911,8 @@ template <
     int bits,
     bool partial_rows = false,
     bool bias_free = false,
-    bool implied_bias = false>
+    bool implied_bias = false,
+    bool row_stride = false>
 METAL_FUNC void qmv_fast_impl(
     const device uint32_t* w,
     const device T* scales,
@@ -908,7 +923,8 @@ METAL_FUNC void qmv_fast_impl(
     const constant int& out_vec_size,
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
-    uint simd_lid [[thread_index_in_simdgroup]]) {
+    uint simd_lid [[thread_index_in_simdgroup]],
+    const QRowStrides rs = QRowStrides{0, 0, 0}) {
   // numen-tech/mlx#3: 1-bit uses 1 pack/thread (vpt=32) for occupancy
   // (~+11% decode).
   constexpr int packs_per_thread = bits <= 2 ? 1 : 2;
@@ -930,8 +946,10 @@ METAL_FUNC void qmv_fast_impl(
   const T f = implied_bias ? biases[0] : T(0);
 
   // Adjust positions
-  const int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;
-  const int in_vec_size_g = in_vec_size / group_size;
+  const int in_vec_size_w =
+      row_stride ? rs.w : in_vec_size * bytes_per_pack / pack_factor;
+  const int in_vec_size_g = row_stride ? rs.s : in_vec_size / group_size;
+  const int in_vec_size_b = row_stride ? rs.b : in_vec_size_g;
   const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
       simd_gid * results_per_simdgroup;
 
@@ -949,7 +967,7 @@ METAL_FUNC void qmv_fast_impl(
 
   ws += out_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
   scales += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
-  biases += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  biases += out_row * in_vec_size_b + simd_lid / scale_step_per_thread;
   x += tid.x * in_vec_size + simd_lid * values_per_thread;
   y += tid.x * out_vec_size + out_row;
 
@@ -965,7 +983,7 @@ METAL_FUNC void qmv_fast_impl(
       }
       auto wl = (const device uint8_t*)(ws + src * in_vec_size_w);
       const device T* sl = scales + src * in_vec_size_g;
-      const device T* bl = biases + src * in_vec_size_g;
+      const device T* bl = biases + src * in_vec_size_b;
 
       U s = sl[0];
       U b = affine_bias<U, T, bits, bias_free, implied_bias>(s, f, sl[0], bl);
@@ -994,7 +1012,7 @@ METAL_FUNC void qmv_fast_impl(
         }
         auto wl = (const device uint8_t*)(ws + src * in_vec_size_w);
         const device T* sl = scales + src * in_vec_size_g;
-        const device T* bl = biases + src * in_vec_size_g;
+        const device T* bl = biases + src * in_vec_size_b;
 
         U s = sl[0];
         U b = affine_bias<U, T, bits, bias_free, implied_bias>(s, f, sl[0], bl);
@@ -1017,7 +1035,8 @@ template <
     int group_size,
     int bits,
     bool bias_free = false,
-    bool implied_bias = false>
+    bool implied_bias = false,
+    bool row_stride = false>
 METAL_FUNC void qmv_impl(
     const device uint32_t* w,
     const device T* scales,
@@ -1028,7 +1047,8 @@ METAL_FUNC void qmv_impl(
     const constant int& out_vec_size,
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
-    uint simd_lid [[thread_index_in_simdgroup]]) {
+    uint simd_lid [[thread_index_in_simdgroup]],
+    const QRowStrides rs = QRowStrides{0, 0, 0}) {
   constexpr int num_simdgroups = 2;
   constexpr int results_per_simdgroup = 4;
   constexpr int packs_per_thread = 1;
@@ -1049,8 +1069,10 @@ METAL_FUNC void qmv_impl(
   const T f = implied_bias ? biases[0] : T(0);
 
   // Adjust positions
-  const int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;
-  const int in_vec_size_g = in_vec_size / group_size;
+  const int in_vec_size_w =
+      row_stride ? rs.w : in_vec_size * bytes_per_pack / pack_factor;
+  const int in_vec_size_g = row_stride ? rs.s : in_vec_size / group_size;
+  const int in_vec_size_b = row_stride ? rs.b : in_vec_size_g;
   const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
       simd_gid * results_per_simdgroup;
   const int used_out_row = min(out_vec_size - results_per_simdgroup, out_row);
@@ -1065,7 +1087,7 @@ METAL_FUNC void qmv_impl(
     ws +=
         out_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
     scales += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
-    biases += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+    biases += out_row * in_vec_size_b + simd_lid / scale_step_per_thread;
     x += tid.x * in_vec_size + simd_lid * values_per_thread;
     y += tid.x * out_vec_size + out_row;
 
@@ -1078,7 +1100,7 @@ METAL_FUNC void qmv_impl(
            row++) {
         auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
         const device T* sl = scales + row * in_vec_size_g;
-        const device T* bl = biases + row * in_vec_size_g;
+        const device T* bl = biases + row * in_vec_size_b;
 
         U s = sl[0];
         U b = affine_bias<U, T, bits, bias_free, implied_bias>(s, f, sl[0], bl);
@@ -1104,7 +1126,7 @@ METAL_FUNC void qmv_impl(
            row++) {
         auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
         const device T* sl = scales + row * in_vec_size_g;
-        const device T* bl = biases + row * in_vec_size_g;
+        const device T* bl = biases + row * in_vec_size_b;
 
         U s = sl[0];
         U b = affine_bias<U, T, bits, bias_free, implied_bias>(s, f, sl[0], bl);
@@ -1128,7 +1150,7 @@ METAL_FUNC void qmv_impl(
     ws += used_out_row * in_vec_size_w +
         simd_lid * packs_per_thread * bytes_per_pack;
     scales += used_out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
-    biases += used_out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+    biases += used_out_row * in_vec_size_b + simd_lid / scale_step_per_thread;
     x += tid.x * in_vec_size + simd_lid * values_per_thread;
     y += tid.x * out_vec_size + used_out_row;
 
@@ -1139,7 +1161,7 @@ METAL_FUNC void qmv_impl(
       for (int row = 0; row < results_per_simdgroup; row++) {
         auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
         const device T* sl = scales + row * in_vec_size_g;
-        const device T* bl = biases + row * in_vec_size_g;
+        const device T* bl = biases + row * in_vec_size_b;
 
         U s = sl[0];
         U b = affine_bias<U, T, bits, bias_free, implied_bias>(s, f, sl[0], bl);
@@ -1163,7 +1185,7 @@ METAL_FUNC void qmv_impl(
       for (int row = 0; row < results_per_simdgroup; row++) {
         auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
         const device T* sl = scales + row * in_vec_size_g;
-        const device T* bl = biases + row * in_vec_size_g;
+        const device T* bl = biases + row * in_vec_size_b;
 
         U s = sl[0];
         U b = affine_bias<U, T, bits, bias_free, implied_bias>(s, f, sl[0], bl);
@@ -1191,7 +1213,8 @@ template <
     int bits,
     int vecs_per_tg,
     int rows,
-    bool implied_bias = false>
+    bool implied_bias = false,
+    bool row_stride = false>
 METAL_FUNC void qmv_wide_rr_impl(
     const device uint32_t* w,
     const device T* scales,
@@ -1203,7 +1226,8 @@ METAL_FUNC void qmv_wide_rr_impl(
     const constant int& M,
     uint3 tid,
     uint simd_gid,
-    uint simd_lid) {
+    uint simd_lid,
+    const QRowStrides rs = QRowStrides{0, 0, 0}) {
   constexpr int num_simdgroups = 2;
   constexpr int vpt = 8;
   constexpr int step = vpt * SIMD_SIZE;
@@ -1212,8 +1236,9 @@ METAL_FUNC void qmv_wide_rr_impl(
 
   const int row0 = tid.y * (rows * num_simdgroups) + rows * simd_gid;
   const int vec0 = tid.x * vecs_per_tg;
-  const int in_vec_size_w = in_vec_size * bits / 8;
-  const int in_vec_size_g = in_vec_size / group_size;
+  const int in_vec_size_w = row_stride ? rs.w : in_vec_size * bits / 8;
+  const int in_vec_size_g = row_stride ? rs.s : in_vec_size / group_size;
+  const int in_vec_size_b = row_stride ? rs.b : in_vec_size_g;
   const T f = implied_bias ? biases[0] : T(0);
 
   U result[rows][vecs_per_tg];
@@ -1242,7 +1267,7 @@ METAL_FUNC void qmv_wide_rr_impl(
       const device uint8_t* wc =
           (const device uint8_t*)w + rr * in_vec_size_w + k * bits / 8;
       const device T* srow = scales + rr * in_vec_size_g;
-      const device T* brow = biases + rr * in_vec_size_g;
+      const device T* brow = biases + rr * in_vec_size_b;
       U scale = srow[g];
       U bias = affine_bias<U, T, bits, false, implied_bias>(
           scale, f, srow[g], brow + g);
@@ -1293,7 +1318,8 @@ template <
     int bits,
     int vecs_per_tg,
     int k_lanes,
-    bool implied_bias = false>
+    bool implied_bias = false,
+    bool row_stride = false>
 METAL_FUNC void qmv_wide_impl(
     const device uint32_t* w,
     const device T* scales,
@@ -1305,7 +1331,8 @@ METAL_FUNC void qmv_wide_impl(
     const constant int& M,
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
-    uint simd_lid [[thread_index_in_simdgroup]]) {
+    uint simd_lid [[thread_index_in_simdgroup]],
+    const QRowStrides rs = QRowStrides{0, 0, 0}) {
   constexpr int num_simdgroups = 2;
   constexpr int results_per_simdgroup = SIMD_SIZE / k_lanes;
   constexpr int sub = 8; // values per sub-chunk (== bits bytes, byte-aligned)
@@ -1323,9 +1350,10 @@ METAL_FUNC void qmv_wide_impl(
 
   const int in_vec_size_w = in_vec_size * bits / 8; // bytes per weight row
   const int in_vec_size_g = in_vec_size / group_size;
-  const device uint8_t* wrow = (const device uint8_t*)w + row * in_vec_size_w;
-  const device T* srow = scales + row * in_vec_size_g;
-  const device T* brow = biases + row * in_vec_size_g;
+  const device uint8_t* wrow =
+      (const device uint8_t*)w + row * (row_stride ? rs.w : in_vec_size_w);
+  const device T* srow = scales + row * (row_stride ? rs.s : in_vec_size_g);
+  const device T* brow = biases + row * (row_stride ? rs.b : in_vec_size_g);
   const T f = implied_bias ? biases[0] : T(0);
 
   const device T* xv[vecs_per_tg];
@@ -1393,7 +1421,8 @@ template <
     typename T,
     const int group_size,
     const int bits,
-    bool implied_bias = false>
+    bool implied_bias = false,
+    bool row_stride = false>
 METAL_FUNC void qvm_impl(
     const device uint32_t* w,
     const device T* scales,
@@ -1405,7 +1434,8 @@ METAL_FUNC void qvm_impl(
     const int in_vec_stride,
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
-    uint simd_lid [[thread_index_in_simdgroup]]) {
+    uint simd_lid [[thread_index_in_simdgroup]],
+    const QRowStrides rs = QRowStrides{0, 0, 0}) {
   constexpr int power_of_2_bits = (bits & (bits - 1)) == 0;
   constexpr int num_simdgroups = 2;
   constexpr int pack_factor = get_pack_factor<bits, 32>();
@@ -1432,12 +1462,16 @@ METAL_FUNC void qvm_impl(
   const T f = implied_bias ? biases[0] : T(0);
 
   // Adjust positions
-  const int out_vec_size_w = out_vec_size * bytes_per_pack / pack_factor;
-  const int out_vec_size_g = out_vec_size / group_size;
+  // rs.w is in bytes; ws steps in W_T.
+  const int out_vec_size_w = row_stride
+      ? rs.w / static_cast<int>(sizeof(W_T))
+      : out_vec_size * bytes_per_pack / pack_factor;
+  const int out_vec_size_g = row_stride ? rs.s : out_vec_size / group_size;
+  const int out_vec_size_b = row_stride ? rs.b : out_vec_size_g;
   int out_col = pack_factor * tn * (tid.y * num_simdgroups + simd_gid);
   ws += out_col * bytes_per_pack / pack_factor + simd_lid * out_vec_size_w;
   scales += out_col / group_size + simd_lid * out_vec_size_g;
-  biases += out_col / group_size + simd_lid * out_vec_size_g;
+  biases += out_col / group_size + simd_lid * out_vec_size_b;
   x += tid.x * in_vec_stride + simd_lid;
   y += tid.x * out_vec_size + out_col;
 
@@ -1459,7 +1493,7 @@ METAL_FUNC void qvm_impl(
 
       x += block_size;
       scales += block_size * out_vec_size_g;
-      biases += block_size * out_vec_size_g;
+      biases += block_size * out_vec_size_b;
       ws += block_size * out_vec_size_w;
     }
   } else {
@@ -1475,7 +1509,7 @@ METAL_FUNC void qvm_impl(
 
       x += block_size;
       scales += block_size * out_vec_size_g;
-      biases += block_size * out_vec_size_g;
+      biases += block_size * out_vec_size_b;
       ws += block_size * out_vec_size_w;
     }
     if (static_cast<int>(simd_lid) < remaining) {
@@ -1517,7 +1551,8 @@ template <
     const int BM = 32,
     const int BK = 32,
     const int BN = 32,
-    bool implied_bias = false>
+    bool implied_bias = false,
+    bool row_stride = false>
 METAL_FUNC void qmm_t_impl(
     const device uint32_t* w,
     const device T* scales,
@@ -1533,7 +1568,8 @@ METAL_FUNC void qmm_t_impl(
     uint3 tid [[threadgroup_position_in_grid]],
     uint lid [[thread_index_in_threadgroup]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
-    uint simd_lid [[thread_index_in_simdgroup]]) {
+    uint simd_lid [[thread_index_in_simdgroup]],
+    const QRowStrides rs = QRowStrides{0, 0, 0}) {
   static_assert(BK >= SIMD_SIZE, "BK should be larger than SIMD_SIZE");
   static_assert(BK % SIMD_SIZE == 0, "BK should be divisible by SIMD_SIZE");
 
@@ -1560,11 +1596,13 @@ METAL_FUNC void qmm_t_impl(
       WM * WN * SIMD_SIZE,
       group_size,
       bits,
-      implied_bias>;
+      implied_bias,
+      row_stride>;
 
   // Set the block
-  const int K_w = K * bytes_per_pack / pack_factor;
-  const int K_g = K / group_size;
+  const int K_w = row_stride ? rs.w : K * bytes_per_pack / pack_factor;
+  const int K_g = row_stride ? rs.s : K / group_size;
+  const int K_b = row_stride ? rs.b : K_g;
   const int y_row = tid.y * BM;
   const int y_col = tid.x * BN;
 
@@ -1574,7 +1612,7 @@ METAL_FUNC void qmm_t_impl(
   wl += y_col * K_w;
   scales += y_col * K_g;
   if (!implied_bias) {
-    biases += y_col * K_g;
+    biases += y_col * K_b;
   }
   y += y_row * static_cast<int64_t>(N) + y_col;
 
@@ -1582,7 +1620,7 @@ METAL_FUNC void qmm_t_impl(
   const short num_els = min(BM, M - y_row);
   const short num_outs = min(BN, N - y_col);
   loader_x_t loader_x(x, K, Xs, simd_gid, simd_lid);
-  loader_w_t loader_w(wl, scales, biases, K, Ws, simd_gid, simd_lid);
+  loader_w_t loader_w(wl, scales, biases, K, Ws, simd_gid, simd_lid, rs);
   mma_t mma_op(simd_gid, simd_lid);
 
   if (num_els < BM) {
@@ -1648,7 +1686,8 @@ template <
     const int BM = 32,
     const int BK = 32,
     const int BN = 32,
-    bool implied_bias = false>
+    bool implied_bias = false,
+    bool row_stride = false>
 METAL_FUNC void qmm_n_impl(
     const device uint32_t* w,
     const device T* scales,
@@ -1663,7 +1702,8 @@ METAL_FUNC void qmm_n_impl(
     uint3 tid [[threadgroup_position_in_grid]],
     uint lid [[thread_index_in_threadgroup]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
-    uint simd_lid [[thread_index_in_simdgroup]]) {
+    uint simd_lid [[thread_index_in_simdgroup]],
+    const QRowStrides rs = QRowStrides{0, 0, 0}) {
   static_assert(BK >= SIMD_SIZE, "BK should be larger than SIMD_SIZE");
   static_assert(BK % SIMD_SIZE == 0, "BK should be divisible by SIMD_SIZE");
 
@@ -1691,7 +1731,8 @@ METAL_FUNC void qmm_n_impl(
       WM * WN * SIMD_SIZE,
       group_size,
       bits,
-      implied_bias>;
+      implied_bias,
+      row_stride>;
 
   auto wl = (const device uint8_t*)w;
 
@@ -1709,7 +1750,7 @@ METAL_FUNC void qmm_n_impl(
   // Make the x loader and mma operation
   const short num_els = min(BM, M - y_row);
   loader_x_t loader_x(x, K, Xs, simd_gid, simd_lid);
-  loader_w_t loader_w(wl, scales, biases, N, Ws, simd_gid, simd_lid);
+  loader_w_t loader_w(wl, scales, biases, N, Ws, simd_gid, simd_lid, rs);
   mma_t mma_op(simd_gid, simd_lid);
 
   if (num_els < BM) {
@@ -1942,7 +1983,8 @@ template <
     bool partial_rows = false,
     bool has_global_scale = false,
     int results_per_simdgroup = 4,
-    bool implied_bias = false>
+    bool implied_bias = false,
+    bool row_stride = false>
 [[kernel]] void affine_qmv_fast(
     const device uint32_t* w [[buffer(0)]],
     const device T* scales [[buffer(1)]],
@@ -1981,13 +2023,16 @@ template <
         b_strides,
         tid);
   }
+  const QRowStrides rs = load_row_strides<row_stride>(
+      w_batch_ndims, w_strides, s_strides, b_strides);
   qmv_fast_impl<
       T,
       group_size,
       bits,
       partial_rows,
       /*bias_free=*/false,
-      implied_bias>(
+      implied_bias,
+      row_stride>(
       w,
       scales,
       biases,
@@ -1997,7 +2042,8 @@ template <
       out_vec_size,
       tid,
       simd_gid,
-      simd_lid);
+      simd_lid,
+      rs);
 }
 
 template <
@@ -2008,7 +2054,8 @@ template <
     bool partial_rows = false,
     bool has_global_scale = false,
     int results_per_simdgroup = 4,
-    bool implied_bias = false>
+    bool implied_bias = false,
+    bool row_stride = false>
 [[kernel]] void affine_qmv(
     const device uint32_t* w [[buffer(0)]],
     const device T* scales [[buffer(1)]],
@@ -2047,7 +2094,9 @@ template <
         b_strides,
         tid);
   }
-  qmv_impl<T, group_size, bits, /*bias_free=*/false, implied_bias>(
+  const QRowStrides rs = load_row_strides<row_stride>(
+      w_batch_ndims, w_strides, s_strides, b_strides);
+  qmv_impl<T, group_size, bits, /*bias_free=*/false, implied_bias, row_stride>(
       w,
       scales,
       biases,
@@ -2057,7 +2106,8 @@ template <
       out_vec_size,
       tid,
       simd_gid,
-      simd_lid);
+      simd_lid,
+      rs);
 }
 
 // Bias-free decode kernels: same buffer layout as affine_qmv* with the biases
@@ -2187,7 +2237,8 @@ template <
     int vecs_per_tg,
     int k_lanes,
     bool batched,
-    bool implied_bias = false>
+    bool implied_bias = false,
+    bool row_stride = false>
 [[kernel]] void affine_qmv_wide(
     const device uint32_t* w,
     const device T* scales,
@@ -2226,7 +2277,16 @@ template <
         b_strides,
         tid);
   }
-  qmv_wide_impl<T, group_size, bits, vecs_per_tg, k_lanes, implied_bias>(
+  const QRowStrides rs = load_row_strides<row_stride>(
+      w_batch_ndims, w_strides, s_strides, b_strides);
+  qmv_wide_impl<
+      T,
+      group_size,
+      bits,
+      vecs_per_tg,
+      k_lanes,
+      implied_bias,
+      row_stride>(
       w,
       scales,
       biases,
@@ -2237,7 +2297,8 @@ template <
       M,
       tid,
       simd_gid,
-      simd_lid);
+      simd_lid,
+      rs);
 }
 
 // SIMT quantized GEMM for the Apple6 (A13) MMA-free route (gemma4-qat#991).
@@ -2444,7 +2505,8 @@ template <
     int bits,
     int vecs_per_tg,
     bool batched,
-    bool implied_bias = false>
+    bool implied_bias = false,
+    bool row_stride = false>
 [[kernel]] void affine_qmv_wide_rr(
     const device uint32_t* w,
     const device T* scales,
@@ -2483,13 +2545,16 @@ template <
         b_strides,
         tid);
   }
+  const QRowStrides rs = load_row_strides<row_stride>(
+      w_batch_ndims, w_strides, s_strides, b_strides);
   qmv_wide_rr_impl<
       T,
       group_size,
       bits,
       vecs_per_tg,
       SIMD_SIZE / 8,
-      implied_bias>(
+      implied_bias,
+      row_stride>(
       w,
       scales,
       biases,
@@ -2500,7 +2565,8 @@ template <
       M,
       tid,
       simd_gid,
-      simd_lid);
+      simd_lid,
+      rs);
 }
 
 template <
@@ -2509,7 +2575,8 @@ template <
     const int bits,
     bool batched,
     bool has_global_scale = false,
-    bool implied_bias = false>
+    bool implied_bias = false,
+    bool row_stride = false>
 [[kernel]] void affine_qvm(
     const device uint32_t* w [[buffer(0)]],
     const device T* scales [[buffer(1)]],
@@ -2548,7 +2615,9 @@ template <
         b_strides,
         tid);
   }
-  qvm_impl<T, group_size, bits, implied_bias>(
+  const QRowStrides rs = load_row_strides<row_stride>(
+      w_batch_ndims, w_strides, s_strides, b_strides);
+  qvm_impl<T, group_size, bits, implied_bias, row_stride>(
       w,
       scales,
       biases,
@@ -2559,7 +2628,8 @@ template <
       in_vec_size,
       tid,
       simd_gid,
-      simd_lid);
+      simd_lid,
+      rs);
 }
 
 template <
@@ -2567,7 +2637,8 @@ template <
     const int group_size,
     const int bits,
     int split_k = 32,
-    bool implied_bias = false>
+    bool implied_bias = false,
+    bool row_stride = false>
 [[kernel]] void affine_qvm_split_k(
     const device uint32_t* w [[buffer(0)]],
     const device T* scales [[buffer(1)]],
@@ -2613,7 +2684,9 @@ template <
   // The in_vec_stride is the full K dimension, not the partition size
   int in_vec_stride = (split_k - 1) * in_vec_size + final_block_size;
 
-  qvm_impl<T, group_size, bits, implied_bias>(
+  const QRowStrides rs = load_row_strides<row_stride>(
+      w_batch_ndims, w_strides, s_strides, b_strides);
+  qvm_impl<T, group_size, bits, implied_bias, row_stride>(
       w,
       scales,
       biases,
@@ -2624,7 +2697,8 @@ template <
       in_vec_stride,
       tid,
       simd_gid,
-      simd_lid);
+      simd_lid,
+      rs);
 }
 
 template <
@@ -2637,7 +2711,8 @@ template <
     const int BM = 32,
     const int BK = 32,
     const int BN = 32,
-    bool implied_bias = false>
+    bool implied_bias = false,
+    bool row_stride = false>
 [[kernel]] void affine_qmm_t(
     const device uint32_t* w [[buffer(0)]],
     const device T* scales [[buffer(1)]],
@@ -2684,7 +2759,19 @@ template <
         b_strides,
         tid);
   }
-  qmm_t_impl<T, group_size, bits, aligned_N, T, BM, BK, BN, implied_bias>(
+  const QRowStrides rs = load_row_strides<row_stride>(
+      w_batch_ndims, w_strides, s_strides, b_strides);
+  qmm_t_impl<
+      T,
+      group_size,
+      bits,
+      aligned_N,
+      T,
+      BM,
+      BK,
+      BN,
+      implied_bias,
+      row_stride>(
       w,
       scales,
       biases,
@@ -2699,7 +2786,8 @@ template <
       tid,
       lid,
       simd_gid,
-      simd_lid);
+      simd_lid,
+      rs);
 }
 
 // ml-explore/mlx#4787's affine_qmv_mma (3-16 rows on the 8x8 simdgroup MMA),
@@ -3340,7 +3428,8 @@ template <
     int BM = 32,
     int BK = 32,
     int BN = 32,
-    bool implied_bias = false>
+    bool implied_bias = false,
+    bool row_stride = false>
 [[kernel]] void affine_qmm_n(
     const device uint32_t* w [[buffer(0)]],
     const device T* scales [[buffer(1)]],
@@ -3389,8 +3478,24 @@ template <
         tid);
   }
 
-  qmm_n_impl<T, group_size, bits, BM, BK, BN, implied_bias>(
-      w, scales, biases, x, y, Xs, Ws, K, N, M, tid, lid, simd_gid, simd_lid);
+  const QRowStrides rs = load_row_strides<row_stride>(
+      w_batch_ndims, w_strides, s_strides, b_strides);
+  qmm_n_impl<T, group_size, bits, BM, BK, BN, implied_bias, row_stride>(
+      w,
+      scales,
+      biases,
+      x,
+      y,
+      Xs,
+      Ws,
+      K,
+      N,
+      M,
+      tid,
+      lid,
+      simd_gid,
+      simd_lid,
+      rs);
 }
 
 // The gather kernels with an implied-bias twin (numen-tech/gemma4-qat#1833):

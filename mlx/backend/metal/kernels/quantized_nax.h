@@ -681,7 +681,8 @@ template <
     short tgp_size,
     short group_size,
     short bits,
-    bool implied_bias = false>
+    bool implied_bias = false,
+    bool row_stride = false>
 struct QuantizedBlockLoader {
   static_assert(
       BCOLS <= group_size,
@@ -705,6 +706,9 @@ struct QuantizedBlockLoader {
   const int tile_stride;
   short group_step_cnt;
   const int group_stride;
+  // Rows of biases per tile step; group_stride unless row_stride ("_rs"
+  // kernels, gemma4-qat#1973: QRowStrides gives each array's own row stride).
+  const int bias_stride;
 
   const short thread_idx;
   const short bi;
@@ -723,21 +727,31 @@ struct QuantizedBlockLoader {
       const int src_ld_,
       threadgroup T* dst_,
       ushort simd_group_id [[simdgroup_index_in_threadgroup]],
-      ushort simd_lane_id [[thread_index_in_simdgroup]]) thread
+      ushort simd_lane_id [[thread_index_in_simdgroup]],
+      const QRowStrides rs = QRowStrides{0, 0, 0}) thread
       : src_ld(src_ld_),
         tile_stride(
             reduction_dim ? BCOLS_PACKED* bytes_per_pack
-                          : BROWS * src_ld * bytes_per_pack / pack_factor),
+                          : (row_stride ? BROWS * rs.w
+                                        : BROWS * src_ld * bytes_per_pack /
+                                              pack_factor)),
         group_step_cnt(0),
-        group_stride(BROWS* src_ld / group_size),
+        group_stride(row_stride ? BROWS * rs.s : BROWS * src_ld / group_size),
+        bias_stride(row_stride ? BROWS * rs.b : BROWS * src_ld / group_size),
         thread_idx(simd_group_id * 32 + simd_lane_id),
         bi(n_reads* thread_idx / BCOLS_PACKED),
         bj((n_reads * thread_idx) % BCOLS_PACKED),
         dst(dst_ + bi * dst_ld + bj * pack_factor),
-        src(src_ + bi * src_ld * bytes_per_pack / pack_factor +
+        src(src_ +
+            (row_stride ? bi * rs.w
+                        : bi * src_ld * bytes_per_pack / pack_factor) +
             bj * bytes_per_pack),
-        scales(scales_ + bi * src_ld / group_size),
-        biases(implied_bias ? biases_ : biases_ + bi * src_ld / group_size),
+        scales(scales_ + (row_stride ? bi * rs.s : bi * src_ld / group_size)),
+        biases(
+            implied_bias ? biases_
+                         : biases_ +
+                               (row_stride ? bi * rs.b
+                                           : bi * src_ld / group_size)),
         bias_factor(implied_bias ? biases_[0] : T(0)) {}
 
   T load_bias(T scale) const thread {
@@ -801,7 +815,7 @@ struct QuantizedBlockLoader {
     } else {
       scales += group_stride;
       if (!implied_bias) {
-        biases += group_stride;
+        biases += row_stride ? bias_stride : group_stride;
       }
     }
   }
@@ -815,7 +829,8 @@ template <
     short reduction_dim,
     short tgp_size,
     short bits,
-    bool implied_bias>
+    bool implied_bias,
+    bool row_stride>
 struct QuantizedBlockLoader<
     T,
     BROWS,
@@ -825,7 +840,8 @@ struct QuantizedBlockLoader<
     tgp_size,
     32,
     bits,
-    implied_bias> {
+    implied_bias,
+    row_stride> {
   MLX_MTL_CONST short group_size = 32;
 
   static_assert(
@@ -850,6 +866,7 @@ struct QuantizedBlockLoader<
   const int src_ld;
   const int tile_stride;
   const int group_stride;
+  const int bias_stride; // as the primary template's
 
   const short thread_idx;
   const short bi;
@@ -870,23 +887,34 @@ struct QuantizedBlockLoader<
       const int src_ld_,
       threadgroup T* dst_,
       ushort simd_group_id [[simdgroup_index_in_threadgroup]],
-      ushort simd_lane_id [[thread_index_in_simdgroup]]) thread
+      ushort simd_lane_id [[thread_index_in_simdgroup]],
+      const QRowStrides rs = QRowStrides{0, 0, 0}) thread
       : src_ld(src_ld_),
         tile_stride(
             reduction_dim ? BCOLS_PACKED* bytes_per_pack
-                          : BROWS * src_ld * bytes_per_pack / pack_factor),
-        group_stride(BROWS* src_ld / group_size),
+                          : (row_stride ? BROWS * rs.w
+                                        : BROWS * src_ld * bytes_per_pack /
+                                              pack_factor)),
+        group_stride(row_stride ? BROWS * rs.s : BROWS * src_ld / group_size),
+        bias_stride(row_stride ? BROWS * rs.b : BROWS * src_ld / group_size),
         thread_idx(simd_group_id * 32 + simd_lane_id),
         bi(n_reads* thread_idx / BCOLS_PACKED),
         bj((n_reads * thread_idx) % BCOLS_PACKED),
         group_id((bj * pack_factor) / group_size),
         dst(dst_ + bi * dst_ld + bj * pack_factor),
-        src(src_ + bi * src_ld * bytes_per_pack / pack_factor +
+        src(src_ +
+            (row_stride ? bi * rs.w
+                        : bi * src_ld * bytes_per_pack / pack_factor) +
             bj * bytes_per_pack),
-        scales(scales_ + bi * src_ld / group_size + group_id),
+        scales(
+            scales_ + (row_stride ? bi * rs.s : bi * src_ld / group_size) +
+            group_id),
         biases(
             implied_bias ? biases_
-                         : biases_ + bi * src_ld / group_size + group_id),
+                         : biases_ +
+                               (row_stride ? bi * rs.b
+                                           : bi * src_ld / group_size) +
+                               group_id),
         bias_factor(implied_bias ? biases_[0] : T(0)) {}
 
   T load_bias(T scale) const thread {
@@ -948,7 +976,7 @@ struct QuantizedBlockLoader<
     } else {
       scales += group_stride;
       if (!implied_bias) {
-        biases += group_stride;
+        biases += row_stride ? bias_stride : group_stride;
       }
     }
   }
@@ -1057,7 +1085,8 @@ template <
     const int BN = 64,
     const int WM = 2,
     const int WN = 2,
-    bool implied_bias = false>
+    bool implied_bias = false,
+    bool row_stride = false>
 METAL_FUNC void qmm_t_nax_tgp_impl(
     const device uint32_t* w,
     const device T* scales,
@@ -1071,7 +1100,8 @@ METAL_FUNC void qmm_t_nax_tgp_impl(
     uint3 tid [[threadgroup_position_in_grid]],
     uint lid [[thread_index_in_threadgroup]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
-    uint simd_lid [[thread_index_in_simdgroup]]) {
+    uint simd_lid [[thread_index_in_simdgroup]],
+    const QRowStrides rs = QRowStrides{0, 0, 0}) {
   static_assert(BK >= SIMD_SIZE, "BK should be larger than SIMD_SIZE");
   static_assert(BK % SIMD_SIZE == 0, "BK should be divisible by SIMD_SIZE");
 
@@ -1091,11 +1121,13 @@ METAL_FUNC void qmm_t_nax_tgp_impl(
       WM * WN * SIMD_SIZE,
       group_size,
       bits,
-      implied_bias>;
+      implied_bias,
+      row_stride>;
 
   // Set the block
-  const int K_w = K * bytes_per_pack / pack_factor;
-  const int K_g = K / group_size;
+  const int K_w = row_stride ? rs.w : K * bytes_per_pack / pack_factor;
+  const int K_g = row_stride ? rs.s : K / group_size;
+  const int K_b = row_stride ? rs.b : K_g;
   const int y_row = tid.y * BM;
   const int y_col = tid.x * BN;
 
@@ -1105,12 +1137,12 @@ METAL_FUNC void qmm_t_nax_tgp_impl(
   wl += y_col * K_w;
   scales += y_col * K_g;
   if (!implied_bias) {
-    biases += y_col * K_g;
+    biases += y_col * K_b;
   }
   y += y_row * static_cast<int64_t>(N) + y_col;
 
   // Make the weight loader
-  loader_w_t loader_w(wl, scales, biases, K, Ws, simd_gid, simd_lid);
+  loader_w_t loader_w(wl, scales, biases, K, Ws, simd_gid, simd_lid, rs);
 
   constexpr short SM = BM / WM;
   constexpr short SN = BN / WN;
@@ -1205,7 +1237,8 @@ template <
     const int BN = 64,
     const int WM = 2,
     const int WN = 2,
-    bool implied_bias = false>
+    bool implied_bias = false,
+    bool row_stride = false>
 METAL_FUNC void qmm_n_nax_tgp_impl(
     const device uint32_t* w,
     const device T* scales,
@@ -1219,7 +1252,8 @@ METAL_FUNC void qmm_n_nax_tgp_impl(
     uint3 tid [[threadgroup_position_in_grid]],
     uint lid [[thread_index_in_threadgroup]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
-    uint simd_lid [[thread_index_in_simdgroup]]) {
+    uint simd_lid [[thread_index_in_simdgroup]],
+    const QRowStrides rs = QRowStrides{0, 0, 0}) {
   (void)lid;
 
   static_assert(BK >= SIMD_SIZE, "BK should be larger than SIMD_SIZE");
@@ -1239,7 +1273,8 @@ METAL_FUNC void qmm_n_nax_tgp_impl(
       WM * WN * SIMD_SIZE,
       group_size,
       bits,
-      implied_bias>;
+      implied_bias,
+      row_stride>;
 
   // Set the block
   const int y_row = tid.y * BM;
@@ -1257,7 +1292,7 @@ METAL_FUNC void qmm_n_nax_tgp_impl(
   y += y_row * static_cast<int64_t>(N) + y_col;
 
   // Make the weight loader
-  loader_w_t loader_w(wl, scales, biases, N, Ws, simd_gid, simd_lid);
+  loader_w_t loader_w(wl, scales, biases, N, Ws, simd_gid, simd_lid, rs);
 
   constexpr short SM = BM / WM;
   constexpr short SN = BN / WN;
@@ -1340,7 +1375,8 @@ template <
     const int WM = 2,
     const int WN = 2,
     const bool has_global_scale = false,
-    bool implied_bias = false>
+    bool implied_bias = false,
+    bool row_stride = false>
 [[kernel]] void affine_qmm_t_nax(
     const device uint32_t* w [[buffer(0)]],
     const device T* scales [[buffer(1)]],
@@ -1386,6 +1422,8 @@ template <
         b_strides,
         tid);
   }
+  const QRowStrides rs = load_row_strides<row_stride>(
+      w_batch_ndims, w_strides, s_strides, b_strides);
   qmm_t_nax_tgp_impl<
       T,
       group_size,
@@ -1396,8 +1434,9 @@ template <
       BN,
       WM,
       WN,
-      implied_bias>(
-      w, scales, biases, x, y, Ws, K, N, M, tid, lid, simd_gid, simd_lid);
+      implied_bias,
+      row_stride>(
+      w, scales, biases, x, y, Ws, K, N, M, tid, lid, simd_gid, simd_lid, rs);
 }
 
 template <
@@ -1410,7 +1449,8 @@ template <
     const int BN = 64,
     const int WM = 2,
     const int WN = 2,
-    bool implied_bias = false>
+    bool implied_bias = false,
+    bool row_stride = false>
 [[kernel]] void affine_qmm_n_nax(
     const device uint32_t* w [[buffer(0)]],
     const device T* scales [[buffer(1)]],
@@ -1457,8 +1497,20 @@ template <
         tid);
   }
 
-  qmm_n_nax_tgp_impl<T, group_size, bits, BM, BK, BN, WM, WN, implied_bias>(
-      w, scales, biases, x, y, Ws, K, N, M, tid, lid, simd_gid, simd_lid);
+  const QRowStrides rs = load_row_strides<row_stride>(
+      w_batch_ndims, w_strides, s_strides, b_strides);
+  qmm_n_nax_tgp_impl<
+      T,
+      group_size,
+      bits,
+      BM,
+      BK,
+      BN,
+      WM,
+      WN,
+      implied_bias,
+      row_stride>(
+      w, scales, biases, x, y, Ws, K, N, M, tid, lid, simd_gid, simd_lid, rs);
 }
 
 template <

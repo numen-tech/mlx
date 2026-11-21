@@ -331,6 +331,18 @@ constexpr int kQmvMmaVersion = 2;
 //    (numen-tech/gemma4-qat#1833).
 constexpr int kGatherImpliedBiasVersion = 1;
 
+// Bumped when the quantized-matmul row-stride route (quantized.cpp
+// use_row_stride) changes. A binding reads it to tell whether a core carries
+// it.
+// 1: under set_quantized_row_stride(true) (metal.h) or MLX_QMM_ROW_STRIDE=1,
+//    an affine 4/8-bit quantized_matmul with an explicit bias reads w, scales
+//    and biases whose rows are a row stride apart in place ("_rs" kernels:
+//    qmv, qmv_fast, qmv_wide, qmv_wide_rr, qmm_t, qmm_t_nax, qvm, qvm_split_k,
+//    qmm_n, qmm_n_nax) instead of copying them. Off by default; every other
+//    call, and qmv_quad, qmv_mma, the split-K qmm and Apple6, copy as before
+//    (numen-tech/gemma4-qat#1973).
+constexpr int kQuantizedRowStrideVersion = 1;
+
 // Call before each host wait on GPU work.
 void count_host_wait();
 

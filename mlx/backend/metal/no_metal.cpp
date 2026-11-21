@@ -39,6 +39,7 @@ std::vector<std::string> kernel_trace_stop() {
 }
 
 void set_qmv_mma(bool) {}
+void set_quantized_row_stride(bool) {}
 bool qmv_mma_device() {
   return false;
 }
