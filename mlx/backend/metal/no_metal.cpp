@@ -43,6 +43,11 @@ bool qmv_mma_device() {
   return false;
 }
 
+void set_sdpa_d512_prefill(bool) {}
+bool sdpa_d512_prefill() {
+  return false;
+}
+
 array nonresident_array(
     void* data,
     Shape shape,

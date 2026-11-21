@@ -1,5 +1,6 @@
 // Copyright © 2024-26 Apple Inc.
 #include <algorithm>
+#include <atomic>
 #include <sstream>
 
 #include "mlx/backend/common/compiled.h"
@@ -17,7 +18,25 @@ namespace mlx::core::fast {
 
 namespace {
 
-bool use_blocked_d512(
+// The head-dim-512 prefill route (metal::set_sdpa_d512_prefill,
+// numen-tech/gemma4-qat#1972): off by default. On, the fused d512 paths take a
+// causal call from kD512PrefillMinRows query rows instead of 1,024 (and the NAX
+// kernel without its query-block floor). Read only when an op is built
+// (use_fallback); eval_gpu routes on the shape alone, so a call keeps the path
+// it was built for. Version: kSdpaD512PrefillVersion (device.h).
+std::atomic<bool> sdpa_d512_prefill_flag{false};
+constexpr int kD512PrefillMinRows = 9;
+
+int d512_min_rows() {
+  return sdpa_d512_prefill_flag.load(std::memory_order_relaxed)
+      ? kD512PrefillMinRows
+      : 1024;
+}
+
+// Whether the blocked d512 path can serve a call (a GPU without NAX, half
+// precision, head dim 512, causal with no array mask, sinks or logsumexp),
+// whatever its row count.
+bool blocked_d512_shape(
     const array& q,
     const array& k,
     const array& v,
@@ -28,8 +47,24 @@ bool use_blocked_d512(
     Stream s) {
   return s.device == Device::gpu && !metal::is_nax_available() &&
       (q.dtype() == float16 || q.dtype() == bfloat16) && q.shape(-1) == 512 &&
-      v.shape(-1) == 512 && q.shape(2) >= 1024 && q.shape(2) <= k.shape(2) &&
-      do_causal && !has_arr_mask && !has_sinks && !output_logsumexp;
+      v.shape(-1) == 512 && q.shape(2) <= k.shape(2) && do_causal &&
+      !has_arr_mask && !has_sinks && !output_logsumexp;
+}
+
+// Whether to build a call for the blocked d512 path: the shape and the row
+// floor (1,024, or kD512PrefillMinRows with the prefill route on).
+bool use_blocked_d512(
+    const array& q,
+    const array& k,
+    const array& v,
+    bool has_arr_mask,
+    bool do_causal,
+    bool has_sinks,
+    bool output_logsumexp,
+    Stream s) {
+  return q.shape(2) >= d512_min_rows() &&
+      blocked_d512_shape(
+             q, k, v, has_arr_mask, do_causal, has_sinks, output_logsumexp, s);
 }
 
 void sdpa_blocked_softmax(const Stream& s, metal::Device& d, array& scores) {
@@ -75,12 +110,12 @@ void sdpa_full_self_attention_blocked(
     const array& v,
     float scale,
     array& o) {
-  // This block size balances score-buffer memory and GEMM efficiency.
-  constexpr int block_rows = 256;
-
   int B = q.shape(0);
   int H = q.shape(1);
   int qL = q.shape(2);
+  // This block size balances score-buffer memory and GEMM efficiency; a call
+  // of fewer rows (the prefill route's) sizes the buffers to its rows.
+  const int block_rows = std::min(256, qL);
   int kL = k.shape(2);
   int D = q.shape(3);
   int kvH = k.shape(1);
@@ -1452,14 +1487,17 @@ bool ScaledDotProductAttention::use_fallback(
   const int value_head_dim = v.shape(-1);
 
   if (query_head_dim == 512 && query_sequence_length > 8) {
-    constexpr int64_t min_query_blocks = 1024;
+    // The D512 kernel needs this many query blocks to match fallback speed;
+    // the prefill route takes it from kD512PrefillMinRows rows regardless,
+    // since the unfused path's score array is what it removes.
+    const bool route = sdpa_d512_prefill_flag.load(std::memory_order_relaxed);
+    const int64_t min_query_blocks = route ? 0 : 1024;
     const int64_t query_blocks = int64_t(q.shape(0)) * q.shape(1) *
         int64_t(ceildiv(query_sequence_length, 32));
-    // The D512 kernel needs this many query blocks to match fallback speed.
     const bool eligible = metal::is_nax_available() &&
         (env::enable_tf32() || q.dtype() != float32) &&
-        query_sequence_length >= 1024 && do_causal && !has_arr_mask &&
-        query_blocks >= min_query_blocks;
+        query_sequence_length >= d512_min_rows() && do_causal &&
+        !has_arr_mask && query_blocks >= min_query_blocks;
     return !eligible;
   }
 
@@ -1646,7 +1684,10 @@ void ScaledDotProductAttention::eval_gpu(
       lse = &outputs[1];
     }
 
-    if (use_blocked_d512(
+    // The row floor was applied when the op was built (use_fallback): a
+    // head-dim-512 call that reaches here on a GPU without NAX has no other
+    // fused kernel, so the shape alone decides.
+    if (blocked_d512_shape(
             q,
             k,
             v,
@@ -1740,3 +1781,18 @@ void ScaledDotProductAttentionVJP::eval_gpu(
 }
 
 } // namespace mlx::core::fast
+
+namespace mlx::core::metal {
+
+void set_sdpa_d512_prefill(bool enabled) {
+  // Relaxed: the host's own synchronization with the thread that builds the
+  // ops (its load, then a forward) orders the store before the calls it
+  // governs.
+  fast::sdpa_d512_prefill_flag.store(enabled, std::memory_order_relaxed);
+}
+
+bool sdpa_d512_prefill() {
+  return fast::sdpa_d512_prefill_flag.load(std::memory_order_relaxed);
+}
+
+} // namespace mlx::core::metal

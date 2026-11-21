@@ -45,6 +45,16 @@ void init_metal(nb::module_& m) {
       &mx::metal::qmv_mma_device,
       "Whether this GPU can take the affine qmv_mma route.");
   metal.def(
+      "_set_sdpa_d512_prefill",
+      &mx::metal::set_sdpa_d512_prefill,
+      "enabled"_a,
+      "Turn the head-dim-512 prefill route on or off (fused d512 attention "
+      "from 9 causal query rows).");
+  metal.def(
+      "_sdpa_d512_prefill",
+      &mx::metal::sdpa_d512_prefill,
+      "Whether the head-dim-512 prefill route is on.");
+  metal.def(
       "is_available",
       &mx::metal::is_available,
       R"pbdoc(
