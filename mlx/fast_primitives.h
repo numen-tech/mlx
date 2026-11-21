@@ -274,13 +274,15 @@ class ScaledDotProductAttention : public Custom {
       bool do_causal,
       bool has_sinks,
       bool output_logsumexp,
-      bool force_fused)
+      bool force_fused,
+      bool blocked_d512 = false)
       : Custom(stream, std::move(fallback)),
         scale_(scale),
         do_causal_(do_causal),
         has_sinks_(has_sinks),
         output_logsumexp_(output_logsumexp),
-        force_fused_(force_fused) {}
+        force_fused_(force_fused),
+        blocked_d512_(blocked_d512) {}
 
   static bool use_fallback(
       const array& q,
@@ -295,6 +297,18 @@ class ScaledDotProductAttention : public Custom {
       bool force_fused,
       Stream s);
   static bool supports_bool_mask();
+  // Whether the head-dim-512 prefill route (metal::set_sdpa_d512_prefill,
+  // numen-tech/gemma4-qat#1972) sends this call to the blocked d512 path; read
+  // when the op is built and kept in blocked_d512_.
+  static bool use_d512_prefill_route(
+      const array& q,
+      const array& k,
+      const array& v,
+      bool has_arr_mask,
+      bool do_causal,
+      bool has_sinks,
+      bool output_logsumexp,
+      Stream s);
 
   void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs)
       override {
@@ -330,6 +344,8 @@ class ScaledDotProductAttention : public Custom {
   bool has_sinks_;
   bool output_logsumexp_;
   bool force_fused_;
+  // Not in state(): a process-local routing choice, not part of the op.
+  bool blocked_d512_;
 };
 
 class ScaledDotProductAttentionVJP : public Custom {

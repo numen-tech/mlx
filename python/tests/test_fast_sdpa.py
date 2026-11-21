@@ -407,12 +407,12 @@ class TestFastSDPA(mlx_tests.MLXTestCase):
     @unittest.skipIf(not mx.metal.is_available(), "Metal kernel path only")
     def test_sdpa_d512_prefill_route(self):
         # numen-tech/gemma4-qat#1972: mx.metal._set_sdpa_d512_prefill(True)
-        # lets a causal head-dim-512 call of 9 or more rows take the blocked
-        # path (no NAX) or the NAX d512 kernel; off, such a call below 1,024
-        # rows stays unfused, as before.
+        # sends a causal head-dim-512 call of 9 or more rows to the blocked
+        # path on every GPU, NAX included (never the NAX d512 kernel), and its
+        # output matches the unfused path bit for bit; off, such a call below
+        # 1,024 rows stays unfused, as before.
         if mx.default_device() != mx.gpu:
             self.skipTest("requires GPU")
-        nax = None
 
         def run(q, k, v, mask, on, off_at_eval=False):
             mx.metal._set_sdpa_d512_prefill(on)
@@ -460,15 +460,13 @@ class TestFastSDPA(mlx_tests.MLXTestCase):
                 off, off_names = run(q, k, v, "causal", False)
                 self.assertEqual(fused(off_names), (False, False), off_names)
                 on, on_names = run(q, k, v, "causal", True)
-                blocked, nax_d512 = fused(on_names)
-                if nax is None:
-                    nax = nax_d512
-                self.assertTrue(blocked != nax_d512, on_names)
-                self.assertEqual(nax_d512, nax)
+                self.assertEqual(fused(on_names), (True, False), on_names)
                 self.assertTrue(mx.allclose(ref, on, atol=tol, rtol=tol))
                 self.assertTrue(mx.allclose(ref, off, atol=tol, rtol=tol))
+                # The blocked path sums as the unfused one does.
+                self.assertTrue(mx.array_equal(on, off))
                 late, late_names = run(q, k, v, "causal", True, off_at_eval=True)
-                self.assertEqual(fused(late_names), (blocked, nax_d512))
+                self.assertEqual(fused(late_names), (True, False), late_names)
                 self.assertTrue(mx.array_equal(late, on))
 
         # The route never takes 8 rows or fewer (the vector kernels' range), an

@@ -75,14 +75,15 @@ MLX_API void set_qmv_mma(bool enabled);
 MLX_API bool qmv_mma_device();
 
 // The head-dim-512 prefill route (numen-tech/gemma4-qat#1972), off by default.
-// set_sdpa_d512_prefill(true) lets a causal head-dim-512 attention of 9 or more
-// query rows (no array mask, sinks or logsumexp) take the fused d512 paths,
-// which otherwise need 1,024 rows: the blocked path on a GPU without NAX, the
-// NAX d512 kernel on a NAX GPU. Neither materializes the full
-// [heads x rows x keys] score array the unfused path builds. A host that
-// switches it per model load calls this; the decision is taken when the op is
-// built, and a call built with it on still runs fused if it is switched off
-// before the call is evaluated. Version: kSdpaD512PrefillVersion (device.h).
+// set_sdpa_d512_prefill(true) sends a causal head-dim-512 attention of 9 or
+// more query rows (fp16/bf16, no array mask, sinks or logsumexp) to the
+// blocked d512 path on every GPU but Apple6, NAX included (never the NAX d512
+// kernel). Upstream takes it from 1,024 rows, and only without NAX. It does
+// not materialize the full [heads x rows x keys] score array the unfused path
+// builds. A host that switches it per model load calls this; the decision is
+// taken when the op is built, and a call built with it on still runs blocked if
+// it is switched off before the call is evaluated. Version:
+// kSdpaD512PrefillVersion (device.h).
 MLX_API void set_sdpa_d512_prefill(bool enabled);
 MLX_API bool sdpa_d512_prefill();
 
