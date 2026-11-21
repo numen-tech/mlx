@@ -2,6 +2,8 @@
 
 #include <atomic>
 #include <cstring>
+#include <limits>
+#include <stdexcept>
 
 #include "mlx/backend/common/broadcasting.h"
 #include "mlx/backend/common/compiled.h"
@@ -131,6 +133,16 @@ inline array ensure_row_contiguous_matrix(
   array x_copy = contiguous_copy_gpu(x, s);
   metal::get_command_encoder(s).add_temporary(x_copy);
   return x_copy;
+}
+
+// A route without a row-stride twin reached with uncopied views would read the
+// wrong rows: use_row_stride and the dispatch disagree (gemma4-qat#1973).
+inline void require_packed_rows(bool row_stride, const char* route) {
+  if (row_stride) {
+    throw std::logic_error(
+        std::string("[QuantizedMatmul] ") + route +
+        " has no row-stride kernel.");
+  }
 }
 
 // The most rows (input vectors) an Apple6 GPU takes in one quantized matmul
@@ -634,7 +646,8 @@ void qmv(
     int K,
     metal::Device& d,
     const Stream& s,
-    const std::string& mode) {
+    const std::string& mode,
+    bool row_stride = false) {
   int B = out.size() / M / N;
 
   int bn = 8;
@@ -667,7 +680,8 @@ void qmv(
       global_scale ? "_hgs_1" : "_hgs_0",
       "_r_",
       results_per_simdgroup,
-      is_implied_bias(biases) ? "_ib" : "");
+      is_implied_bias(biases) ? "_ib" : "",
+      row_stride ? "_rs" : "");
   auto kernel = is_implied_bias(biases) ? get_quantized_kernel_wrapped(
                                               d,
                                               kname,
@@ -681,18 +695,32 @@ void qmv(
                                               global_scale.has_value(),
                                               results_per_simdgroup,
                                               true)
-                                        : get_quantized_kernel_wrapped(
-                                              d,
-                                              kname,
-                                              (fast ? "qmv_fast" : "qmv"),
-                                              mode,
-                                              type_string,
-                                              group_size,
-                                              bits,
-                                              B > 1,
-                                              partial_rows,
-                                              global_scale.has_value(),
-                                              results_per_simdgroup);
+      : row_stride ? get_quantized_kernel_wrapped(
+                         d,
+                         kname,
+                         (fast ? "qmv_fast" : "qmv"),
+                         mode,
+                         type_string,
+                         group_size,
+                         bits,
+                         B > 1,
+                         partial_rows,
+                         /* has_global_scale = */ false,
+                         results_per_simdgroup,
+                         /* implied_bias = */ false,
+                         true)
+                   : get_quantized_kernel_wrapped(
+                         d,
+                         kname,
+                         (fast ? "qmv_fast" : "qmv"),
+                         mode,
+                         type_string,
+                         group_size,
+                         bits,
+                         B > 1,
+                         partial_rows,
+                         global_scale.has_value(),
+                         results_per_simdgroup);
 
   auto& compute_encoder = metal::get_command_encoder(s);
   compute_encoder.set_compute_pipeline_state(kernel);
@@ -709,7 +737,8 @@ void qmv(
   compute_encoder.set_output_array(out, c++);
   compute_encoder.set_bytes(K, c++);
   compute_encoder.set_bytes(N, c++);
-  add_strides_and_shapes(compute_encoder, B <= 1, x, w, scales, biases, c);
+  add_strides_and_shapes(
+      compute_encoder, B <= 1 && !row_stride, x, w, scales, biases, c);
 
   compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
 }
@@ -807,7 +836,8 @@ void qmv_wide(
     int K,
     metal::Device& d,
     const Stream& s,
-    const std::string& mode) {
+    const std::string& mode,
+    bool row_stride = false) {
   // vecs_per_tg is the per-threadgroup input-vector tile. Each tile re-reads
   // the weights, so use the fewest tiles, then the smallest tile that fills
   // them.
@@ -859,7 +889,8 @@ void qmv_wide(
         "_nv_",
         vecs_per_tg,
         batched ? "_batch_1" : "_batch_0",
-        implied ? "_ib" : "");
+        implied ? "_ib" : "",
+        row_stride ? "_rs" : "");
     kernel = implied ? get_quantized_kernel_wrapped(
                            d,
                            kname,
@@ -870,6 +901,18 @@ void qmv_wide(
                            bits,
                            vecs_per_tg,
                            batched,
+                           true)
+        : row_stride ? get_quantized_kernel_wrapped(
+                           d,
+                           kname,
+                           "qmv_wide_rr",
+                           mode,
+                           type_string,
+                           group_size,
+                           bits,
+                           vecs_per_tg,
+                           batched,
+                           /* implied_bias = */ false,
                            true)
                      : get_quantized_kernel_wrapped(
                            d,
@@ -895,7 +938,8 @@ void qmv_wide(
         "_kl_",
         k_lanes,
         batched ? "_batch_1" : "_batch_0",
-        implied ? "_ib" : "");
+        implied ? "_ib" : "",
+        row_stride ? "_rs" : "");
     kernel = implied ? get_quantized_kernel_wrapped(
                            d,
                            kname,
@@ -907,6 +951,19 @@ void qmv_wide(
                            vecs_per_tg,
                            k_lanes,
                            batched,
+                           true)
+        : row_stride ? get_quantized_kernel_wrapped(
+                           d,
+                           kname,
+                           "qmv_wide",
+                           mode,
+                           type_string,
+                           group_size,
+                           bits,
+                           vecs_per_tg,
+                           k_lanes,
+                           batched,
+                           /* implied_bias = */ false,
                            true)
                      : get_quantized_kernel_wrapped(
                            d,
@@ -935,7 +992,8 @@ void qmv_wide(
   compute_encoder.set_bytes(K, c++);
   compute_encoder.set_bytes(N, c++);
   compute_encoder.set_bytes(M, c++);
-  add_strides_and_shapes(compute_encoder, !batched, x, w, scales, biases, c);
+  add_strides_and_shapes(
+      compute_encoder, !batched && !row_stride, x, w, scales, biases, c);
 
   compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
 }
@@ -953,7 +1011,8 @@ void qvm_split_k(
     int K,
     metal::Device& d,
     const Stream& s,
-    const std::string& mode) {
+    const std::string& mode,
+    bool row_stride = false) {
   auto& compute_encoder = metal::get_command_encoder(s);
 
   int split_k = K > 8192 ? 32 : 8;
@@ -1000,9 +1059,14 @@ void qvm_split_k(
 
   w_shape.insert(w_shape.end() - 2, split_k);
   w_shape[w.ndim() - 1] /= split_k;
-  w_strides.insert(w_strides.end() - 2, split_D * w.shape(-1));
+  // One split is split_D rows of w: the packed row width apart, or the row
+  // stride of a view read in place (row_stride).
+  auto row_step = [row_stride](const array& a) {
+    return row_stride ? a.strides()[a.ndim() - 2] : int64_t(a.shape(-1));
+  };
+  w_strides.insert(w_strides.end() - 2, split_D * row_step(w));
   w_batch_ndims += 1;
-  s_strides.insert(s_strides.end() - 2, split_D * scales.shape(-1));
+  s_strides.insert(s_strides.end() - 2, split_D * row_step(scales));
 
   int final_block_size = K - (split_k - 1) * split_D;
 
@@ -1028,7 +1092,8 @@ void qvm_split_k(
       bits,
       "_spk_",
       split_k,
-      is_implied_bias(biases) ? "_ib" : "");
+      is_implied_bias(biases) ? "_ib" : "",
+      row_stride ? "_rs" : "");
 
   // Encode and dispatch kernel
   auto kernel = is_implied_bias(biases) ? get_quantized_kernel_wrapped(
@@ -1041,15 +1106,26 @@ void qvm_split_k(
                                               bits,
                                               split_k,
                                               true)
-                                        : get_quantized_kernel_wrapped(
-                                              d,
-                                              kname,
-                                              "qvm_split_k",
-                                              mode,
-                                              type_string,
-                                              group_size,
-                                              bits,
-                                              split_k);
+      : row_stride ? get_quantized_kernel_wrapped(
+                         d,
+                         kname,
+                         "qvm_split_k",
+                         mode,
+                         type_string,
+                         group_size,
+                         bits,
+                         split_k,
+                         /* implied_bias = */ false,
+                         true)
+                   : get_quantized_kernel_wrapped(
+                         d,
+                         kname,
+                         "qvm_split_k",
+                         mode,
+                         type_string,
+                         group_size,
+                         bits,
+                         split_k);
 
   compute_encoder.set_compute_pipeline_state(kernel);
 
@@ -1079,7 +1155,7 @@ void qvm_split_k(
       b_strides = Strides(s_strides.size(), 0);
     } else {
       b_strides = biases->strides();
-      b_strides.insert(b_strides.end() - 2, split_D * biases->shape(-1));
+      b_strides.insert(b_strides.end() - 2, split_D * row_step(*biases));
     }
     compute_encoder.set_vector_bytes(b_strides, c++);
   }
@@ -1110,7 +1186,8 @@ void qvm(
     int K,
     metal::Device& d,
     const Stream& s,
-    const std::string& mode) {
+    const std::string& mode,
+    bool row_stride = false) {
   int B = out.size() / M / N;
 
   constexpr int num_simdgroups = 2;
@@ -1132,7 +1209,8 @@ void qvm(
       bits,
       B > 1 ? "_batch_1" : "_batch_0",
       global_scale ? "_hgs" : "",
-      is_implied_bias(biases) ? "_ib" : "");
+      is_implied_bias(biases) ? "_ib" : "",
+      row_stride ? "_rs" : "");
   auto kernel = is_implied_bias(biases) ? get_quantized_kernel_wrapped(
                                               d,
                                               kname,
@@ -1144,16 +1222,28 @@ void qvm(
                                               B > 1,
                                               global_scale.has_value(),
                                               true)
-                                        : get_quantized_kernel_wrapped(
-                                              d,
-                                              kname,
-                                              "qvm",
-                                              mode,
-                                              type_string,
-                                              group_size,
-                                              bits,
-                                              B > 1,
-                                              global_scale.has_value());
+      : row_stride ? get_quantized_kernel_wrapped(
+                         d,
+                         kname,
+                         "qvm",
+                         mode,
+                         type_string,
+                         group_size,
+                         bits,
+                         B > 1,
+                         /* has_global_scale = */ false,
+                         /* implied_bias = */ false,
+                         true)
+                   : get_quantized_kernel_wrapped(
+                         d,
+                         kname,
+                         "qvm",
+                         mode,
+                         type_string,
+                         group_size,
+                         bits,
+                         B > 1,
+                         global_scale.has_value());
   auto& compute_encoder = metal::get_command_encoder(s);
   compute_encoder.set_compute_pipeline_state(kernel);
 
@@ -1169,7 +1259,8 @@ void qvm(
   compute_encoder.set_output_array(out, c++);
   compute_encoder.set_bytes(K, c++);
   compute_encoder.set_bytes(N, c++);
-  add_strides_and_shapes(compute_encoder, B <= 1, x, w, scales, biases, c++);
+  add_strides_and_shapes(
+      compute_encoder, B <= 1 && !row_stride, x, w, scales, biases, c++);
 
   compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
 }
@@ -1189,7 +1280,8 @@ void qmm_nax(
     int K,
     metal::Device& d,
     const Stream& s,
-    const std::string& mode) {
+    const std::string& mode,
+    bool row_stride = false) {
   int B = out.size() / M / N;
 
   int wm = 2;
@@ -1228,7 +1320,8 @@ void qmm_nax(
       transpose ? (aligned ? "_alN_true" : "_alN_false") : "",
       batched ? "_batch_1" : "_batch_0",
       global_scale ? "_hgs" : "",
-      is_implied_bias(biases) ? "_ib" : "");
+      is_implied_bias(biases) ? "_ib" : "",
+      row_stride ? "_rs" : "");
   std::string template_def;
   MTL::ComputePipelineState* kernel;
   const bool implied_bias = is_implied_bias(biases);
@@ -1251,22 +1344,40 @@ void qmm_nax(
                                 wn,
                                 /* has_global_scale = */ false,
                                 true)
-                          : get_qmm_nax_kernel_wrapped(
-                                d,
-                                kname,
-                                "qmm_t_nax",
-                                mode,
-                                type_string,
-                                group_size,
-                                bits,
-                                aligned,
-                                batched,
-                                bm,
-                                bk,
-                                bn,
-                                wm,
-                                wn,
-                                global_scale.has_value());
+        : row_stride ? get_qmm_nax_kernel_wrapped(
+                           d,
+                           kname,
+                           "qmm_t_nax",
+                           mode,
+                           type_string,
+                           group_size,
+                           bits,
+                           aligned,
+                           batched,
+                           bm,
+                           bk,
+                           bn,
+                           wm,
+                           wn,
+                           /* has_global_scale = */ false,
+                           /* implied_bias = */ false,
+                           true)
+                     : get_qmm_nax_kernel_wrapped(
+                           d,
+                           kname,
+                           "qmm_t_nax",
+                           mode,
+                           type_string,
+                           group_size,
+                           bits,
+                           aligned,
+                           batched,
+                           bm,
+                           bk,
+                           bn,
+                           wm,
+                           wn,
+                           global_scale.has_value());
   } else {
     kernel = implied_bias ? get_qmm_nax_kernel_wrapped(
                                 d,
@@ -1283,20 +1394,36 @@ void qmm_nax(
                                 wm,
                                 wn,
                                 true)
-                          : get_qmm_nax_kernel_wrapped(
-                                d,
-                                kname,
-                                "qmm_n_nax",
-                                mode,
-                                type_string,
-                                group_size,
-                                bits,
-                                batched,
-                                bm,
-                                bk,
-                                bn,
-                                wm,
-                                wn);
+        : row_stride ? get_qmm_nax_kernel_wrapped(
+                           d,
+                           kname,
+                           "qmm_n_nax",
+                           mode,
+                           type_string,
+                           group_size,
+                           bits,
+                           batched,
+                           bm,
+                           bk,
+                           bn,
+                           wm,
+                           wn,
+                           /* implied_bias = */ false,
+                           true)
+                     : get_qmm_nax_kernel_wrapped(
+                           d,
+                           kname,
+                           "qmm_n_nax",
+                           mode,
+                           type_string,
+                           group_size,
+                           bits,
+                           batched,
+                           bm,
+                           bk,
+                           bn,
+                           wm,
+                           wn);
   }
   auto& compute_encoder = metal::get_command_encoder(s);
   compute_encoder.set_compute_pipeline_state(kernel);
@@ -1317,7 +1444,8 @@ void qmm_nax(
   compute_encoder.set_bytes(K, c++);
   compute_encoder.set_bytes(N, c++);
   compute_encoder.set_bytes(M, c++);
-  add_strides_and_shapes(compute_encoder, B <= 1, x, w, scales, biases, c);
+  add_strides_and_shapes(
+      compute_encoder, B <= 1 && !row_stride, x, w, scales, biases, c);
 
   compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
 }
@@ -1448,7 +1576,8 @@ void qmm(
     int K,
     metal::Device& d,
     const Stream& s,
-    const std::string& mode) {
+    const std::string& mode,
+    bool row_stride = false) {
   d.require_mma("quantized_matmul (qmm)");
   assert(
       (!global_scale || (transpose && !biases)) &&
@@ -1474,7 +1603,8 @@ void qmm(
         /* int K = */ K,
         /* metal::Device& d = */ d,
         /* const Stream& s = */ s,
-        /* const std::string& mode = */ mode);
+        /* const std::string& mode = */ mode,
+        /* bool row_stride = */ row_stride);
   }
 
   int B = out.size() / M / N;
@@ -1484,6 +1614,7 @@ void qmm(
   // 32 x 32 output tiles, or 64 x 64 (use_qmm_tile64); BK stays 32.
   const bool tile64 = use_qmm_tile64(
       d, mode, transpose, global_scale.has_value(), bits, B, M, N);
+  require_packed_rows(row_stride && tile64, "qmm with 64 x 64 tiles");
   int bm = tile64 ? 64 : 32;
   int bn = tile64 ? 64 : 32;
   MTL::Size group_dims(32, wn, wm);
@@ -1507,7 +1638,8 @@ void qmm(
       batched ? "_batch_1" : "_batch_0",
       global_scale ? "_hgs" : "",
       tile64 ? "_bm_64_bn_64" : "",
-      is_implied_bias(biases) ? "_ib" : "");
+      is_implied_bias(biases) ? "_ib" : "",
+      row_stride ? "_rs" : "");
   std::string template_def;
   MTL::ComputePipelineState* kernel;
   const bool implied_bias = is_implied_bias(biases);
@@ -1528,6 +1660,22 @@ void qmm(
                                 32,
                                 bn,
                                 true)
+        : row_stride ? get_quantized_kernel_wrapped(
+                           d,
+                           kname,
+                           "qmm_t",
+                           mode,
+                           type_string,
+                           group_size,
+                           bits,
+                           aligned,
+                           batched,
+                           /* has_global_scale = */ false,
+                           bm,
+                           32,
+                           bn,
+                           /* implied_bias = */ false,
+                           true)
         : tile64 ? get_quantized_kernel_wrapped(
                        d,
                        kname,
@@ -1554,7 +1702,21 @@ void qmm(
                        batched,
                        global_scale.has_value());
   } else {
-    kernel = implied_bias
+    kernel = implied_bias ? get_quantized_kernel_wrapped(
+                                d,
+                                kname,
+                                "qmm_n",
+                                mode,
+                                type_string,
+                                group_size,
+                                bits,
+                                batched,
+                                /* has_global_scale = */ false,
+                                bm,
+                                32,
+                                bn,
+                                true)
+        : row_stride
         ? get_quantized_kernel_wrapped(
               d,
               kname,
@@ -1568,6 +1730,7 @@ void qmm(
               bm,
               32,
               bn,
+              /* implied_bias = */ false,
               true)
         : get_quantized_kernel_wrapped(
               d, kname, "qmm_n", mode, type_string, group_size, bits, batched);
@@ -1591,7 +1754,8 @@ void qmm(
   compute_encoder.set_bytes(K, c++);
   compute_encoder.set_bytes(N, c++);
   compute_encoder.set_bytes(M, c++);
-  add_strides_and_shapes(compute_encoder, B <= 1, x, w, scales, biases, c);
+  add_strides_and_shapes(
+      compute_encoder, B <= 1 && !row_stride, x, w, scales, biases, c);
 
   compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
 }
@@ -2480,11 +2644,13 @@ void dispatch_qmv(
     int K,
     metal::Device& d,
     const Stream& s,
-    const std::string& mode) {
+    const std::string& mode,
+    bool row_stride = false) {
   // It is a qmv with a small inner dimension so route to qmv_quad kernel
   // (1-bit needs K == 128 for a full pack per lane; no affine_sym variant).
   if ((K == 128 || (K == 64 && bits >= 2)) && is_power_of_2(bits) &&
       !global_scale && mode != "affine_sym") {
+    require_packed_rows(row_stride, "qmv_quad");
     qmv_quad(x, w, scales, biases, out, group_size, bits, M, N, K, d, s, mode);
     return;
   }
@@ -2492,7 +2658,21 @@ void dispatch_qmv(
   // Small batch so route to qmv_wide, which reuses each weight group across the
   // M vectors.
   if (M >= 2 && use_qmv_wide(mode, bits, M, d) && !global_scale) {
-    qmv_wide(x, w, scales, biases, out, group_size, bits, M, N, K, d, s, mode);
+    qmv_wide(
+        x,
+        w,
+        scales,
+        biases,
+        out,
+        group_size,
+        bits,
+        M,
+        N,
+        K,
+        d,
+        s,
+        mode,
+        row_stride);
     return;
   }
   qmv(x,
@@ -2508,7 +2688,8 @@ void dispatch_qmv(
       K,
       d,
       s,
-      mode);
+      mode,
+      row_stride);
 }
 
 // ml-explore/mlx#4787's affine qmv_mma (numen-tech/gemma4-qat#1701): taken
@@ -2606,6 +2787,92 @@ void qmv_mma(
       MTL::Size(N / bn, 1, 1), MTL::Size(32, wk, 1));
 }
 
+// The row-stride switch (numen-tech/gemma4-qat#1973):
+// metal::set_quantized_row_stride (a host's per-load switch) or
+// MLX_QMM_ROW_STRIDE=0|1, which decides alone when it is in the environment
+// (never cached). Off by default. use_row_stride reads it only for a call whose
+// w, scales or biases would otherwise be copied, so a call with packed rows
+// never reads the flag or the environment. Version: kQuantizedRowStrideVersion
+// (device.h).
+static std::atomic<bool> quantized_row_stride_flag{false};
+
+inline bool quantized_row_stride_enabled() {
+  if (const char* v = std::getenv("MLX_QMM_ROW_STRIDE")) {
+    return std::strcmp(v, "1") == 0;
+  }
+  return quantized_row_stride_flag.load(std::memory_order_relaxed);
+}
+
+// Whether QuantizedMatmul::eval_gpu reads w, scales and biases in place
+// through their row strides ("_rs" kernels) instead of copying the ones whose
+// rows are not packed: the switch is on, the call is affine with an explicit
+// bias at 4 or 8 bits, each of the three is packed or a view with unit column
+// stride and rows at least a row apart (a slice of the columns of a wider
+// array, such as one of two overlapping views of a compact K=V KV row), and the
+// route the call takes has a twin. The route test mirrors the dispatch in
+// eval_gpu, dispatch_qmv and qmm; `x` is eval_gpu's (already contiguous) input.
+// Twins: qmv, qmv_fast, qmv_wide, qmv_wide_rr, qmm_t (32 x 32 tiles), qmm_t_nax
+// (transposed); qvm, qvm_split_k, qmm_n, qmm_n_nax (not transposed). No twin:
+// the Apple6 routes, qmv_mma, qmv_quad and the split-K qmm (a transposed
+// non-batched product at or above the qmv batch limit).
+// A single row broadcast over batch dims has row stride 0 and is copied, as it
+// is when packed.
+inline bool use_row_stride(
+    const std::vector<array>& inputs,
+    const array& x,
+    const array& out,
+    bool transpose,
+    QuantizationMode mode,
+    int bits,
+    metal::Device& d) {
+  if (mode != QuantizationMode::Affine || inputs.size() != 4 ||
+      !(bits == 4 || bits == 8)) {
+    return false;
+  }
+  const array& w = inputs[1];
+  if (w.ndim() < 2 || inputs[2].ndim() != w.ndim() ||
+      inputs[3].ndim() != w.ndim()) {
+    return false;
+  }
+  bool strided = false;
+  for (int i = 1; i < 4; i++) {
+    const array& a = inputs[i];
+    auto row = a.strides()[a.ndim() - 2];
+    auto col = a.strides()[a.ndim() - 1];
+    // ensure_row_contiguous_matrix's test: this one is not copied.
+    if (a.flags().row_contiguous || (row == a.shape(-1) && col == 1)) {
+      continue;
+    }
+    if (col != 1 || row < a.shape(-1) ||
+        row > std::numeric_limits<int>::max() / 4) {
+      return false;
+    }
+    strided = true;
+  }
+  if (!strided || !quantized_row_stride_enabled() || d.is_apple6()) {
+    return false;
+  }
+
+  bool non_batched = w.ndim() == 2 && x.flags().row_contiguous;
+  int K = x.shape(-1);
+  int M = non_batched ? x.size() / K : x.shape(-2);
+  int N = out.shape(-1);
+  int B = out.size() / M / N;
+  if (!transpose) {
+    // qmm_n (+NAX) from 4 rows, qvm and qvm_split_k below.
+    return true;
+  }
+  if (non_batched && qmv_mma_enabled()) {
+    return false;
+  }
+  if (M >= get_qmv_batch_limit(K, N, d)) {
+    // B == 1 is the split-K qmm; batched is qmm_t (+NAX).
+    return B > 1;
+  }
+  // qmv_quad
+  return !(K == 128 || K == 64);
+}
+
 void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   auto& s = stream();
   auto& d = metal::device(s.device);
@@ -2615,11 +2882,18 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   // Make sure the last two dims of x and w, s, b are contiguous. This should
   // be relaxed for x.
   array x = ensure_row_contiguous_matrix(inputs[0], d, s);
-  array w = ensure_row_contiguous_matrix(inputs[1], d, s);
-  array scales = ensure_row_contiguous_matrix(inputs[2], d, s);
+  // Views of w, scales and biases with a row stride are read in place where
+  // the route has an "_rs" twin (use_row_stride, gemma4-qat#1973).
+  const bool row_stride =
+      use_row_stride(inputs, x, out, transpose_, mode_, bits_, d);
+  auto packed_rows = [&](const array& a) {
+    return row_stride ? a : ensure_row_contiguous_matrix(a, d, s);
+  };
+  array w = packed_rows(inputs[1]);
+  array scales = packed_rows(inputs[2]);
   std::optional<array> biases = std::nullopt;
   if (inputs.size() == 4) {
-    biases = ensure_row_contiguous_matrix(inputs[3], d, s);
+    biases = packed_rows(inputs[3]);
   }
 
   // Extract the matmul shapes
@@ -2654,6 +2928,7 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
             bits_,
             group_size_,
             K)) {
+      require_packed_rows(row_stride, "qgemm_simt");
       qgemm_simt(x, w, scales, biases, out, group_size_, bits_, M, N, K, d, s);
       return;
     }
@@ -2667,6 +2942,7 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   // Ahead of the qmv batch limit, as upstream routes it (gemma4-qat#1701).
   if (transpose_ && non_batched &&
       use_qmv_mma(x, w, scales, biases, mode, bits_, M, N, K, d)) {
+    require_packed_rows(row_stride, "qmv_mma");
     qmv_mma(x, w, scales, biases, out, group_size_, bits_, M, N, K, d, s, mode);
     return;
   }
@@ -2675,6 +2951,7 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
     // Use split-K qmm for small M with transposed weights (non-batched only)
     int B = out.size() / M / N;
     if (transpose_ && B == 1) {
+      require_packed_rows(row_stride, "qmm_splitk");
       qmm_splitk(
           x, w, scales, biases, out, group_size_, bits_, M, N, K, d, s, mode);
       return;
@@ -2693,7 +2970,8 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
         K,
         d,
         s,
-        mode);
+        mode,
+        row_stride);
     return;
   }
 
@@ -2713,7 +2991,8 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
         K,
         d,
         s,
-        mode);
+        mode,
+        row_stride);
     return;
   }
 
@@ -2732,13 +3011,27 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
         K,
         d,
         s,
-        mode);
+        mode,
+        row_stride);
     return;
   }
 
   // Qvm with large dimension so route to a split K kernel for more parallelism
   qvm_split_k(
-      x, w, scales, biases, out, group_size_, bits_, M, N, K, d, s, mode);
+      x,
+      w,
+      scales,
+      biases,
+      out,
+      group_size_,
+      bits_,
+      M,
+      N,
+      K,
+      d,
+      s,
+      mode,
+      row_stride);
   return;
 }
 
@@ -3104,6 +3397,11 @@ void set_qmv_mma(bool enabled) {
 
 bool qmv_mma_device() {
   return qmv_mma_gpu(metal::device(mlx::core::Device::gpu));
+}
+
+void set_quantized_row_stride(bool enabled) {
+  // Relaxed, as set_qmv_mma: the host orders the store before the calls.
+  quantized_row_stride_flag.store(enabled, std::memory_order_relaxed);
 }
 
 } // namespace metal

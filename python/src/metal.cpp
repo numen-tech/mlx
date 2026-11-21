@@ -55,6 +55,12 @@ void init_metal(nb::module_& m) {
       &mx::metal::sdpa_d512_prefill,
       "Whether the head-dim-512 prefill route is on.");
   metal.def(
+      "_set_quantized_row_stride",
+      &mx::metal::set_quantized_row_stride,
+      "enabled"_a,
+      "Turn the quantized-matmul row-stride route on or off, as "
+      "MLX_QMM_ROW_STRIDE does.");
+  metal.def(
       "is_available",
       &mx::metal::is_available,
       R"pbdoc(

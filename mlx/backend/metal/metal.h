@@ -86,4 +86,14 @@ MLX_API bool qmv_mma_device();
 MLX_API void set_sdpa_d512_prefill(bool enabled);
 MLX_API bool sdpa_d512_prefill();
 
+// The quantized-matmul row-stride route (numen-tech/gemma4-qat#1973): off by
+// default. set_quantized_row_stride(true) turns it on for the process, as
+// MLX_QMM_ROW_STRIDE=1 does (the variable, when set, decides alone): an affine
+// 4/8-bit quantized_matmul with an explicit bias then reads a w, scales or
+// biases whose rows are a row stride apart (a view of some columns of a wider
+// array) in place, on the routes that have an "_rs" kernel, instead of copying
+// it. A no-op without the Metal backend. Version: kQuantizedRowStrideVersion
+// (device.h).
+MLX_API void set_quantized_row_stride(bool enabled);
+
 } // namespace mlx::core::metal

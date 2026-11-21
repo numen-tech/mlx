@@ -4553,6 +4553,292 @@ class TestQuantized(mlx_tests.MLXTestCase):
         expected = mx.dequantize(w_q, mx.contiguous(scales), mode=mode)
         self.assertTrue(mx.allclose(w_hat, expected))
 
+    # The row-stride route (numen-tech/gemma4-qat#1973): under
+    # mx.metal._set_quantized_row_stride(True) or MLX_QMM_ROW_STRIDE=1 an affine
+    # 4/8-bit quantized_matmul with an explicit bias reads w, scales and biases
+    # whose rows are a row stride apart in place ("_rs" kernels) instead of
+    # copying them. Every comparison is on bit patterns against mx.contiguous
+    # copies of the same views, and the kernel trace proves the route.
+
+    ROW_STRIDE_ENV = "MLX_QMM_ROW_STRIDE"
+
+    @staticmethod
+    def is_copy_kernel(name):
+        return "_copy" in name
+
+    @staticmethod
+    def is_rs_kernel(name):
+        return name.endswith("_rs")
+
+    def row_stride_run(self, on, fn):
+        # fn()'s result and kernel names with the process flag set to `on` and
+        # the variable out of the way.
+        saved = os.environ.pop(self.ROW_STRIDE_ENV, None)
+        mx.metal._set_quantized_row_stride(on)
+        try:
+            return self.traced(mx.gpu, fn)
+        finally:
+            mx.metal._set_quantized_row_stride(False)
+            if saved is not None:
+                os.environ[self.ROW_STRIDE_ENV] = saved
+
+    @staticmethod
+    def row_stride_views(key, dtype, bits, gs, lead, L, W, D, rot):
+        # A packed [*lead, L + spare, W] triple and two overlapping D-wide
+        # views of its first L rows, columns [0, D) and [rot, W): the K and V
+        # views of a compact K=V KV row (W = D + rot).
+        rows = mx.random.normal(lead + (L + 96, W), key=key).astype(dtype)
+        wq, scales, biases = mx.quantize(rows, group_size=gs, bits=bits)
+        mx.eval(wq, scales, biases)
+        wpv = 32 // bits  # values per word
+
+        def view(lo, hi):
+            return (
+                wq[..., :L, lo // wpv : hi // wpv],
+                scales[..., :L, lo // gs : hi // gs],
+                biases[..., :L, lo // gs : hi // gs],
+            )
+
+        return view(0, D), view(rot, W)
+
+    @staticmethod
+    def packed(triple):
+        out = tuple(mx.contiguous(a) for a in triple)
+        mx.eval(*out)
+        return out
+
+    def assert_row_stride(self, x, view, transpose, gs, bits, taught=True):
+        # The view read in place gives the bits of its packed copy through the
+        # same kernels with "_rs" names and no copy; with the switch off it is
+        # copied and takes the stock kernels. `taught` False: the route has no
+        # twin, so the view is copied with the switch on too. Returns the "_rs"
+        # kernels that ran.
+        def mm(triple):
+            return lambda: mx.quantized_matmul(
+                x, *triple, transpose=transpose, group_size=gs, bits=bits
+            )
+
+        dense = self.packed(view)
+        y_ref, t_ref = self.row_stride_run(True, mm(dense))
+        y_on, t_on = self.row_stride_run(True, mm(view))
+        y_off, t_off = self.row_stride_run(False, mm(view))
+        self.assert_same_bits(y_on, y_ref)
+        self.assert_same_bits(y_off, y_ref)
+        self.assertFalse(any(map(self.is_rs_kernel, t_ref)), t_ref)
+        if view[0].ndim > 2 and view[0].shape[-2] == 1:
+            # One row broadcast over the batch dims has row stride 0
+            # (broadcast_to), which eval_gpu copies even when the row is
+            # packed; the route leaves that alone.
+            self.assertEqual(t_on, t_off)
+            self.assertEqual(t_on, t_ref)
+            return []
+        self.assertFalse(any(map(self.is_copy_kernel, t_ref)), t_ref)
+        # Off: the stock kernels after one copy per array.
+        self.assertEqual([n for n in t_off if not self.is_copy_kernel(n)], t_ref)
+        self.assertEqual(sum(map(self.is_copy_kernel, t_off)), 3, t_off)
+        if not taught:
+            self.assertEqual(t_on, t_off)
+            return []
+        rs = [n for n in t_on if self.is_rs_kernel(n)]
+        self.assertEqual(len(rs), 1, t_on)
+        self.assertFalse(any(map(self.is_copy_kernel, t_on)), t_on)
+        self.assertEqual([n[:-3] if self.is_rs_kernel(n) else n for n in t_on], t_ref)
+        return rs
+
+    @staticmethod
+    def row_stride_family(name):
+        # "affine_qmv_fast_float16_t_gs_..." -> "qmv_fast"
+        return re.match(r"affine_(q[a-z_]+?)_(?:float|bfloat)", name).group(1)
+
+    @unittest.skipIf(not mx.metal.is_available(), "requires Metal")
+    def test_row_stride_kv_views(self):
+        # The quantized attention pair over a compact K=V KV row at 8-bit g64:
+        # 640-value rows (160 words, 10 groups), K = columns [0, 512), V =
+        # columns [128, 640); queries [1, Hkv, 8, M, 512] against K transposed,
+        # scores [1, Hkv, 8, M, L] against V.
+        if mx.default_device() == mx.cpu:
+            self.skipTest("Covers GPU kernels only")
+        arch = mx.metal.device_info()["architecture"]
+        gen = self._gpu_gen()
+        families = set()
+        k = mx.random.key(1973)
+        cases = [(2, L, M) for L in (1, 63, 640, 1024, 2304) for M in range(1, 9)]
+        cases += [(2, L, M) for L in (63, 640, 2304) for M in (13, 33, 512)]
+        cases += [(4, L, M) for L in (640, 2304) for M in (1, 2, 4, 8, 33, 512)]
+        for Hkv, L, M in cases:
+            k, k1, k2, k3 = mx.random.split(k, 4)
+            kview, vview = self.row_stride_views(
+                k1, mx.float16, 8, 64, (1, Hkv, 1), L, 640, 512, 128
+            )
+            q = mx.random.normal((1, Hkv, 8, M, 512), key=k2).astype(mx.float16)
+            p = mx.random.normal((1, Hkv, 8, M, L), key=k3).astype(mx.float16)
+            mx.eval(q, p)
+            with self.subTest(Hkv=Hkv, L=L, M=M):
+                rs = self.assert_row_stride(q, kview, True, 64, 8)
+                rs += self.assert_row_stride(p, vview, False, 64, 8)
+                families.update(map(self.row_stride_family, rs))
+        nax = any("_nax_" in f + "_" for f in families)
+        expected = {"qmv_fast", "qvm", "qvm_split_k"}
+        expected |= {"qmm_t_nax", "qmm_n_nax"} if nax else {"qmm_t", "qmm_n"}
+        if gen >= 15:
+            expected.add("qmv_wide_rr")
+        self.assertTrue(expected <= families, (arch, sorted(families)))
+
+    @unittest.skipIf(not mx.metal.is_available(), "requires Metal")
+    def test_row_stride_formats(self):
+        # 4- and 8-bit at g32/64/128, fp32, fp16 and bf16, batched and 2-D:
+        # K % 256 != 0 takes the plain qmv, a transposed 2-D product at or
+        # above the qmv batch limit is the split-K qmm, which has no twin.
+        if mx.default_device() == mx.cpu:
+            self.skipTest("Covers GPU kernels only")
+        families = set()
+        k = mx.random.key(73)
+        for bits, gs, dtype in product(
+            (4, 8), (32, 64, 128), (mx.float32, mx.float16, mx.bfloat16)
+        ):
+            for lead, W, D, rot, L in (
+                ((1, 2, 1), 640, 512, 128, 700),
+                ((), 640, 512, 128, 1100),
+                ((3,), 512, 384, 128, 72),
+                ((), 512, 384, 128, 250),
+            ):
+                for M in (1, 3, 6, 40):
+                    k, k1, k2, k3 = mx.random.split(k, 4)
+                    kview, vview = self.row_stride_views(
+                        k1, dtype, bits, gs, lead, L, W, D, rot
+                    )
+                    xl = lead[:-1] + (8,) if len(lead) == 3 else lead
+                    q = mx.random.normal(xl + (M, D), key=k2).astype(dtype)
+                    p = mx.random.normal(xl + (M, L), key=k3).astype(dtype)
+                    mx.eval(q, p)
+                    with self.subTest(
+                        bits=bits, gs=gs, dtype=dtype, lead=lead, D=D, L=L, M=M
+                    ):
+                        # A 2-D w folds every leading dim of x into the rows.
+                        rows = M * (lead[0] if len(lead) == 1 else 1)
+                        splitk = len(lead) == 0 and rows >= self._qmv_batch_limit(D, L)
+                        rs = self.assert_row_stride(
+                            q, kview, True, gs, bits, taught=not splitk
+                        )
+                        rs += self.assert_row_stride(p, vview, False, gs, bits)
+                        families.update(map(self.row_stride_family, rs))
+        self.assertIn("qmv", families)
+        if self._gpu_gen() >= 15:
+            self.assertIn("qmv_wide", families)
+
+    @staticmethod
+    def _qmv_batch_limit(K, N):
+        # get_qmv_batch_limit (quantized.cpp) for K, N <= 2048.
+        assert K <= 2048 and N <= 2048
+        arch = mx.metal.device_info()["architecture"]
+        gen = int("".join(c for c in arch.split("_g")[-1] if c.isdigit()))
+        ultra = arch[-1] == "d"
+        if gen >= 17 and not ultra:
+            return 33
+        if gen >= 15 and not ultra:
+            return 13
+        if ultra:
+            return 32
+        return 14 if gen >= 13 else 18
+
+    @unittest.skipIf(not mx.metal.is_available(), "requires Metal")
+    def test_row_stride_copies(self):
+        # What the route does not take keeps copying, switch on: a column
+        # stride, qmv_quad (K = 64 or 128), 2-bit, an implied (0-d) bias, a
+        # bias-free call, an fp mode. And the variable decides alone.
+        if mx.default_device() == mx.cpu:
+            self.skipTest("Covers GPU kernels only")
+        k = mx.random.key(7)
+        k1, k2, k3 = mx.random.split(k, 3)
+        dtype = mx.float16
+
+        def copies(names):
+            return sum(map(self.is_copy_kernel, names))
+
+        def check(x, view, dense, n_copies, transpose=True, **kwargs):
+            def mm(triple):
+                return lambda: mx.quantized_matmul(
+                    x, *triple, transpose=transpose, **kwargs
+                )
+
+            y_ref, t_ref = self.row_stride_run(True, mm(dense))
+            y_on, t_on = self.row_stride_run(True, mm(view))
+            self.assert_same_bits(y_on, y_ref)
+            self.assertFalse(any(map(self.is_rs_kernel, t_on)), t_on)
+            self.assertEqual(copies(t_on) - copies(t_ref), n_copies, t_on)
+
+        # Evaluated up front: the traces below must hold the product alone.
+        x = mx.random.normal((3, 512), key=k2).astype(dtype)
+        x32 = x.astype(mx.float32)
+        rows = mx.random.normal((200, 1024), key=k1).astype(dtype)
+        wq, scales, biases = mx.quantize(rows, group_size=64, bits=8)
+        mx.eval(x, x32, wq, scales, biases)
+
+        with self.subTest("column stride"):
+            view = (wq[:, ::2], scales[:, ::2], biases[:, ::2])
+            check(x, view, self.packed(view), 3, group_size=64, bits=8)
+
+        with self.subTest("qmv_quad"):
+            for K in (64, 128):
+                view = (wq[:, : K // 4], scales[:, : K // 64], biases[:, : K // 64])
+                check(x[:, :K], view, self.packed(view), 3, group_size=64, bits=8)
+
+        with self.subTest("implied bias"):
+            factor = mx.array(-128.0, dtype)
+            view = (wq[:, :128], scales[:, :8], factor)
+            dense = (mx.contiguous(view[0]), mx.contiguous(view[1]), factor)
+            mx.eval(*dense)
+            check(x, view, dense, 2, group_size=64, bits=8)
+
+        with self.subTest("2-bit"):
+            w2, s2, b2 = mx.quantize(rows, group_size=64, bits=2)
+            mx.eval(w2, s2, b2)
+            view = (w2[:, :32], s2[:, :8], b2[:, :8])
+            check(x, view, self.packed(view), 3, group_size=64, bits=2)
+            with self.subTest("bias-free"):
+                view = (w2[:, :32], s2[:, :8], None)
+                dense = (mx.contiguous(w2[:, :32]), mx.contiguous(s2[:, :8]), None)
+                mx.eval(dense[0], dense[1])
+                check(x[:1], view, dense, 2, group_size=64, bits=2)
+
+        with self.subTest("nvfp4"):
+            wf, sf = mx.quantize(rows.astype(mx.float32), mode="nvfp4")[:2]
+            mx.eval(wf, sf)
+            view = (wf[:, :64], sf[:, :32], None)
+            dense = (mx.contiguous(view[0]), mx.contiguous(view[1]), None)
+            mx.eval(dense[0], dense[1])
+            check(x32, view, dense, 2, group_size=16, bits=4, mode="nvfp4")
+
+        with self.subTest("environment"):
+            view = (wq[:, :128], scales[:, :8], biases[:, :8])
+
+            def run(env, flag):
+                saved = os.environ.get(self.ROW_STRIDE_ENV)
+                if env is None:
+                    os.environ.pop(self.ROW_STRIDE_ENV, None)
+                else:
+                    os.environ[self.ROW_STRIDE_ENV] = env
+                mx.metal._set_quantized_row_stride(flag)
+                try:
+                    _, names = self.traced(
+                        mx.gpu,
+                        lambda: mx.quantized_matmul(
+                            x, *view, transpose=True, group_size=64, bits=8
+                        ),
+                    )
+                finally:
+                    mx.metal._set_quantized_row_stride(False)
+                    if saved is None:
+                        os.environ.pop(self.ROW_STRIDE_ENV, None)
+                    else:
+                        os.environ[self.ROW_STRIDE_ENV] = saved
+                return any(map(self.is_rs_kernel, names))
+
+            self.assertFalse(run(None, False))  # off by default
+            self.assertTrue(run(None, True))
+            self.assertTrue(run("1", False))
+            self.assertFalse(run("0", True))  # the variable decides alone
+
     def test_quantized_matmul_batched_split_k(self):
         tol = 3e-2 if mx.cuda.is_available() else 1e-3
         K, N = 2048, 512
